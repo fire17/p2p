@@ -13,8 +13,18 @@ Two teams, disjoint by directory, working in parallel:
   Own **all production `src/` code** + `package.json` + `README.md` fill. zenith-manager
   enforces single-writer-per-file AMONG its own workers.
 - **GATE VALIDATORS — the spike lanes** (`spike-crypto`, `spike-transport`,
-  `spike-rendezvous`, spawned by main). Own **`test/`** + the live-network gate proofs.
-  They independently VALIDATE the builders' code — a stronger check than testing one's own.
+  `spike-rendezvous`, spawned by main). Own **`test/gate/`** + the live-network gate
+  proofs. They independently VALIDATE the builders' code — a stronger check than
+  testing one's own.
+
+### TEST-FILE RULE (updated 15:10 after lanes naturally co-located unit tests)
+- A builder owns BOTH `src/<mod>.js` AND its co-located unit test `test/<mod>.test.js`
+  (module self-test — good practice, keep it).
+- A validator writes its independent, adversarial, live-network proof under
+  **`test/gate/<mod>.test.js`** — a DIFFERENT file, no clobber. Independent verification
+  preserved; both run under `node --test`.
+- Security-core exception: `spike-crypto` owns `src/noise.js` + `test/noise.test.js` +
+  `test/vectors/` (one owner for the whole crypto core).
 - **SECURITY-CORE EXCEPTION:** `src/noise.js` + `test/vectors/` stay with `spike-crypto`
   (deepest context + the D5 assurance regime). Builders MUST NOT write `src/noise.js`.
 
@@ -31,8 +41,10 @@ Two teams, disjoint by directory, working in parallel:
 | `src/rendezvous/{bencode,dht,tracker,mdns,race}.js` | **zenith swarm** | spike-rendezvous hands over its working DHT client if stronger |
 | `src/node.js`, `src/group.js`, `bin/p2p-chat.js` | **zenith swarm** | builders |
 | `package.json`, `README.md` | **zenith swarm** | already committed by main; extend, don't recreate |
-| `test/wire.test.js`, `test/stun.test.js`, `test/punch.test.js` | **spike-transport** | validate builders' transport+wire |
-| `test/bencode.test.js`, `test/dht.test.js`, `test/tracker.test.js` | **spike-rendezvous** | validate builders' rendezvous + the live-DHT round-trip proof |
+| `test/<mod>.test.js` (co-located unit test) | **the module's builder** | self-test ships with the module |
+| `test/gate/wire.test.js`, `test/gate/stun.test.js`, `test/gate/punch.test.js` | **spike-transport** | independent validation of builders' transport+wire |
+| `test/gate/dht.test.js` + live-DHT round-trip proof | **spike-rendezvous** | the decisive "no server of ours" kill-criteria |
+| `src/rendezvous/{mdns,race}.js`, `src/node.js`, `src/group.js`, `bin/p2p-chat.js` (TAIL modules) | **build swarm** (lane-key→mdns+race, lane-wire→node+group, lane-noise→cli) | assigned 15:10; build against INTERFACES.md contracts |
 | `docs/*`, `DESIGN.md`, `research/*` | **main** | single-writer; workers read only |
 
 ## The P0 gates still gate everything (premortem kill-criteria)
