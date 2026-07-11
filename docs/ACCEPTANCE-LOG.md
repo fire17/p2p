@@ -65,3 +65,74 @@
 **28 PASS · 1 GAP (owner-gated, VAL-ACCEPT-XNET) · 0 FAIL.** v1 is looks-done == is-done for
 every observable surface except real cross-network NAT, which is machinery-ready and awaits a
 second network. Independent verification by zenith-manager; no src/ writes.
+
+---
+
+## ⚠ CORRECTION / RETRACTION (2026-07-11, post zenith end_mission terminal review)
+
+The zenith closure terminal-review + my own re-verification against current HEAD **fc01cdf**
+(NOTE: the 28/29 above was against d774792 — the tree changed since: fc01cdf added a unified
+CLI/TUI + stable identity, LOC 3260→2941) found REAL reliability bugs my battery MISSED. The
+verdict above is **partially retracted**:
+
+- **GAP-001 (High, CONFIRMED):** `node.tick()` (src/node.js:326) has ZERO production callers —
+  `grep '\.tick(' src/ bin/` returns only the definition. wire.js RTO-resend + keepalive PING
+  fire ONLY from `channel.tick()`. So in production there is NO keepalive (NAT mappings expire
+  ~30s) and NO ARQ retransmit of lost DATA/HS frames (survives only on lossless loopback).
+  → **VAL-WIRE-003 keepalive claim RETRACTED to FAIL-in-production** (unit test drove tick()
+  manually; the real system never does). Endangers VAL-ACCEPT-XNET durability.
+- **GAP-002 (High, CONFIRMED by code):** kill-mid-chat → restart → resend does NOT work through
+  the product. `connect()` short-circuits on a stale dead peer (src/node.js:319), no
+  keepalive/idle close means `peer.connected` stays true after remote death, outbox replay
+  (attach()) never runs. → **VAL-ACCEPT-RECONNECT RETRACTED to FAIL** (my PASS rested on
+  test/node.test.js:216, which force-`close()`s first — a real user gets no death signal).
+- **GAP-003 (Med, partially fixed):** shipped `p2p-chat.js` had no key persistence; fc01cdf
+  added a `p2p` command with stable identity + doctor (now in package.json bin). Re-verify which
+  CLI is the demo surface for VAL-CLI-001.
+- **GAP-004 (Low):** VAL-ACCEPT-LOOPBACK #2 "log the commitment check" is silent on the success
+  path (only under P2P_DEBUG=1 or on failure).
+
+**Corrected standing:** ~25/29 PASS · 2 real FAIL (VAL-WIRE-003 production-keepalive,
+VAL-ACCEPT-RECONNECT) · 1 owner-gated GAP (XNET, durability now also impaired by GAP-001) ·
+2 notes (CLI persistence, gate logging). Root cause is small in surface (drive node.tick() on
+an interval; add keepalive-timeout close; redial dead-but-"connected" peers; wire persistence
+into the registered CLI) — but the build does NOT satisfy the battery as observed. Fixes belong
+to the build lanes (zenith-manager does not write src/); re-validation required after they land.
+LESSON: unit tests that call tick()/close() manually hid an integration gap — the same
+mock-vs-real class flagged earlier for mDNS. Real-surface repros must drive the production path.
+
+---
+
+## ✅ RE-VALIDATION (2026-07-11, after fix commit e62943f "durability: drive node.tick() on an interval + wire liveness-death detection")
+
+Fix verified in code: src/node.js:343 `setInterval(node.tick, 250)` cleared on close (tick now
+DRIVEN in production); src/wire.js livenessMs=keepaliveMs*3, tick() closes channel on silence
+(liveness death). Re-ran the RETRACTED contracts on the REAL production path (tick on its own
+interval, SIGKILL not force-close, cross-process, real mDNS):
+
+- **Repro A/C (GAP-001 + GAP-002 liveness):** listener SIGKILLed mid-chat @1783798505 → dialer
+  detected disconnect @1783798511 = **6.08s = exactly livenessMs (keepaliveMs*3)**; peer.connected
+  flipped false. Beats flowed over real transport for 14s with NO manual tick → tick IS driven in
+  production. (Pre-fix: connected stayed true 35s+ forever.)
+- **Repro A part 3 (buffered exactly-once after app redial):** send `BUFFERED-while-down` AFTER
+  disconnect (listener dead) → NOT delivered to listener1; app redials `connect()` → 'reconnect'
+  event, connected=true; restarted same-identity listener2 received `BUFFERED-while-down` **exactly
+  once, no duplicate**. Outbox replay on attach confirmed (node.js:130 + initiatorHandshake reuses
+  the S-keyed record, node.js:211).
+- **Repro B (retransmit):** covered by composition — wire.test.js ARQ exactly-once under 20%
+  loss+reorder+dup PASS + tick now empirically driven in production (Repro A/C).
+- **Full suite:** `node --test` = **98/98** pass (was 96; +2 new liveness tests), 0 fail. Regression clean.
+- **GAP-003 (CLI persistence):** RESOLVED — primary registered command `p2p` (bin/p2p.js, first in
+  package.json bin) uses loadOrCreateIdentity → ~/.p2p/<profile>.json (0600), stable key across
+  restarts + doctor. (bin/p2p-chat.js remains an ephemeral quick-demo secondary.)
+
+**RE-VALIDATED VERDICTS:** VAL-WIRE-003 → **PASS** (keepalive/liveness driven in production);
+VAL-ACCEPT-RECONNECT → **PASS** (v1 bar: disconnect + app-redial + buffered exactly-once; auto-redial
+deferred v1.1, not a fail); VAL-CLI-001 → **PASS** (stable-identity `p2p` command); VAL-ACCEPT-TEST →
+**PASS** (98/98).
+
+**RESTORED STANDING: 28/29 PASS · 0 FAIL · 1 owner-gated GAP (VAL-ACCEPT-XNET, real cross-network run
+unobserved — durability now real via live keepalive; awaits owner 2nd network).** Remaining Low note:
+GAP-004 — success-path commitment-gate log is DBG-only (acceptance #2 literal "log the commitment
+check"); recommend one unconditional log line. The two retracted High FAILs (GAP-001/002) are fixed
+and empirically re-validated on the production path.
