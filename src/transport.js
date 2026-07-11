@@ -123,6 +123,7 @@ function ifaceSig() {
 const PUNCH_MAGIC = 0x50327050; // "P2pP"
 const PROBE = 0x01;
 const PROBE_ACK = 0x02;
+const ZERO_TOKEN = Buffer.alloc(8); // untrusted/legacy: no session correlation -> per-4-tuple accept
 
 function probePkt(type, tok8, nonce8) {
   const b = Buffer.alloc(21);
@@ -147,6 +148,7 @@ class Endpoint extends EventEmitter {
     this._punch = null; // active punch session { token, onProbe(type,nonce,rinfo) }
     this._peers = new Map(); // addrKey -> onMessage cb (one shared port, many punched peers)
     this._onConnCb = null; // onConnection callback — set => this endpoint accepts inbound first-contact
+    this._accepted = new Map(); // tokenHex -> socketLike (dedup multi-path accepts of one dialer session)
     this._srflx = null; // cached reflexive candidate
     this._netTimer = null;
   }
@@ -348,23 +350,25 @@ class Endpoint extends EventEmitter {
   /** UDP socketLike bound to the validated peer. Demux happens in _onMessage. */
   _udpSocketLike(rinfo) {
     const rk = akey(rinfo.address, rinfo.port);
-    const v6 = rinfo.family === 6;
     let closed = false;
     let handler = () => {};
-    const addr = { address: rinfo.address, port: rinfo.port, family: v6 ? 6 : 4 };
-    // socketLike: send(buf) / close() / closed / rinfo, plus onMessage that supports BOTH
-    // consumer styles — `sock.onMessage(cb)` registers (method) AND `sock.onMessage = fn`
-    // assigns. Transport delivers inbound data via the internal _emit (never re-reads onMessage).
+    // `cur` is the LIVE reply target — follows whichever tuple last delivered data. For a
+    // single-tuple accept it never moves; for a token-grouped multi-path accept (or a NAT
+    // rebind) it tracks the path the peer is actually using.
+    const cur = { address: rinfo.address, port: rinfo.port, family: rinfo.family === 6 ? 6 : 4 };
+    // socketLike: send(buf) / close() / closed / rinfo, plus onMessage supporting BOTH styles —
+    // `sock.onMessage(cb)` registers (method) AND `sock.onMessage = fn` assigns. Transport
+    // delivers inbound data via the internal _emit (never re-reads onMessage).
     const sock = {
-      proto: v6 ? 'udp6' : 'udp4',
-      remote: addr,
-      rinfo: addr,
+      get proto() { return cur.family === 6 ? 'udp6' : 'udp4'; },
+      get remote() { return { ...cur }; },
+      get rinfo() { return { ...cur }; },
       get onMessage() { return (cb) => { handler = typeof cb === 'function' ? cb : (() => {}); }; },
       set onMessage(fn) { handler = typeof fn === 'function' ? fn : (() => {}); },
       get closed() { return closed; },
-      send: (buf) => { if (!closed) this._sendRaw(buf, rinfo.address, rinfo.port, v6); },
-      close: () => { closed = true; this._peers.delete(rk); },
-      _emit: (msg, ri) => { try { handler(msg, ri); } catch { /* consumer handler threw */ } },
+      send: (buf) => { if (!closed) this._sendRaw(buf, cur.address, cur.port, cur.family === 6); },
+      close: () => { closed = true; for (const [k, s] of this._peers) if (s === sock) this._peers.delete(k); },
+      _emit: (msg, ri) => { if (ri) { cur.address = ri.address; cur.port = ri.port; cur.family = ri.family === 6 ? 6 : 4; } try { handler(msg, ri); } catch { /* consumer handler threw */ } },
     };
     this._peers.set(rk, sock);
     return sock;
@@ -380,9 +384,23 @@ class Endpoint extends EventEmitter {
     // ACK every inbound PROBE (retransmits too) so the dialer's punch() validates the 4-tuple.
     this._sendRaw(probePkt(PROBE_ACK, tok, nonce), rinfo.address, rinfo.port, rinfo.family === 6);
     const rk = akey(rinfo.address, rinfo.port);
-    if (this._peers.has(rk)) return; // already accepted — keep acking, fire onConnection once
-    const sock = this._udpSocketLike(rinfo);
-    this._onConnCb(sock);
+    if (this._peers.has(rk)) return; // this exact 4-tuple already routed
+
+    // A dialer's ICE-lite punch bursts from several source addresses (v4 + multiple v6), so one
+    // logical dialer arrives as MANY distinct rinfo tuples. When the PROBE carries a non-zero
+    // session token we correlate them: fire onConnection ONCE per token and route every
+    // same-token tuple to that one socketLike (its reply target follows the live path). With a
+    // zero token (no correlation available) we fire per-4-tuple — ICE-correct; the responder
+    // whose HELLO reaches the dialer's chosen path wins, the rest go silent (node.js converges).
+    if (!tok.equals(ZERO_TOKEN)) {
+      const tk = tok.toString('hex');
+      const existing = this._accepted.get(tk);
+      if (existing && !existing.closed) { this._peers.set(rk, existing); return; } // same session, extra path
+      const sock = this._udpSocketLike(rinfo);
+      this._accepted.set(tk, sock);
+      return this._onConnCb(sock);
+    }
+    this._onConnCb(this._udpSocketLike(rinfo));
   }
 
   /** TCP simultaneous-open fallback: listen on our port AND connect out to every tcp/udp

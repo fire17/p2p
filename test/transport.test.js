@@ -118,6 +118,53 @@ test('onConnection: listener accepts an UNSOLICITED inbound punch (node.listen p
   lSock.close(); dSock.close(); listener.close(); dialer.close();
 });
 
+// Raw PROBE builder (mirrors transport's internal punch wire: magic|type|token|nonce).
+const PUNCH_MAGIC = 0x50327050;
+function rawProbe(token, nonce) {
+  const b = Buffer.alloc(21);
+  b.writeUInt32BE(PUNCH_MAGIC, 0); b[4] = 0x01; token.copy(b, 5); nonce.copy(b, 13);
+  return b;
+}
+const bindP = (s) => new Promise((r) => s.bind(0, r));
+
+test('onConnection dedups multi-path accepts by SESSION TOKEN (fires once, both tuples routed)', async () => {
+  const listener = await createEndpoint({});
+  let fires = 0; const socks = [];
+  listener.onConnection((s) => { fires++; socks.push(s); });
+  const token = Buffer.from('tok12345'); // non-zero 8-byte session token
+  // two distinct source sockets on loopback = two rinfo tuples (same address, different port),
+  // both carrying the SAME token — models one dialer's v4+v6 multi-path burst.
+  const s1 = dgram.createSocket('udp4'); const s2 = dgram.createSocket('udp4');
+  await Promise.all([bindP(s1), bindP(s2)]);
+  s1.send(rawProbe(token, Buffer.alloc(8, 1)), listener.port4, '127.0.0.1');
+  s2.send(rawProbe(token, Buffer.alloc(8, 2)), listener.port4, '127.0.0.1');
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(fires, 1, 'one logical dialer -> exactly one onConnection');
+
+  // both source tuples must route to the SAME accepted socketLike
+  const seen = [];
+  socks[0].onMessage = (m) => seen.push(m.toString());
+  s1.send(Buffer.from('from-s1'), listener.port4, '127.0.0.1');
+  s2.send(Buffer.from('from-s2'), listener.port4, '127.0.0.1');
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(seen.includes('from-s1') && seen.includes('from-s2'), 'both tuples deliver to the one sock');
+  s1.close(); s2.close(); socks[0].close(); listener.close();
+});
+
+test('onConnection with ZERO token accepts per-4-tuple (ICE-style; node.js converges)', async () => {
+  const listener = await createEndpoint({});
+  let fires = 0;
+  listener.onConnection(() => { fires++; });
+  const zero = Buffer.alloc(8);
+  const s1 = dgram.createSocket('udp4'); const s2 = dgram.createSocket('udp4');
+  await Promise.all([bindP(s1), bindP(s2)]);
+  s1.send(rawProbe(zero, Buffer.alloc(8, 1)), listener.port4, '127.0.0.1');
+  s2.send(rawProbe(zero, Buffer.alloc(8, 2)), listener.port4, '127.0.0.1');
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(fires, 2, 'no token correlation -> one accept per distinct 4-tuple');
+  s1.close(); s2.close(); listener.close();
+});
+
 test('punch rejects when there are no candidates', async () => {
   const ep = await createEndpoint({});
   await assert.rejects(() => ep.punch([], { timeout: 500 }), /no candidates/i);
