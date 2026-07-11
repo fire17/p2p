@@ -174,6 +174,19 @@ test('keepalive PING emitted from tick after idle interval', () => {
   assert.equal(frames.filter((f) => f.type === TYPE.PING).length, 2)
 })
 
+test('liveness: channel dies after livenessMs of inbound silence; a frame resets it', () => {
+  let T = 0
+  const closes = []
+  const ch = createChannel({ connId: CONNID, now: () => T, keepaliveMs: 100, livenessMs: 300, send: () => {} })
+  ch.onClose((why) => closes.push(why))
+  ch.onDatagram(encodeFrame(TYPE.PING, CONNID, 0, 0, null), {})   // inbound at T=0 sets lastRecvAt
+  T = 250; ch.tick(T); assert.equal(closes.length, 0, 'within livenessMs -> alive')
+  ch.onDatagram(encodeFrame(TYPE.PONG, CONNID, 0, 0, null), {})   // fresh inbound at 250 resets liveness
+  T = 500; ch.tick(T); assert.equal(closes.length, 0, 'reset kept it alive (500-250 < 300)')
+  T = 560; ch.tick(T); assert.deepEqual(closes, ['timeout'], 'silence 250->560 = 310 >= 300 -> dead')
+  assert.equal(ch.closed, true)
+})
+
 test('PING is answered with PONG', () => {
   let T = 0
   const frames = []

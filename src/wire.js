@@ -96,6 +96,9 @@ const noop = () => {}
  * @param {number} [opts.mtu=1200]    max datagram size; sendReliable throws if exceeded.
  * @param {number} [opts.window=256]  max in-flight reliable frames (backpressure).
  * @param {number} [opts.keepaliveMs=25000]  idle interval before a PING is emitted.
+ * @param {number} [opts.livenessMs]  silence (no inbound frame) before the peer is declared
+ *                                    DEAD and the channel closes. Default keepaliveMs*3
+ *                                    (~75s: survives a couple missed PONGs, dies on real silence).
  * @param {number} [opts.rtoMin=200]  RTO floor (ms).
  * @param {number} [opts.rtoMax=60000] RTO ceiling (ms).
  * @param {()=>number} [opts.now]     monotonic clock (ms). Default () => Date.now().
@@ -110,6 +113,7 @@ export function createChannel(opts = {}) {
   const mtu = opts.mtu ?? 1200
   const window = opts.window ?? 256
   const keepaliveMs = opts.keepaliveMs ?? 25000
+  const livenessMs = opts.livenessMs ?? keepaliveMs * 3
   const rtoMin = opts.rtoMin ?? 200
   const rtoMax = opts.rtoMax ?? 60000
   const maxPayload = mtu - HEADER_LEN
@@ -293,6 +297,10 @@ export function createChannel(opts = {}) {
     }
     // Keepalive: if we haven't sent anything for keepaliveMs, emit a PING.
     if (t - lastSentAt >= keepaliveMs) rawSend(TYPE.PING, 0, null)
+    // Liveness death: no inbound frame (data/ack/PONG) for livenessMs => peer is gone.
+    // Close so the owner (node.js) flips connected=false + emits 'disconnect', and a
+    // redial re-handshakes instead of reusing the corpse. NAT expiry / real silence.
+    if (t - lastRecvAt >= livenessMs) { closed = true; onCloseCb('timeout') }
   }
 
   function rawSendData(seg) {

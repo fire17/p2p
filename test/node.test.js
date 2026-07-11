@@ -21,6 +21,7 @@ function mkIdentity(S, tag) {
 function makeBoard() {
   const eps = new Map()          // S -> endpoint
   const registry = new Map()     // S -> identity (for decodeKey/gate)
+  let severed = false            // simulates the network going dark (peer death)
   function sock(getPeer, getDrop) {
     let handler = null; const inbox = []
     const s = {
@@ -29,7 +30,7 @@ function makeBoard() {
       set onMessage(fn) { handler = fn; if (fn) while (inbox.length) fn(inbox.shift()) },  // flush buffered
       _recv(buf) { if (handler) handler(buf); else inbox.push(buf) },
       send(buf) {
-        if (s.closed) return
+        if (s.closed || severed) return
         const cp = Buffer.from(buf)
         const drop = getDrop && getDrop()
         if (drop && drop(cp)) return
@@ -60,6 +61,8 @@ function makeBoard() {
       return ep
     },
     register(S, ep) { eps.set(S, ep) },
+    sever() { severed = true },            // peer death: all datagrams silently vanish
+    heal() { severed = false },
   }
   return board
 }
@@ -102,16 +105,23 @@ function baseDeps(board, over = {}) {
   }
 }
 
-async function buildNode(board, S, tag, over = {}) {
+async function buildNode(board, S, tag, over = {}, listenOpts = {}) {
   const id = mkIdentity(S, tag)
   board.registry.set(S, id)
   const ep = board.makeEndpoint()
   board.register(S, ep)
-  const node = await listen(id, { endpoint: ep, deps: baseDeps(board, over), now: () => 0, keepaliveMs: 1e12 })
+  const node = await listen(id, {
+    endpoint: ep, deps: baseDeps(board, over),
+    now: listenOpts.now || (() => 0),
+    keepaliveMs: listenOpts.keepaliveMs ?? 1e12,
+    livenessMs: listenOpts.livenessMs,
+    tickMs: listenOpts.tickMs,
+  })
   return { node, id, ep }
 }
 
 const nextTick = () => new Promise((r) => setImmediate(r))
+const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // --- tests ----------------------------------------------------------------
 test('identity() delegates to key.generateIdentity via deps', async () => {
@@ -243,4 +253,32 @@ test('resend buffer + exactly-once across reconnect (dropped app-ack, then repla
   assert.equal(secondAckResolved, true)
   assert.deepEqual(aMsgs, ['first', 'second'], 'no duplicate delivery after replay (exactly-once)')
   assert.equal(peer2.connected, true)
+})
+
+test('interval-driven tick: keepalive holds a peer past livenessMs, then death (silence) => disconnect + reconnect', async () => {
+  // REAL setInterval + real clock (small windows). livenessMs=200, keepalive=40 -> if the
+  // node were NOT driving tick(), the peer would die at 200ms even while linked. Surviving
+  // 300ms linked proves keepalive PING/PONG is actually firing on the interval.
+  const board = makeBoard()
+  const opts = { now: Date.now, keepaliveMs: 40, livenessMs: 200, tickMs: 20 }
+  const A = await buildNode(board, 'NNNNNNNNNNNNNNNNNNNNNNNNNN', 'liveA', {}, opts)
+  const B = await buildNode(board, 'OOOOOOOOOOOOOOOOOOOOOOOOOO', 'liveB', {}, opts)
+  try {
+    const peer = await B.node.connect('NNNNNNNNNNNNNNNNNNNNNNNNNN')
+    let disconnects = 0
+    B.node.on('disconnect', () => disconnects++)
+
+    await delay(300)                                   // > livenessMs while linked
+    assert.equal(peer.connected, true, 'keepalive (interval-driven) held the peer past livenessMs')
+    assert.equal(disconnects, 0)
+
+    board.sever()                                      // peer death: network goes dark, no PONG
+    await delay(320)                                   // > livenessMs of silence
+    assert.equal(peer.connected, false, 'dead peer detected, connected flipped false')
+    assert.equal(disconnects, 1, 'disconnect emitted exactly once')
+
+    board.heal()                                       // peer restarts / network returns
+    const peer2 = await B.node.connect('NNNNNNNNNNNNNNNNNNNNNNNNNN')
+    assert.equal(peer2.connected, true, 'redial RE-HANDSHAKES a fresh session (not the corpse)')
+  } finally { A.node.close(); B.node.close() }
 })

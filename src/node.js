@@ -326,8 +326,9 @@ function createNode(identity, opts, deps, ep) {
     tick(now) { const t = now ?? node._now(); for (const r of node._peers.values()) { const c = r.channel(); if (c) c.tick(t) } },
     peers() { return [...node._peers.values()].map((r) => r.peer) },
     _accept(socket) { acceptConnection(node, deps, socket) },
-    _channels: [], _publishHandle: null,
+    _channels: [], _publishHandle: null, _tickTimer: null,
     close() {
+      if (node._tickTimer) { clearInterval(node._tickTimer); node._tickTimer = null }
       for (const r of node._peers.values()) r.peer.close()
       const h = node._publishHandle
       if (h && typeof h.stop === 'function') { try { h.stop() } catch { /* */ } }        // stop rendezvous timers
@@ -335,6 +336,13 @@ function createNode(identity, opts, deps, ep) {
       if (ep && ep.close) ep.close()
     },
   }
+  // Drive every peer channel's timers: RTO resend + keepalive PING + liveness-death.
+  // Without this NOTHING fires in production (loopback hid it) — no resend on loss, no
+  // keepalive (NAT mapping expires ~30s), no dead-peer detection. 250ms = RTO granularity;
+  // wire only PINGs every keepaliveMs internally. unref so it never blocks process exit.
+  const tk = setInterval(() => { try { node.tick() } catch { /* */ } }, opts.tickMs ?? 250)
+  if (typeof tk.unref === 'function') tk.unref()
+  node._tickTimer = tk
   if (ep && typeof ep.onConnection === 'function') ep.onConnection((sock) => node._accept(sock))
   if (ep && typeof ep.on === 'function') ep.on('netchange', () => { Promise.resolve().then(() => deps.publishAll(identity.S ?? identity.key, ep)).catch(() => {}) })
   return node
