@@ -29,16 +29,19 @@ const parseHello = (b) => ({ version: b[1], edPub: b.subarray(2, 34), xPub: b.su
 const tag = (t, body) => Buffer.concat([Buffer.from([t]), body]);
 
 // In-memory socketLike pair (deterministic; stands in for a punched transport). Mimics the
-// transport contract: .send(buf) / .onMessage(cb) / .close(). Async delivery via microtask.
+// transport contract: .send(buf) / onMessage=assignable fn / .close() / rinfo. Async delivery.
 function memPair() {
-  let ca = null, cb = null, open = true;
-  const mk = (getPeerCb) => ({
-    send: (buf) => { if (open) { const copy = Buffer.from(buf); queueMicrotask(() => open && getPeerCb() && getPeerCb()(copy, { address: 'mem', port: 0, family: 'IPv4' })); } },
-    onMessage: (cb2) => { /* set below */ },
+  let open = true;
+  const a = {
+    proto: 'mem', onMessage: null, rinfo: { address: 'B', port: 0, family: 'IPv4' },
+    send: (buf) => { const c = Buffer.from(buf); queueMicrotask(() => { if (open && typeof b.onMessage === 'function') b.onMessage(c, { address: 'A', port: 0, family: 'IPv4' }); }); },
     close: () => { open = false; },
-  });
-  const a = { proto: 'mem', send: (buf) => { const c = Buffer.from(buf); queueMicrotask(() => open && cb && cb(c, { address: 'B', port: 0, family: 'IPv4' })); }, onMessage: (fn) => { ca = fn; }, close: () => { open = false; } };
-  const b = { proto: 'mem', send: (buf) => { const c = Buffer.from(buf); queueMicrotask(() => open && ca && ca(c, { address: 'A', port: 0, family: 'IPv4' })); }, onMessage: (fn) => { cb = fn; }, close: () => { open = false; } };
+  };
+  const b = {
+    proto: 'mem', onMessage: null, rinfo: { address: 'A', port: 0, family: 'IPv4' },
+    send: (buf) => { const c = Buffer.from(buf); queueMicrotask(() => { if (open && typeof a.onMessage === 'function') a.onMessage(c, { address: 'B', port: 0, family: 'IPv4' }); }); },
+    close: () => { open = false; },
+  };
   return [a, b];
 }
 
@@ -76,12 +79,12 @@ function firstContact(o) {
       const connId = split.handshakeHash.subarray(0, 8); // both sides derive the SAME id
       const ch = createChannel({ send: (frame) => sock.send(frame), connId });
       ch.onReliable((ct) => { try { onPlain(split.rx.decrypt(ct)); } catch { /* AEAD fail = drop */ } });
-      sock.onMessage((buf) => ch.onDatagram(buf, { address: dir, port: 0, family: 'IPv4' }));
+      sock.onMessage = (buf) => ch.onDatagram(buf, { address: dir, port: 0, family: 'IPv4' });
       return { ch, send: (pt) => ch.sendReliable(split.tx.encrypt(pt)), close: () => ch.close() };
     };
 
     // --- LISTENER (A): send HELLO, answer HS1 with HS2 (the ack), then go to wire ---
-    sockL.onMessage((buf) => {
+    sockL.onMessage = (buf) => {
       try {
         if (buf[0] === T.HS1) {
           hsA = responder({ localX: { pub: listenerId.xPub, priv: listenerId.xPriv } });
@@ -92,10 +95,10 @@ function firstContact(o) {
           aWire = attachWire(sockL, split, (pt) => recvResolveL(pt), 'B');
         }
       } catch (e) { result.error = 'listener: ' + e.message; /* dialer will time out with no ack */ }
-    });
+    };
 
     // --- DIALER (B): gate A's HELLO, run IK, decrypt(msg2) = first ack ---
-    sockD.onMessage((buf) => {
+    sockD.onMessage = (buf) => {
       try {
         if (buf[0] === T.HELLO) {
           const h = parseHello(buf);
@@ -113,7 +116,7 @@ function firstContact(o) {
           clearTimeout(to); settle();
         }
       } catch (e) { result.error = 'dialer: ' + e.message; result.firstAck = false; }
-    });
+    };
 
     ticker = setInterval(() => { aWire?.ch.tick(Date.now()); bWire?.ch.tick(Date.now()); }, 40);
     ticker.unref?.();
@@ -212,28 +215,44 @@ test('adversarial #3 — MITM: attacker has A\'s PUBLIC string but not A\'s stat
 
 // ============================ PUBLIC API (auto-lights when node.js lands) ============================
 
-// node.js (lane-wire) has LANDED. Its public API is smoke-tested here for shape + a live
-// listen(); the full two-node public-API connect needs the transport<->node onConnection seam
-// + the rendezvous lane, which are still settling (flagged to lead). The protocol itself is
-// already proven end-to-end above via firstContact() over real transport.punch.
-test('public node.js API: identity()/listen() shape + a real online node', { skip: !existsSync(new URL('../../src/node.js', import.meta.url)) }, async () => {
+// THE MILESTONE — full first-contact over the PUBLIC node.js API with the REAL transport
+// (onConnection inbound-accept + punch). Rendezvous is injected in-memory (real DHT/mDNS is
+// the rendezvous lane) — everything else is the real shipped code path: listen -> publish ->
+// connect -> resolve -> punch -> onConnection -> HELLO+gate -> Noise IK -> first-ack -> wire ->
+// message delivered + acked. This is what makes a real two-terminal chat work.
+test('e2e via public node.js API: two real nodes, first-contact + message (real transport)', { skip: !existsSync(new URL('../../src/node.js', import.meta.url)) }, async () => {
   const mod = await import('../../src/node.js');
-  assert.equal(typeof mod.identity, 'function');
-  assert.equal(typeof mod.listen, 'function');
+  const registry = new Map(); // S(upper) -> listener udp4 port (in-mem rendezvous)
+  // inject ALL 8 deps so node's resolveDeps returns early (no import of unlanded dht/tracker)
+  const rv = {
+    generateIdentity, decodeKey, verifyCommitment, createEndpoint, initiator, responder,
+    publishAll: (S, ep) => { registry.set(String(S).toUpperCase(), ep.port4); return { stop() {} }; },
+    resolve: (S) => { const port = registry.get(String(S).toUpperCase()); return port ? [{ proto: 'udp4', ip: '127.0.0.1', port, kind: 'host' }] : []; },
+  };
 
-  const A = await mod.identity();
-  assert.equal(typeof A.S, 'string');
-  assert.equal(A.S.length, 26, 'identity() yields a canonical 26-char contact string');
-  assert.ok(Buffer.isBuffer(A.edPub) && A.edPub.length === 32);
-  assert.ok(Buffer.isBuffer(A.xPub) && A.xPub.length === 32);
-  // the string A publishes must round-trip through the gate machinery
+  const A = await mod.identity({ deps: rv });
+  const B = await mod.identity({ deps: rv });
+  assert.equal(A.S.length, 26);
   assert.ok(verifyCommitment(decodeKey(A.S).commitment, A.edPub, A.xPub), 'published S gates against its own keys');
 
-  const node = await mod.listen(A, {});
-  assert.equal(typeof node.connect, 'function');
-  assert.equal(typeof node.on, 'function');
-  assert.equal(typeof node.close, 'function');
-  // connect() must reject fast on a typo'd key (checksum guard, no network)
-  await assert.rejects(() => node.connect('not-a-valid-key'), /26 chars|checksum|Typo/i);
-  await node.close?.();
+  const epA = await createEndpoint({});
+  const epB = await createEndpoint({});
+  const nodeA = await mod.listen(A, { endpoint: epA, deps: rv }); // publishes A.S -> epA.port4
+  const nodeB = await mod.listen(B, { endpoint: epB, deps: rv });
+  const ticker = setInterval(() => { nodeA.tick(); nodeB.tick(); }, 40);
+
+  // connect() must still reject fast on a typo'd key (checksum guard, no network)
+  await assert.rejects(() => nodeB.connect('not-a-valid-key'), /26 chars|checksum|Typo/i);
+
+  const gotAtA = new Promise((res) => nodeA.on('message', (_peer, buf) => res(buf)));
+  const peer = await nodeB.connect(A.S);          // resolves ONLY after the IK first-ack (MITM-free)
+  const payload = Buffer.from('two-terminal-chat 🎉');
+  const ackSeq = await peer.send(payload);         // resolves on the listener's app-level ACK
+  const got = await gotAtA;
+
+  assert.deepEqual(got, payload, 'listener received dialer bytes EXACTLY over the public API + real transport');
+  assert.equal(typeof ackSeq, 'number', 'peer.send resolved with an ack (round-trip confirmed)');
+
+  clearInterval(ticker);
+  await nodeA.close?.(); await nodeB.close?.();
 });

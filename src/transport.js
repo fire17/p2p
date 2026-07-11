@@ -146,6 +146,7 @@ class Endpoint extends EventEmitter {
     this._stunPending = new Map(); // txidHex -> (res) => void
     this._punch = null; // active punch session { token, onProbe(type,nonce,rinfo) }
     this._peers = new Map(); // addrKey -> onMessage cb (one shared port, many punched peers)
+    this._onConnCb = null; // onConnection callback — set => this endpoint accepts inbound first-contact
     this._srflx = null; // cached reflexive candidate
     this._netTimer = null;
   }
@@ -179,15 +180,19 @@ class Endpoint extends EventEmitter {
     }
     // 2) punch probe/ack
     if (msg.length >= 21 && msg.readUInt32BE(0) === PUNCH_MAGIC) {
-      const p = this._punch;
-      if (!p) return;
+      const type = msg[4];
       const tok = msg.subarray(5, 13);
-      if (!tok.equals(p.token)) return; // wrong session
-      return p.onProbe(msg[4], msg.subarray(13, 21), rinfo);
+      const nonce = msg.subarray(13, 21);
+      const p = this._punch;
+      if (p && tok.equals(p.token)) return p.onProbe(type, nonce, rinfo); // our active dial
+      // no matching dial session: an unsolicited PROBE is an INBOUND first-contact (D4 —
+      // transport is untrusted; real auth is the commitment gate + Noise IK node.js runs on top).
+      if (type === PROBE) return this._acceptInbound(tok, nonce, rinfo);
+      return; // stray ACK, no session
     }
     // 3) application data — route to the matching punched peer
-    const cb = this._peers.get(akey(rinfo.address, rinfo.port));
-    if (cb) cb(msg, rinfo);
+    const sock = this._peers.get(akey(rinfo.address, rinfo.port));
+    if (sock) sock._emit(msg, rinfo);
   }
 
   _sendRaw(buf, ip, port, v6) {
@@ -344,14 +349,40 @@ class Endpoint extends EventEmitter {
   _udpSocketLike(rinfo) {
     const rk = akey(rinfo.address, rinfo.port);
     const v6 = rinfo.family === 6;
-    this._peers.set(rk, () => {}); // reserve the route until onMessage binds a real cb
-    return {
+    let closed = false;
+    let handler = () => {};
+    const addr = { address: rinfo.address, port: rinfo.port, family: v6 ? 6 : 4 };
+    // socketLike: send(buf) / close() / closed / rinfo, plus onMessage that supports BOTH
+    // consumer styles — `sock.onMessage(cb)` registers (method) AND `sock.onMessage = fn`
+    // assigns. Transport delivers inbound data via the internal _emit (never re-reads onMessage).
+    const sock = {
       proto: v6 ? 'udp6' : 'udp4',
-      remote: { address: rinfo.address, port: rinfo.port, family: v6 ? 6 : 4 },
-      send: (buf) => this._sendRaw(buf, rinfo.address, rinfo.port, v6),
-      onMessage: (cb) => { this._peers.set(rk, cb); },
-      close: () => { this._peers.delete(rk); },
+      remote: addr,
+      rinfo: addr,
+      get onMessage() { return (cb) => { handler = typeof cb === 'function' ? cb : (() => {}); }; },
+      set onMessage(fn) { handler = typeof fn === 'function' ? fn : (() => {}); },
+      get closed() { return closed; },
+      send: (buf) => { if (!closed) this._sendRaw(buf, rinfo.address, rinfo.port, v6); },
+      close: () => { closed = true; this._peers.delete(rk); },
+      _emit: (msg, ri) => { try { handler(msg, ri); } catch { /* consumer handler threw */ } },
     };
+    this._peers.set(rk, sock);
+    return sock;
+  }
+
+  /** Register an inbound-connection acceptor. Set => this endpoint answers unsolicited PROBEs
+   * (node.listen). One callback per NEW inbound peer with a ready socketLike. */
+  onConnection(cb) { this._onConnCb = cb; }
+
+  /** Accept an unsolicited inbound PROBE as a new peer (listener side of first-contact). */
+  _acceptInbound(tok, nonce, rinfo) {
+    if (!this._onConnCb) return; // not listening for inbound — drop (don't ACK)
+    // ACK every inbound PROBE (retransmits too) so the dialer's punch() validates the 4-tuple.
+    this._sendRaw(probePkt(PROBE_ACK, tok, nonce), rinfo.address, rinfo.port, rinfo.family === 6);
+    const rk = akey(rinfo.address, rinfo.port);
+    if (this._peers.has(rk)) return; // already accepted — keep acking, fire onConnection once
+    const sock = this._udpSocketLike(rinfo);
+    this._onConnCb(sock);
   }
 
   /** TCP simultaneous-open fallback: listen on our port AND connect out to every tcp/udp

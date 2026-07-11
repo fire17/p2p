@@ -90,13 +90,32 @@ test('punch: two endpoints validate a 4-tuple and exchange data (loopback)', asy
   assert.equal(sa.proto, 'udp4');
   assert.equal(sb.proto, 'udp4');
 
-  const gotA = new Promise((res) => sa.onMessage((m) => m.toString() === 'ping-b' && res()));
-  const gotB = new Promise((res) => sb.onMessage((m) => m.toString() === 'ping-a' && res()));
+  const gotA = new Promise((res) => { sa.onMessage = (m) => m.toString() === 'ping-b' && res(); });
+  const gotB = new Promise((res) => { sb.onMessage = (m) => m.toString() === 'ping-a' && res(); });
   const iv = setInterval(() => { sa.send(Buffer.from('ping-a')); sb.send(Buffer.from('ping-b')); }, 100);
   await Promise.all([gotA, gotB]);
   clearInterval(iv);
 
   sa.close(); sb.close(); a.close(); b.close();
+});
+
+test('onConnection: listener accepts an UNSOLICITED inbound punch (node.listen path)', async () => {
+  const listener = await createEndpoint({});
+  const dialer = await createEndpoint({});
+  const token = 'inbound';
+  const accepted = new Promise((res) => listener.onConnection((sock) => res(sock)));
+  // dialer punches; listener is NOT punching — only accepting via onConnection.
+  const dialerSockP = dialer.punch([{ proto: 'udp4', ip: '127.0.0.1', port: listener.port4, kind: 'host' }], { token, timeout: 4000 });
+  const [lSock, dSock] = await Promise.all([accepted, dialerSockP]);
+  assert.equal(lSock.proto, 'udp4');
+  assert.equal(dSock.proto, 'udp4');
+
+  const gotAtL = new Promise((res) => { lSock.onMessage = (m) => m.toString() === 'hi-listener' && res(); });
+  const gotAtD = new Promise((res) => { dSock.onMessage = (m) => m.toString() === 'hi-dialer' && res(); });
+  const iv = setInterval(() => { dSock.send(Buffer.from('hi-listener')); lSock.send(Buffer.from('hi-dialer')); }, 80);
+  await Promise.all([gotAtL, gotAtD]);
+  clearInterval(iv);
+  lSock.close(); dSock.close(); listener.close(); dialer.close();
 });
 
 test('punch rejects when there are no candidates', async () => {
