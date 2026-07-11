@@ -151,6 +151,38 @@ test('onConnection dedups multi-path accepts by SESSION TOKEN (fires once, both 
   s1.close(); s2.close(); socks[0].close(); listener.close();
 });
 
+test('token-accepted socket FANS OUT send to all tuples until the path is locked by inbound', async () => {
+  const listener = await createEndpoint({});
+  let sock = null;
+  listener.onConnection((s) => { sock = s; });
+  const token = Buffer.from('fanotok1');
+  const s1 = dgram.createSocket('udp4'); const s2 = dgram.createSocket('udp4');
+  await Promise.all([bindP(s1), bindP(s2)]);
+  const r1 = []; const r2 = [];
+  s1.on('message', (m) => r1.push(m.toString()));
+  s2.on('message', (m) => r2.push(m.toString()));
+  // two source tuples, same token -> one accepted sock correlating both
+  s1.send(rawProbe(token, Buffer.alloc(8, 1)), listener.port4, '127.0.0.1');
+  s2.send(rawProbe(token, Buffer.alloc(8, 2)), listener.port4, '127.0.0.1');
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(sock, 'accepted');
+
+  // PRE-LOCK: send must reach BOTH source tuples (dialer's validated path is still unknown)
+  sock.send(Buffer.from('pre-lock'));
+  await new Promise((r) => setTimeout(r, 120));
+  assert.ok(r1.includes('pre-lock') && r2.includes('pre-lock'), 'fan-out reaches every tuple before lock');
+
+  // s1 delivers inbound app data -> locks cur to s1's tuple
+  s1.send(Buffer.from('lock-me'), listener.port4, '127.0.0.1');
+  await new Promise((r) => setTimeout(r, 120));
+  r1.length = 0; r2.length = 0;
+  sock.send(Buffer.from('post-lock'));
+  await new Promise((r) => setTimeout(r, 120));
+  assert.ok(r1.includes('post-lock'), 'after lock, send goes to the delivering path');
+  assert.ok(!r2.includes('post-lock'), 'after lock, send no longer fans out to dead paths');
+  s1.close(); s2.close(); sock.close(); listener.close();
+});
+
 test('onConnection with ZERO token accepts per-4-tuple (ICE-style; node.js converges)', async () => {
   const listener = await createEndpoint({});
   let fires = 0;

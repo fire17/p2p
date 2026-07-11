@@ -350,15 +350,15 @@ class Endpoint extends EventEmitter {
   /** UDP socketLike bound to the validated peer. Demux happens in _onMessage. */
   _udpSocketLike(rinfo) {
     const rk = akey(rinfo.address, rinfo.port);
-    let closed = false;
+    let closed = false, locked = false;
     let handler = () => {};
-    // `cur` is the LIVE reply target — follows whichever tuple last delivered data. For a
-    // single-tuple accept it never moves; for a token-grouped multi-path accept (or a NAT
-    // rebind) it tracks the path the peer is actually using.
+    // `cur` is the LIVE reply target once locked. `tuples` are all source paths correlated to
+    // this peer (a dialer's ICE-lite burst arrives as several v4/v6 sources). We do NOT yet know
+    // which path the dialer validated until it sends inbound data — so PRE-LOCK, send() FANS OUT
+    // to every tuple (guarantees the dialer's validated-path socket receives HELLO retransmits);
+    // the FIRST inbound datagram locks `cur` to the delivering path and steady-state uses it only.
     const cur = { address: rinfo.address, port: rinfo.port, family: rinfo.family === 6 ? 6 : 4 };
-    // socketLike: send(buf) / close() / closed / rinfo, plus onMessage supporting BOTH styles —
-    // `sock.onMessage(cb)` registers (method) AND `sock.onMessage = fn` assigns. Transport
-    // delivers inbound data via the internal _emit (never re-reads onMessage).
+    const tuples = [{ address: cur.address, port: cur.port, v6: cur.family === 6 }];
     const sock = {
       get proto() { return cur.family === 6 ? 'udp6' : 'udp4'; },
       get remote() { return { ...cur }; },
@@ -366,9 +366,17 @@ class Endpoint extends EventEmitter {
       get onMessage() { return (cb) => { handler = typeof cb === 'function' ? cb : (() => {}); }; },
       set onMessage(fn) { handler = typeof fn === 'function' ? fn : (() => {}); },
       get closed() { return closed; },
-      send: (buf) => { if (!closed) this._sendRaw(buf, cur.address, cur.port, cur.family === 6); },
+      send: (buf) => {
+        if (closed) return;
+        if (locked) { this._sendRaw(buf, cur.address, cur.port, cur.family === 6); return; }
+        for (const t of tuples) this._sendRaw(buf, t.address, t.port, t.v6); // fan out until the path is known
+      },
       close: () => { closed = true; for (const [k, s] of this._peers) if (s === sock) this._peers.delete(k); },
-      _emit: (msg, ri) => { if (ri) { cur.address = ri.address; cur.port = ri.port; cur.family = ri.family === 6 ? 6 : 4; } try { handler(msg, ri); } catch { /* consumer handler threw */ } },
+      _emit: (msg, ri) => {
+        if (ri) { cur.address = ri.address; cur.port = ri.port; cur.family = ri.family === 6 ? 6 : 4; locked = true; } // first inbound locks the path
+        try { handler(msg, ri); } catch { /* consumer handler threw */ }
+      },
+      _addTuple: (ri) => { if (!tuples.some((t) => t.address === ri.address && t.port === ri.port)) tuples.push({ address: ri.address, port: ri.port, v6: ri.family === 6 }); },
     };
     this._peers.set(rk, sock);
     return sock;
@@ -395,7 +403,7 @@ class Endpoint extends EventEmitter {
     if (!tok.equals(ZERO_TOKEN)) {
       const tk = tok.toString('hex');
       const existing = this._accepted.get(tk);
-      if (existing && !existing.closed) { this._peers.set(rk, existing); return; } // same session, extra path
+      if (existing && !existing.closed) { existing._addTuple(rinfo); this._peers.set(rk, existing); return; } // same session, extra path
       const sock = this._udpSocketLike(rinfo);
       this._accepted.set(tk, sock);
       return this._onConnCb(sock);
