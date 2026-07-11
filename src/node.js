@@ -149,8 +149,9 @@ async function resolveDeps(inj = {}, opts = {}) {
     import('./rendezvous/dht.js'), import('./rendezvous/tracker.js'),
   ])
   let { resolve, publishAll } = inj
+  let channels = []
   if (!resolve || !publishAll) {
-    const channels = [mdns.createMdns(opts), dht.createDht(opts), tracker.createTracker(opts)]
+    channels = [mdns.createMdns(opts.rendezvous), dht.createDht(opts.rendezvous), tracker.createTracker(opts.rendezvous)]
     const r = race.createRace({ channels, now: opts.now })
     resolve = resolve || r.resolve
     publishAll = publishAll || r.publishAll
@@ -158,7 +159,7 @@ async function resolveDeps(inj = {}, opts = {}) {
   return {
     generateIdentity: key.generateIdentity, decodeKey: key.decodeKey, verifyCommitment: key.verifyCommitment,
     createEndpoint: transport.createEndpoint, initiator: noise.initiator, responder: noise.responder,
-    resolve, publishAll, ...inj,
+    resolve, publishAll, _channels: channels, ...inj,
   }
 }
 
@@ -272,7 +273,14 @@ function createNode(identity, opts, deps, ep) {
     tick(now) { const t = now ?? node._now(); for (const r of node._peers.values()) { const c = r.channel(); if (c) c.tick(t) } },
     peers() { return [...node._peers.values()].map((r) => r.peer) },
     _accept(socket) { acceptConnection(node, deps, socket) },
-    close() { for (const r of node._peers.values()) r.peer.close(); if (ep && ep.close) ep.close() },
+    _channels: [], _publishHandle: null,
+    close() {
+      for (const r of node._peers.values()) r.peer.close()
+      const h = node._publishHandle
+      if (h && typeof h.stop === 'function') { try { h.stop() } catch { /* */ } }        // stop rendezvous timers
+      for (const c of node._channels) { if (c && typeof c.close === 'function') { try { c.close() } catch { /* */ } } }
+      if (ep && ep.close) ep.close()
+    },
   }
   if (ep && typeof ep.onConnection === 'function') ep.onConnection((sock) => node._accept(sock))
   if (ep && typeof ep.on === 'function') ep.on('netchange', () => { Promise.resolve().then(() => deps.publishAll(identity.S ?? identity.key, ep)).catch(() => {}) })
@@ -301,9 +309,12 @@ export async function listen(id, opts = {}) {
   const deps = await resolveDeps(opts.deps || {}, opts)
   const ep = opts.endpoint || await deps.createEndpoint({ port: opts.port })
   const node = createNode(id, opts, deps, ep)
-  Promise.resolve()
-    .then(() => deps.publishAll(id.S ?? id.key, ep))
-    .catch((err) => node.emit('divergence', null, { reason: 'publish', error: err }))
+  node._channels = deps._channels || []
+  try {                                          // instant-on: publishAll returns fast (schedules in bg)
+    const h = deps.publishAll(id.S ?? id.key, ep)
+    node._publishHandle = h
+    if (h && typeof h.then === 'function') h.catch((err) => node.emit('divergence', null, { reason: 'publish', error: err }))
+  } catch (err) { node.emit('divergence', null, { reason: 'publish', error: err }) }
   return node
 }
 
