@@ -30,6 +30,16 @@ const red = (s) => c('31', s)
 const yellow = (s) => c('33', s)
 
 const shortId = (S) => String(S).slice(0, 6)
+// Real node.js peers are keyed by remote identity: the DIALER's peer has .S (the key it
+// dialed); the LISTENER's accepted peer has .S = null but .remoteStatic (32B X25519). Label
+// from whichever is present.
+const peerLabel = (peer) =>
+  peer && peer.S
+    ? shortId(peer.S)
+    : peer && peer.remoteStatic
+      ? Buffer.from(peer.remoteStatic).toString('hex').slice(0, 6).toUpperCase()
+      : '??????'
+const asBuf = (d) => (Buffer.isBuffer(d) ? d : Buffer.from(String(d)))
 
 // ── the backend contract this CLI depends on ─────────────────────────────────
 // identity()            -> { S, edPub, xPub, ... }
@@ -55,10 +65,13 @@ async function loadBackend() {
 }
 
 // ── embedded in-process demo backend (reuses the REAL key.js gate) ───────────
-const REGISTRY = new Map() // S -> LoopNode  (in-process only, by design)
+// Mirrors src/node.js shapes EXACTLY so the CLI has one code path: async identity/listen,
+// positional events ('message' -> (peer, buf), 'peer' -> (peer)), node.peers() method, and
+// peers with {S, remoteStatic}. In-process only (REGISTRY) — the real core does the network.
+const REGISTRY = new Map() // S -> LoopNode
 
 function embeddedBackend() {
-  return { identity: () => generateIdentity(), listen: (id, opts = {}) => new LoopNode(id, opts) }
+  return { identity: async () => generateIdentity(), listen: async (id, opts = {}) => new LoopNode(id, opts) }
 }
 
 class LoopNode {
@@ -66,15 +79,18 @@ class LoopNode {
     this.id = id
     this.S = id.S
     this.handlers = {}
-    this.peers = new Set()
+    this._peers = new Set()
     REGISTRY.set(this.S, this)
   }
   on(ev, fn) {
     ;(this.handlers[ev] ||= []).push(fn)
     return this
   }
-  emit(ev, arg) {
-    for (const fn of this.handlers[ev] || []) fn(arg)
+  emit(ev, ...args) {
+    for (const fn of this.handlers[ev] || []) fn(...args)
+  }
+  peers() {
+    return [...this._peers]
   }
   async connect(KEY) {
     const key = String(KEY).trim().toUpperCase()
@@ -91,29 +107,22 @@ class LoopNode {
     if (!verifyCommitment(commitment, target.id.edPub, target.id.xPub)) {
       throw new Error('commitment gate FAILED — key does not match peer identity (possible MITM). Aborted.')
     }
-    const mine = makePeer(this, target)
-    const theirs = makePeer(target, this)
-    this.peers.add(mine)
-    target.peers.add(theirs)
-    target.emit('peer', theirs) // inbound side sees a new peer
-    this.emit('peer', mine)
-    return mine // connect resolves AFTER gate + ack == the first-ack proof surface
+    // dialerPeer = my handle on target (S known). listenerPeer = target's handle on me
+    // (S=null + remoteStatic, exactly like a real accepted peer). Each is also the
+    // sender-view stamped on messages the OTHER side receives.
+    const dialerPeer = { S: target.S, remoteStatic: target.id.xPub, connected: true, close() {} }
+    const listenerPeer = { S: null, remoteStatic: this.id.xPub, connected: true, close() {} }
+    dialerPeer.send = async (d) => (target.emit('message', listenerPeer, asBuf(d)), 0)
+    listenerPeer.send = async (d) => (this.emit('message', dialerPeer, asBuf(d)), 0)
+    this._peers.add(dialerPeer)
+    target._peers.add(listenerPeer)
+    target.emit('peer', listenerPeer) // inbound side sees a new peer
+    this.emit('peer', dialerPeer)
+    return dialerPeer // resolves AFTER gate + ack == the first-ack proof surface
   }
   close() {
     REGISTRY.delete(this.S)
-    this.peers.clear()
-  }
-}
-
-function makePeer(fromNode, toNode) {
-  return {
-    S: toNode.S,
-    shortId: shortId(toNode.S),
-    async send(data) {
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data))
-      queueMicrotask(() => toNode.emit('message', { from: makePeer(toNode, fromNode), data: buf }))
-      return { ok: true } // ack
-    },
+    this._peers.clear()
   }
 }
 
@@ -137,7 +146,7 @@ function printAck(peer) {
   console.log(
     '\n' +
       green(bold('  ✅ secure channel established — verified, no MITM')) +
-      dim('  (peer ' + peer.shortId + ')')
+      dim('  (peer ' + peerLabel(peer) + ')')
   )
   console.log(dim('  the first ack decrypted: proof the peer holds the key that matches the string.'))
   console.log(dim('  type a message and press enter · Ctrl-C to quit') + '\n')
@@ -146,55 +155,64 @@ function printAck(peer) {
 // ── REPL wiring shared by both modes ─────────────────────────────────────────
 function startRepl(node, getPeers) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: cyan('you › ') })
-  node.on('message', ({ from, data }) => {
+  node.on('message', (peer, data) => {
     // redraw cleanly under the prompt
     readline.cursorTo(process.stdout, 0)
     readline.clearLine(process.stdout, 0)
-    console.log(bold(cyan(shortId(from.S) + ' › ')) + data.toString())
+    console.log(bold(cyan(peerLabel(peer) + ' › ')) + data.toString())
     rl.prompt(true)
   })
   node.on('peer', (peer) => {
     readline.cursorTo(process.stdout, 0)
     readline.clearLine(process.stdout, 0)
-    console.log(dim('  · peer ' + peer.shortId + ' connected'))
+    console.log(dim('  · peer ' + peerLabel(peer) + ' connected'))
     rl.prompt(true)
   })
   rl.prompt()
-  rl.on('line', async (line) => {
+  // track in-flight sends so a stdin-EOF close drains them (real peer.send resolves on ACK)
+  let inflight = Promise.resolve()
+  rl.on('line', (line) => {
     const text = line.trim()
     if (text) {
       const peers = getPeers()
       if (peers.length === 0) console.log(dim('  (no peer connected yet — waiting…)'))
-      else for (const p of peers) await p.send(text)
+      else inflight = inflight.then(() => Promise.all(peers.map((p) => p.send(text).catch(() => {}))))
     }
     rl.prompt()
   })
-  const shutdown = () => {
+  let closing = false
+  const shutdown = async () => {
+    if (closing) return
+    closing = true
+    await inflight.catch(() => {}) // confirm delivery (ACK) before tearing down
     console.log('\n' + dim('  closing…'))
     try {
       node.close()
     } catch {}
-    rl.close()
+    try {
+      rl.close()
+    } catch {}
     process.exit(0)
   }
   rl.on('SIGINT', shutdown)
+  rl.on('close', shutdown) // stdin EOF (piped input, or Ctrl-D): drain then exit, don't hang
   process.on('SIGINT', shutdown)
   return rl
 }
 
 // ── modes ──────────────────────────────────────────────────────────────────
 async function runListen(be) {
-  const id = be.identity()
-  const node = be.listen(id, {})
+  const id = await be.identity()
+  const node = await be.listen(id, {})
   if (!be.real) {
     console.log(
       yellow('  ⚠ demo backend') +
-        dim(' — src/node.js not linked yet; in-process only. --selftest and single-process demo work now.')
+        dim(' — src/node.js not linked; in-process only. --selftest and single-process demo work now.')
     )
   }
   printKey(id.S)
   console.log(dim('  listening · waiting for a friend to connect…'))
-  startRepl(node, () => [...node.peers])
+  startRepl(node, () => node.peers())
 }
 
 async function runConnect(be, KEY) {
@@ -208,12 +226,12 @@ async function runConnect(be, KEY) {
     }
     throw e
   }
-  const id = be.identity()
-  const node = be.listen(id, {}) // we also listen, so the peer can reach us back
+  const id = await be.identity()
+  const node = await be.listen(id, {}) // we also listen, so the peer can reach us back
   if (!be.real) {
     console.log(
       yellow('  ⚠ demo backend') +
-        dim(' — src/node.js not linked yet; in-process only, so a live remote peer will not be found.')
+        dim(' — src/node.js not linked; in-process only, so a live remote peer will not be found.')
     )
   }
   console.log(dim('  your key: ') + cyan(id.S))
@@ -226,25 +244,25 @@ async function runConnect(be, KEY) {
     process.exit(3)
   }
   printAck(peer)
-  startRepl(node, () => [...node.peers])
+  startRepl(node, () => node.peers())
 }
 
 // ── --selftest: two in-process nodes, full round-trip (CLI plumbing proof) ────
 async function selftest() {
   const be = { real: false, ...embeddedBackend() }
-  const a = be.listen(be.identity())
-  const b = be.listen(be.identity())
+  const a = await be.listen(await be.identity())
+  const b = await be.listen(await be.identity())
   let aPeer = false
   let aMsg = null
   let bMsg = null
   a.on('peer', () => (aPeer = true))
-  a.on('message', ({ data }) => (aMsg = data.toString()))
-  b.on('message', ({ data }) => (bMsg = data.toString()))
+  a.on('message', (_peer, data) => (aMsg = data.toString()))
+  b.on('message', (_peer, data) => (bMsg = data.toString()))
 
   const bToA = await b.connect(a.S) // first-ack
   await bToA.send('hello from B')
   await new Promise((r) => setTimeout(r, 10))
-  const aToB = [...a.peers][0]
+  const aToB = a.peers()[0]
   await aToB.send('ack from A')
   await new Promise((r) => setTimeout(r, 10))
 
