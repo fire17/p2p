@@ -55,7 +55,12 @@ createEndpoint({ port? })                 // -> ep (UDP socket + candidate gathe
 ep.candidates()                           // -> [{proto:'udp6'|'udp4'|'tcp', ip, port, kind:'host'|'lan'|'srflx'}]
 ep.stun()                                 // -> {ip,port} via public STUN list (research/transport-nat.md)
 ep.punch(remoteCandidates, {signal})      // -> connected socketLike (races ladder per DESIGN D8)
-socketLike.send(buf) / .onMessage(cb) / .close()
+ep.onConnection(cb)                        // listener inbound-accept: fired once per NEW inbound peer.
+                                           //   impl: unsolicited PROBE (no active punch, unknown addr)
+                                           //   -> PROBE_ACK + build socketLike + cb(socketLike). Accepting
+                                           //   any inbound is safe — real auth is the gate+Noise IK on top.
+ep.on('netchange', cb)                     // local IPs changed -> node.js re-announces (publishAll)
+// socketLike: { send(buf), onMessage: <assignable fn>, close(), closed:boolean, rinfo }
 ```
 Keepalive 25s UDP / 60s TCP, owned by wire.tick. On local-IP-change: emit 'netchange'
 (node.js re-announces immediately).
