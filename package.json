@@ -4,7 +4,7 @@
   "description": "Tiny zero-dependency P2P chat framework: one 26-char key, E2E-encrypted, MITM-proof first contact, NAT traversal, no coordinator server.",
   "type": "module",
   "exports": "./src/node.js",
-  "bin": { "p2p-chat": "./bin/p2p-chat.js" },
+  "bin": { "p2p": "./bin/p2p.js", "p2p-tui": "./bin/p2p-tui.js", "p2p-chat": "./bin/p2p-chat.js" },
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "node --test",
