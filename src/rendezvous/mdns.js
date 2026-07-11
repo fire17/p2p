@@ -176,7 +176,10 @@ function decodeTxt(strings) {
  */
 export function createMdns(opts = {}) {
   const now = opts.now || (() => Date.now())
-  const mkSocket = opts.socketFactory || ((type, o) => dgram.createSocket(type, o))
+  // NOTE: dgram.createSocket(type, cb) treats a 2nd arg as a callback — passing options there
+  // silently DROPS them (reuseAddr lost → EADDRINUSE on the 2nd same-host bind). Options must go
+  // in a single object with a `type` field. (Mock factories in tests ignore the args entirely.)
+  const mkSocket = opts.socketFactory || ((type, o) => dgram.createSocket({ type, ...o }))
   const mcastAddr = opts.mcastAddr || MCAST_ADDR
   const port = opts.port || MCAST_PORT
   const ttl = opts.ttl || 120
@@ -186,6 +189,9 @@ export function createMdns(opts = {}) {
   /** @type {Set<(msg:{ridHex:string,blob:object})=>void>} */
   const listeners = new Set()
 
+  // reuseAddr lets multiple processes on ONE host bind 5353 and each receive the group's
+  // traffic (the two-terminal-on-one-machine case). NOT reusePort — it's ENOTSUP for a
+  // multicast bind on macOS and aborts the bind entirely.
   const sock = mkSocket('udp4', { reuseAddr: true })
   let ready = false
   const pending = []
@@ -214,6 +220,10 @@ export function createMdns(opts = {}) {
       try {
         sock.addMembership(mcastAddr)
         sock.setMulticastTTL(ttl)
+        // CRITICAL for same-host discovery: IP_MULTICAST_LOOP governs whether our multicast
+        // reaches OTHER sockets on this host (a second process, and ourselves). Without it,
+        // a listener's answers never reach a dialer on the same machine → "no candidates".
+        sock.setMulticastLoopback(true)
       } catch {
         /* mock / restricted env */
       }
@@ -270,7 +280,12 @@ export function createMdns(opts = {}) {
       if (wake) wake()
     }
     listeners.add(onMsg)
-    sendMcast(encodeQuery(SERVICE, TYPE_PTR))
+    // First multicast can be missed (join races, buffer drops), so retransmit the query a few
+    // times. Announcers answer every query for our service, so a late/dropped first query still
+    // gets a reply on a retry.
+    const query = encodeQuery(SERVICE, TYPE_PTR)
+    sendMcast(query)
+    const retries = [250, 750].map((d) => setTimeout(() => sendMcast(query), d))
     let done = false
     // NOT unref'd: this timer is the stream terminator; unref would let the loop exit before it fires
     const timer = setTimeout(() => {
@@ -293,6 +308,7 @@ export function createMdns(opts = {}) {
       }
     } finally {
       clearTimeout(timer)
+      for (const r of retries) clearTimeout(r)
       listeners.delete(onMsg)
       lopts.signal?.removeEventListener('abort', onAbort)
     }

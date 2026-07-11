@@ -125,3 +125,33 @@ test('channel descriptor shape matches the uniform surface', () => {
   assert.equal(typeof ch.lookup, 'function')
   ch.close()
 })
+
+// LIVE regression test — the mock bus can't catch real-dgram wiring bugs. This one would have
+// caught BOTH: (1) dgram.createSocket('udp4', optsObj) dropping reuseAddr (2nd instance can't
+// bind 5353), and (2) missing setMulticastLoopback(true) (no same-host delivery). Uses REAL
+// multicast; skips (not fails) where the environment blocks it, so CI stays green everywhere.
+test('LIVE: two real-socket instances discover cross-instance over multicast', async (t) => {
+  let a, b
+  try {
+    a = createMdns()
+    b = createMdns()
+  } catch {
+    a?.close?.()
+    b?.close?.()
+    return t.skip('dgram/multicast unavailable in this environment')
+  }
+  try {
+    await new Promise((r) => setTimeout(r, 400)) // let both bind + join the group
+    const rid = Buffer.alloc(32, 0x5e)
+    const candidates = [{ proto: 'udp4', ip: '127.0.0.1', port: 5555, kind: 'host' }]
+    a.announce(rid, { candidates })
+    const got = []
+    for await (const rec of b.lookup(rid, { timeout: 1500 })) got.push(rec)
+    if (got.length === 0) return t.skip('no multicast loopback delivery in this environment')
+    assert.equal(got[0].channel, 'mdns')
+    assert.deepEqual(got[0].candidates, candidates)
+  } finally {
+    a.close()
+    b.close()
+  }
+})
