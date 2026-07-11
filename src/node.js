@@ -221,12 +221,26 @@ function initiatorHandshake(node, deps, S, dec) {
 /** Responder (accepter) side: send HELLO, run IK responder, key peer by remote static. */
 function acceptConnection(node, deps, socket) {
   const id = node._identity
-  socket.send(encodeFrame(TYPE.HELLO, ZERO8, 0, 0, encodeIdent(id.edPub, id.xPub)))
   const hs = deps.responder({ localX: { pub: id.xPub, priv: id.xPriv } })
-  let rec = null
+  let rec = null, hs1seen = false, tries = 0
+
+  // HELLO must RETRANSMIT: onConnection can fire (and this first HELLO go out) before the
+  // dialer has finished punch() and installed its onMessage — a non-buffering real socket
+  // then drops that HELLO with no recovery, and the dialer waits forever. Resend until HS1
+  // arrives (capped, so a dead/duplicate accept doesn't spin). HS1 itself is retransmitted
+  // by wire's ARQ once the channel exists — only the pre-handshake HELLO needs this.
+  const sendHello = () => { try { socket.send(encodeFrame(TYPE.HELLO, ZERO8, 0, 0, encodeIdent(id.edPub, id.xPub))) } catch { /* */ } }
+  sendHello()
+  const timer = setInterval(() => {
+    if (hs1seen || socket.closed || ++tries >= 8) { clearInterval(timer); return }
+    sendHello()
+  }, 250)
+  if (typeof timer.unref === 'function') timer.unref()
+
   socket.onMessage = (buf) => {
     const f = decodeFrame(buf); if (!f) return
     if (f.type === TYPE.HS1 && !rec) {
+      hs1seen = true; clearInterval(timer)
       const connId = Buffer.from(f.connId)
       let payload
       try { payload = hs.readMessage(f.payload) }
