@@ -147,3 +147,48 @@ export class DHT {
 
   close() { try { this.socket.close(); } catch { /* already closed */ } }
 }
+
+/**
+ * Uniform rendezvous-channel descriptor over the DHT — consumed by src/rendezvous/race.js
+ * alongside createMdns/createTracker. announce = get_peers + announce_peer under the rid
+ * infohash with a marker port; lookup = get_peers yielding discovered ip:port candidates.
+ * DHT stores only a PORT hint (DESIGN D6), so announce info = { port }.
+ * @param {object} [opts]
+ * @param {{getPeers:Function, close:Function}} [opts.dht] injectable backend (tests avoid real UDP)
+ * @param {() => number} [opts.now] clock (ms)
+ * @param {number} [opts.port] default announce port when info.port is absent
+ * @param {number} [opts.rounds] iterative get_peers rounds
+ * @returns {{name:'dht', ridLen:20, announce:Function, lookup:Function, close:Function}}
+ */
+export function createDht(opts = {}) {
+  const now = opts.now || (() => Date.now());
+  const rounds = opts.rounds ?? 6;
+  const dht = opts.dht || new DHT();
+
+  function announce(rid, info = {}) {
+    if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
+    const port = info.port ?? opts.port ?? 0;
+    // fire-and-forget: race drives re-announce on epoch/netchange; a failed announce is non-fatal
+    Promise.resolve(dht.getPeers(rid, { announce: true, port, rounds })).catch(() => {});
+    return { stop() {} };
+  }
+
+  async function* lookup(rid) {
+    if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
+    let res;
+    try { res = await dht.getPeers(rid, { announce: false, rounds }); } catch { return; }
+    const candidates = [];
+    for (const hp of res.peers || []) {
+      const i = hp.lastIndexOf(':');
+      if (i < 0) continue;
+      const ip = hp.slice(0, i);
+      const port = Number(hp.slice(i + 1));
+      if (Number.isInteger(port) && port > 0) candidates.push({ proto: 'udp4', ip, port, kind: 'srflx' });
+    }
+    if (candidates.length) yield { candidates, channel: 'dht', ts: now() };
+  }
+
+  function close() { try { dht.close(); } catch { /* already closed */ } }
+
+  return { name: 'dht', ridLen: 20, announce, lookup, close };
+}

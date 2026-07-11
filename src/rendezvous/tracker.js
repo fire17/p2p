@@ -86,3 +86,38 @@ export function trackerRelayProbe(url, infoHash = randId20(), { timeout = 15000 
     a.onerror = b.onerror = (e) => finish({ ok: false, url, relayed: false, error: (e && e.message) || 'ws error' });
   });
 }
+
+/**
+ * Uniform rendezvous-channel descriptor over WSS trackers — consumed by src/rendezvous/race.js
+ * alongside createMdns/createDht. tracker carries the FULL candidate blob (DESIGN D6).
+ * v1 = announce/echo only: the live offer-RELAY matchmaker (peer discovery via the tracker)
+ * is P1 per D6, so lookup surfaces no peers yet — mDNS + DHT carry v1 discovery. Non-fatal.
+ * @param {object} [opts]
+ * @param {string[]} [opts.trackers] tracker URLs (defaults to TRACKERS)
+ * @param {(url:string, infoHash:string, o?:object)=>Promise<any>} [opts.probe] injectable (tests)
+ * @returns {{name:'tracker', ridLen:20, announce:Function, lookup:Function, close:Function}}
+ */
+export function createTracker(opts = {}) {
+  const trackers = opts.trackers || TRACKERS;
+  const probe = opts.probe || trackerProbe;
+
+  // info (full candidate blob) is accepted for forward-compat; v1 announce is an echo only,
+  // so the blob is parked until relay matchmaking lands (P1).
+  function announce(rid, _info) {
+    if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
+    const infoHash = rid.toString('hex'); // ASCII-safe over the tracker's JSON wire
+    Promise.resolve(probe(trackers[0], infoHash)).catch(() => {});
+    return { stop() {} };
+  }
+
+  // ponytail: v1 tracker yields no peers — live offer relay (peer discovery) is P1 per D6.
+  async function* lookup(rid) {
+    if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
+    // eslint-disable-next-line no-unreachable — intentional empty async generator (P1 relay pending)
+    return;
+  }
+
+  function close() { /* probes self-close their WebSocket; nothing persistent to tear down */ }
+
+  return { name: 'tracker', ridLen: 20, announce, lookup, close };
+}
