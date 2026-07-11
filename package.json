@@ -1,0 +1,18 @@
+{
+  "name": "@fire17/p2p",
+  "version": "0.1.0-dev",
+  "description": "Tiny zero-dependency P2P chat framework: one 26-char key, E2E-encrypted, MITM-proof first contact, NAT traversal, no coordinator server.",
+  "type": "module",
+  "exports": "./src/node.js",
+  "bin": { "p2p-chat": "./bin/p2p-chat.js" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test",
+    "chat": "node bin/p2p-chat.js"
+  },
+  "files": ["src", "bin", "DESIGN.md", "README.md"],
+  "keywords": ["p2p", "chat", "e2e", "encryption", "nat-traversal", "noise", "dht", "zero-dependency", "serverless"],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
