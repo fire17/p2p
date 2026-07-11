@@ -9,9 +9,11 @@
 
 Two teams, disjoint by directory, working in parallel:
 
-- **BUILDERS — the zenith swarm** (`zenith-lane` + `lane-*`, coordinated by `zenith-manager`).
-  Own **all production `src/` code** + `package.json` + `README.md` fill. zenith-manager
-  enforces single-writer-per-file AMONG its own workers.
+- **BUILDERS — the `lane-*` build swarm** (`lane-key`, `lane-wire`, `lane-transport`,
+  `lane-noise`, … — teammates on team `team-lead`/session-668669de, coordinated by MAIN
+  directly). Own **all production `src/` code** + `package.json` + `README.md` fill.
+  Main enforces single-writer-per-file. (NOTE: `zenith-manager` spawned NO workers — the
+  builders are not "a zenith swarm"; zenith is validator-only, below.)
 - **GATE VALIDATORS — the spike lanes** (`spike-crypto`, `spike-transport`,
   `spike-rendezvous`, spawned by main). Own **`test/gate/`** + the live-network gate
   proofs. They independently VALIDATE the builders' code — a stronger check than
