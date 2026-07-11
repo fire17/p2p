@@ -17,7 +17,26 @@
 - **Status:** code is correct; treat the INTERFACES "be64" phrasing as superseded by this
   entry. Verified by KAT byte-exactness against two independent audited impls.
 
-## D-INT-2 — Key's 5-bit field read wholly as `version`, `flags` reserved (P2)
+## D-INT-3 — WSS tracker is a v1 stub, not D6's live matchmaker (cross-net = DHT alone)
+
+- **Where:** `src/rendezvous/tracker.js` — `createTracker().lookup()` is an empty async
+  generator (yields no peers); `announce()` is an echo-only probe; the full candidate blob
+  is accepted but parked.
+- **DESIGN says (D6):** the tracker is a **LIVE MATCHMAKER** — the listener holds persistent
+  tracker connections and answers offers, and the FULL candidate list rides the tracker
+  offer blob. Shipped v1 does none of that peer discovery.
+- **Why:** the live offer-relay matchmaker (sustained connections + offer retention) is more
+  machinery than v1 needs; it is deferred to **P1** (flagged in-code and in `research/
+  rendezvous.md` §4). mDNS + DHT cover v1 discovery.
+- **CONSEQUENCE — state it plainly:** v1 discovery uses **mDNS (LAN only)** + **DHT (the one
+  cross-network rung — returns an ip:port hint)**. So **cross-network first contact rests on
+  the BitTorrent DHT alone** in v1; the "publish-to-N / race-reads" redundancy across three
+  channels (D6) is really two for LAN and *one* for the internet until the tracker matchmaker
+  lands. The DHT round-trip is empirically proven (5/5 live), but it is a single rung — if a
+  network blocks the DHT's UDP, cross-network discovery has no fallback in v1. **This is the
+  main reason the cross-network claim is "machinery ready," not "redundantly ready."**
+- **Status:** intentional scope cut, product works for v1. When P1 adds the tracker
+  matchmaker, restore the 3-channel race and update DESIGN D6 + this entry.
 
 - **Where:** `src/key.js` `encodeKey`/`decodeKey`; the 130-bit layout's first 5 bits are
   labelled "version/flags" in DESIGN D2 / INTERFACES.
@@ -32,6 +51,11 @@
 
 ---
 
-No other intentional divergences. Reality has not contradicted DESIGN elsewhere; where it
-did during the build (e.g. rendezvous BEP44→plain-announce, D7), that was folded into
-DESIGN.md itself rather than logged here, because it changed the design of record.
+No other intentional divergences beyond D-INT-1/2/3 above. Where reality changed the design
+of record during the build (e.g. rendezvous BEP44→plain-announce, D7), that was folded into
+DESIGN.md itself rather than logged here.
+
+> 2026-07-11 correction: D-INT-3 (tracker stub) was added after a second acceptance review
+> caught that it was logged only in ACCEPTANCE-LOG.md, and that this file wrongly claimed
+> "no other intentional divergences." The divergence rule requires every intentional
+> deviation to live here — fixed.
