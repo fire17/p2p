@@ -184,7 +184,10 @@ function initiatorHandshake(node, deps, S, dec) {
 
   return (async () => {
     const cands = await collectCandidates(deps.resolve(S))   // resolve is a STREAM (async gen) in the real path
-    const socket = await node._ep.punch(cands, {})
+    // Per-connect correlation token: collapses transport's 5×-per-dialer onConnection
+    // (one per v4/v6 source tuple) to ONE accept. Correlation only, NOT auth (auth stays
+    // gate+Noise) — reuse myConnId (already random 8 bytes) as the nonce.
+    const socket = await node._ep.punch(cands, { token: myConnId })
     return new Promise((resolve, reject) => {
       let hs = null, helloSeen = false, settled = false
       const fail = (reason, err) => {
