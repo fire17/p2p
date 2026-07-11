@@ -136,3 +136,18 @@ unobserved — durability now real via live keepalive; awaits owner 2nd network)
 GAP-004 — success-path commitment-gate log is DBG-only (acceptance #2 literal "log the commitment
 check"); recommend one unconditional log line. The two retracted High FAILs (GAP-001/002) are fixed
 and empirically re-validated on the production path.
+
+---
+
+## 2ND-REVIEW ADDENDUM (pending doc fix) — tracker divergence unlogged
+
+The 2nd zenith terminal review (post-fix) confirmed the durability fix but surfaced a divergence
+I under-weighted: **src/rendezvous/tracker.js `lookup()` yields NO peers** — the D6 "live
+matchmaker" role is deferred to P1 (announce = echo-only, candidate blob parked). So v1
+cross-network peer discovery rests on the **DHT ip:port hint alone** (mDNS = LAN-only). This is a
+deliberate v1 scope cut, BUT it is a real divergence from DESIGN D6 and is NOT recorded in
+docs/DIVERGENCES.md (which currently asserts "No other intentional divergences"). → VAL-DIVERGENCE-001
+is INCOMPLETE and VAL-RDV-TRACKER-001's PASS is conditional on that entry. Escalated to team-lead
+(docs owner) to add D-INT-3 (tracker matchmaker → P1; v1 cross-net = DHT + mDNS-LAN) + correct the
+completeness line. Mission held OPEN until logged. Also GAP-004 (Low): success-path gate check
+logged only under P2P_DEBUG=1.
