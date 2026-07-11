@@ -1,0 +1,223 @@
+// test/node.test.js — node.js lifecycle logic, seams mocked (transport/noise/key/rendezvous).
+// Real wire.js runs underneath, so ARQ + framing are genuinely exercised. Zero deps.
+
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { listen, identity } from '../src/node.js'
+import { decodeFrame, TYPE } from '../src/wire.js'
+
+// --- mock seams -----------------------------------------------------------
+class TypoError extends Error {}
+
+function mkIdentity(S, tag) {
+  return {
+    S,
+    edPub: Buffer.from(tag + '-ed'), edPriv: Buffer.from(tag + '-edk'),
+    xPub: Buffer.from(tag + '-x'), xPriv: Buffer.from(tag + '-xk'),
+  }
+}
+
+// In-memory switchboard: punch(cands) connects to the node registered under cands[0].to.
+function makeBoard() {
+  const eps = new Map()          // S -> endpoint
+  const registry = new Map()     // S -> identity (for decodeKey/gate)
+  function sock(getPeer, getDrop) {
+    let handler = null; const inbox = []
+    const s = {
+      closed: false, rinfo: { address: 'mock', port: 0 },
+      get onMessage() { return handler },
+      set onMessage(fn) { handler = fn; if (fn) while (inbox.length) fn(inbox.shift()) },  // flush buffered
+      _recv(buf) { if (handler) handler(buf); else inbox.push(buf) },
+      send(buf) {
+        if (s.closed) return
+        const cp = Buffer.from(buf)
+        const drop = getDrop && getDrop()
+        if (drop && drop(cp)) return
+        const p = getPeer()
+        if (p && !p.closed) p._recv(cp)
+      },
+      close() { s.closed = true },
+    }
+    return s
+  }
+  const board = {
+    eps, registry,
+    makeEndpoint() {
+      let onConn = null, dropPred = null
+      const ep = {
+        onConnection(cb) { onConn = cb },
+        on() {}, close() {},
+        setDrop(p) { dropPred = p }, getDrop() { return dropPred },
+        deliver(s) { if (onConn) onConn(s) },
+        punch(cands) {
+          const target = eps.get(cands[0].to)
+          const a = sock(() => b, () => ep.getDrop())          // dialer side (this ep's drop)
+          const b = sock(() => a, () => target.getDrop())      // target side (target's drop)
+          target.deliver(b)
+          return Promise.resolve(a)
+        },
+      }
+      return ep
+    },
+    register(S, ep) { eps.set(S, ep) },
+  }
+  return board
+}
+
+function baseNoise() {
+  const cipher = (tag) => ({
+    encrypt: (pt) => Buffer.concat([Buffer.from([tag]), Buffer.from(pt)]),
+    decrypt: (ct) => { if (ct[0] !== tag) throw new Error('decrypt: bad tag'); return Buffer.from(ct.subarray(1)) },
+  })
+  return {
+    initiator: () => ({
+      writeMessage: (p) => Buffer.concat([Buffer.from('I1'), Buffer.from(p)]),
+      readMessage: (b) => { if (b.subarray(0, 2).toString() !== 'R2') throw new Error('HandshakeError'); return Buffer.from(b.subarray(2)) },
+      split: () => ({ tx: cipher(0x61), rx: cipher(0x62), handshakeHash: Buffer.alloc(32) }),
+    }),
+    responder: () => ({
+      readMessage: (b) => { if (b.subarray(0, 2).toString() !== 'I1') throw new Error('HandshakeError'); return Buffer.from(b.subarray(2)) },
+      writeMessage: (p) => Buffer.concat([Buffer.from('R2'), Buffer.from(p)]),
+      split: () => ({ tx: cipher(0x62), rx: cipher(0x61), handshakeHash: Buffer.alloc(32) }),
+    }),
+  }
+}
+
+function baseDeps(board, over = {}) {
+  const noise = baseNoise()
+  return {
+    generateIdentity: () => mkIdentity('SELF', 'self'),
+    decodeKey: (s) => {
+      const id = board.registry.get(String(s).toUpperCase())
+      if (!id) throw new TypoError('bad key')
+      return { version: 0, flags: 0, commitment: id.xPub }
+    },
+    verifyCommitment: (c, _ed, x) => Buffer.compare(Buffer.from(c), Buffer.from(x)) === 0,
+    createEndpoint: async () => board.makeEndpoint(),
+    initiator: noise.initiator,
+    responder: noise.responder,
+    resolve: async (s) => [{ to: String(s).toUpperCase() }],
+    publishAll: async () => {},
+    ...over,
+  }
+}
+
+async function buildNode(board, S, tag, over = {}) {
+  const id = mkIdentity(S, tag)
+  board.registry.set(S, id)
+  const ep = board.makeEndpoint()
+  board.register(S, ep)
+  const node = await listen(id, { endpoint: ep, deps: baseDeps(board, over), now: () => 0, keepaliveMs: 1e12 })
+  return { node, id, ep }
+}
+
+const nextTick = () => new Promise((r) => setImmediate(r))
+
+// --- tests ----------------------------------------------------------------
+test('identity() delegates to key.generateIdentity via deps', async () => {
+  const id = await identity({ deps: baseDeps(makeBoard()) })
+  assert.equal(id.S, 'SELF')
+  assert.ok(Buffer.isBuffer(id.xPub))
+})
+
+test('connect: gate + IK handshake, first-ack resolves, peer/message/ack events', async () => {
+  const board = makeBoard()
+  const A = await buildNode(board, 'AAAAAAAAAAAAAAAAAAAAAAAAAA', 'alice')
+  const B = await buildNode(board, 'BBBBBBBBBBBBBBBBBBBBBBBBBB', 'bob')
+
+  let aPeerEvents = 0, aMsgs = []
+  A.node.on('peer', () => aPeerEvents++)
+  A.node.on('message', (_p, data) => aMsgs.push(data.toString()))
+
+  const peer = await B.node.connect('AAAAAAAAAAAAAAAAAAAAAAAAAA')
+  assert.equal(peer.connected, true, 'connect resolves only after first-ack, connected')
+  assert.equal(aPeerEvents, 1, 'A emitted peer on accept')
+
+  let ackSeq = -1
+  B.node.on('ack', (_p, seq) => { ackSeq = seq })
+  const seq = await peer.send('hello alice')
+  await nextTick()
+  assert.deepEqual(aMsgs, ['hello alice'])
+  assert.equal(seq, 0)
+  assert.equal(ackSeq, 0, 'B saw ack for seq 0')
+})
+
+test('bidirectional: accepter can send back to the dialer', async () => {
+  const board = makeBoard()
+  const A = await buildNode(board, 'CCCCCCCCCCCCCCCCCCCCCCCCCC', 'a2')
+  const B = await buildNode(board, 'DDDDDDDDDDDDDDDDDDDDDDDDDD', 'b2')
+  const bMsgs = []
+  B.node.on('message', (_p, d) => bMsgs.push(d.toString()))
+  await B.node.connect('CCCCCCCCCCCCCCCCCCCCCCCCCC')
+  await nextTick()
+  const aPeerToB = A.node.peers()[0]
+  await aPeerToB.send('reply from A')
+  await nextTick()
+  assert.deepEqual(bMsgs, ['reply from A'])
+})
+
+test('gate failure: commitment mismatch rejects connect + emits divergence (no auth from HELLO)', async () => {
+  const board = makeBoard()
+  await buildNode(board, 'EEEEEEEEEEEEEEEEEEEEEEEEEE', 'a3')
+  const B = await buildNode(board, 'FFFFFFFFFFFFFFFFFFFFFFFFFF', 'b3', { verifyCommitment: () => false })
+  let div = null
+  B.node.on('divergence', (_p, info) => { div = info })
+  await assert.rejects(B.node.connect('EEEEEEEEEEEEEEEEEEEEEEEEEE'), /gate/)
+  assert.equal(div.reason, 'gate')
+})
+
+test('handshake failure: bad HS2 fails CLOSED (reject + divergence)', async () => {
+  const board = makeBoard()
+  // A responds with a corrupt HS2 -> B.readMessage throws -> fail closed.
+  const badNoise = baseNoise()
+  const goodWrite = badNoise.responder
+  await buildNode(board, 'GGGGGGGGGGGGGGGGGGGGGGGGGG', 'a4', {
+    responder: () => {
+      const hs = goodWrite()
+      return { readMessage: hs.readMessage, writeMessage: () => Buffer.from('XXcorrupt'), split: hs.split }
+    },
+  })
+  const B = await buildNode(board, 'HHHHHHHHHHHHHHHHHHHHHHHHHH', 'b4')
+  let div = null
+  B.node.on('divergence', (_p, info) => { div = info })
+  await assert.rejects(B.node.connect('GGGGGGGGGGGGGGGGGGGGGGGGGG'), /handshake/)
+  assert.equal(div.reason, 'handshake')
+})
+
+test('typo key: decodeKey throws before any network work', async () => {
+  const board = makeBoard()
+  const B = await buildNode(board, 'IIIIIIIIIIIIIIIIIIIIIIIIII', 'b5')
+  await assert.rejects(B.node.connect('UNKNOWNKEYUNKNOWNKEYUNKNOW'), TypoError)
+})
+
+test('resend buffer + exactly-once across reconnect (dropped app-ack, then replay)', async () => {
+  const board = makeBoard()
+  const A = await buildNode(board, 'JJJJJJJJJJJJJJJJJJJJJJJJJJ', 'a6')
+  const B = await buildNode(board, 'KKKKKKKKKKKKKKKKKKKKKKKKKK', 'b6')
+
+  const aMsgs = []
+  A.node.on('message', (_p, d) => aMsgs.push(d.toString()))
+
+  const peer = await B.node.connect('JJJJJJJJJJJJJJJJJJJJJJJJJJ')
+  await peer.send('first')                         // acked normally
+  await nextTick()
+  assert.deepEqual(aMsgs, ['first'])
+
+  // A now drops its outgoing DATA frames -> B never gets the app-ack for 'second'.
+  A.ep.setDrop((buf) => decodeFrame(buf)?.type === TYPE.DATA)
+  let secondAckResolved = false
+  const secondAck = peer.send('second').then(() => { secondAckResolved = true })
+  await nextTick()
+  assert.deepEqual(aMsgs, ['first', 'second'], 'A delivered second exactly once')
+  assert.equal(secondAckResolved, false, 'B has NOT been acked yet (app-ack dropped)')
+
+  // Reconnect: tear down, stop dropping, redial. Outbox replays 'second'.
+  peer.close()
+  A.ep.setDrop(null)
+  const peer2 = await B.node.connect('JJJJJJJJJJJJJJJJJJJJJJJJJJ')
+  await nextTick()
+  await secondAck                                   // replayed ack now resolves
+  assert.equal(secondAckResolved, true)
+  assert.deepEqual(aMsgs, ['first', 'second'], 'no duplicate delivery after replay (exactly-once)')
+  assert.equal(peer2.connected, true)
+})
