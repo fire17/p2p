@@ -48,10 +48,15 @@ that already exist for other reasons. We ride three of them:
   current IP address back. **No server of ours — we're just guests on a network built for
   something else.**
 - **Public WebSocket trackers:** small free servers (run by the BitTorrent community) that
-  introduce peers. Another redundant path.
+  introduce peers. **In v1 this channel is a stub** — the live matchmaker is deferred to a
+  later version, so today it does no peer discovery. It's designed in as the third path but
+  isn't carrying discovery yet.
 
-We publish to all three at once and read from all three at once ("publish-to-N, race the
-reads"), so if one is blocked or slow, the others still work. The critical point: **the
+The design publishes to all three and races the reads ("publish-to-N"). **Honest v1 state:**
+mDNS carries same-network discovery; the **BitTorrent DHT is the one channel doing
+cross-network discovery today**; the tracker is stubbed until a later version. So on a real
+across-the-internet connection, v1 leans on the DHT alone — it works (proven live), but it's
+a single path, not yet the redundant three. The critical point: **the
 only thing anyone learns from these boards is an opaque hash and an IP address** — never
 your identity, never your messages. Observers can't even tell it's "p2p" traffic.
 
