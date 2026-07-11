@@ -15,8 +15,11 @@ node.group(keys[]) / group.send(...)                                // groups (d
 Design promises the API must keep:
 - `connect()` resolves only after the MITM-proof handshake completes — the resolved
   "first ack" IS the proof surface the owner specified.
-- Everything async/non-blocking; reconnects automatic; sends buffered + resent across
-  reconnects (seq+ack), backpressure exposed.
+- Everything async/non-blocking. Liveness: a dead peer is detected within ~keepaliveMs×3
+  of silence — the node emits `disconnect` and `peer.connected` flips false. Reconnect is
+  **app-initiated in v1**: call `connect(key)` again; it re-handshakes (not the corpse) and
+  the buffered outbox flushes exactly-once (seq+ack). Backpressure exposed. **Automatic
+  background redial is v1.1** — v1 gives you the `disconnect` signal to trigger it yourself.
 - Instant-on: `listen()` returns fast, rendezvous publishing continues in background.
 - Zero config required; every knob optional with sane defaults (defaults are the decision).
 - Wire format + key format versioned from byte 0.
