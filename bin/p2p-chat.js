@@ -153,7 +153,7 @@ function printAck(peer) {
 }
 
 // ── REPL wiring shared by both modes ─────────────────────────────────────────
-function startRepl(node, getPeers) {
+function startRepl(node, getPeers, { isDialer = false } = {}) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: cyan('you › ') })
   node.on('message', (peer, data) => {
     // redraw cleanly under the prompt
@@ -195,7 +195,12 @@ function startRepl(node, getPeers) {
     process.exit(0)
   }
   rl.on('SIGINT', shutdown)
-  rl.on('close', shutdown) // stdin EOF (piped input, or Ctrl-D): drain then exit, don't hang
+  // stdin EOF: a DIALER (piped send) or an interactive TTY user (Ctrl-D) exits. But a
+  // non-TTY LISTENER (backgrounded, e.g. `node p2p-chat > log &`) must NOT self-close —
+  // that would tear down its endpoint and stop mDNS announce, making it undiscoverable.
+  rl.on('close', () => {
+    if (isDialer || process.stdin.isTTY) shutdown()
+  })
   process.on('SIGINT', shutdown)
   return rl
 }
@@ -212,7 +217,7 @@ async function runListen(be) {
   }
   printKey(id.S)
   console.log(dim('  listening · waiting for a friend to connect…'))
-  startRepl(node, () => node.peers())
+  startRepl(node, () => node.peers(), { isDialer: false })
 }
 
 async function runConnect(be, KEY) {
@@ -244,7 +249,7 @@ async function runConnect(be, KEY) {
     process.exit(3)
   }
   printAck(peer)
-  startRepl(node, () => node.peers())
+  startRepl(node, () => node.peers(), { isDialer: true })
 }
 
 // ── --selftest: two in-process nodes, full round-trip (CLI plumbing proof) ────
