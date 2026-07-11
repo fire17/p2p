@@ -190,6 +190,29 @@ test('typo key: decodeKey throws before any network work', async () => {
   await assert.rejects(B.node.connect('UNKNOWNKEYUNKNOWNKEYUNKNOW'), TypoError)
 })
 
+test('real-path shapes: listen announces via publishAll(S,endpoint); connect drains a streaming resolve', async () => {
+  const board = makeBoard()
+  const published = []
+  async function* streamResolve(s) { yield { to: String(s).toUpperCase() } }  // like createRace.resolve (async gen)
+  const A = await buildNode(board, 'LLLLLLLLLLLLLLLLLLLLLLLLLL', 'astream', {
+    resolve: (s) => streamResolve(s),
+    publishAll: async (s, ep) => { published.push([s, !!ep]) },
+  })
+  const B = await buildNode(board, 'MMMMMMMMMMMMMMMMMMMMMMMMMM', 'bstream', {
+    resolve: (s) => streamResolve(s), publishAll: async () => {},
+  })
+  await nextTick()
+  assert.deepEqual(published, [['LLLLLLLLLLLLLLLLLLLLLLLLLL', true]], 'listen announced S with an endpoint')
+
+  const aMsgs = []
+  A.node.on('message', (_p, d) => aMsgs.push(d.toString()))
+  const peer = await B.node.connect('LLLLLLLLLLLLLLLLLLLLLLLLLL')   // resolve here is an async generator
+  await peer.send('via stream')
+  await nextTick()
+  assert.equal(peer.connected, true)
+  assert.deepEqual(aMsgs, ['via stream'])
+})
+
 test('resend buffer + exactly-once across reconnect (dropped app-ack, then replay)', async () => {
   const board = makeBoard()
   const A = await buildNode(board, 'JJJJJJJJJJJJJJJJJJJJJJJJJJ', 'a6')

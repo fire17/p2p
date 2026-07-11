@@ -132,18 +132,47 @@ function makePeer(node, { S = null } = {}) {
   return { peer, attach, channel: () => ch, _outbox: outbox, _delivered: delivered }
 }
 
-/** Merge injected seams with lazy real defaults. Full injection => no sibling import. */
-async function resolveDeps(inj = {}) {
+/**
+ * Merge injected seams with lazy real defaults. Full injection => no sibling import
+ * (tests never touch real modules). Real path: rendezvous is a FACTORY — createRace
+ * exports {publishAll,resolve}, NOT bare functions, and its channels come from the
+ * createMdns/createDht/createTracker factories. Construct that here.
+ * @param {object} inj  injected deps
+ * @param {object} opts listen opts (passed to channel/endpoint factories)
+ */
+async function resolveDeps(inj = {}, opts = {}) {
   const need = ['generateIdentity', 'decodeKey', 'verifyCommitment', 'createEndpoint', 'initiator', 'responder', 'resolve', 'publishAll']
   if (need.every((k) => typeof inj[k] === 'function')) return inj
-  const [key, noise, transport, race] = await Promise.all([
-    import('./key.js'), import('./noise.js'), import('./transport.js'), import('./rendezvous/race.js'),
+  const [key, noise, transport, race, mdns, dht, tracker] = await Promise.all([
+    import('./key.js'), import('./noise.js'), import('./transport.js'),
+    import('./rendezvous/race.js'), import('./rendezvous/mdns.js'),
+    import('./rendezvous/dht.js'), import('./rendezvous/tracker.js'),
   ])
+  let { resolve, publishAll } = inj
+  if (!resolve || !publishAll) {
+    const channels = [mdns.createMdns(opts), dht.createDht(opts), tracker.createTracker(opts)]
+    const r = race.createRace({ channels, now: opts.now })
+    resolve = resolve || r.resolve
+    publishAll = publishAll || r.publishAll
+  }
   return {
     generateIdentity: key.generateIdentity, decodeKey: key.decodeKey, verifyCommitment: key.verifyCommitment,
     createEndpoint: transport.createEndpoint, initiator: noise.initiator, responder: noise.responder,
-    resolve: race.resolve, publishAll: race.publishAll, ...inj,
+    resolve, publishAll, ...inj,
   }
+}
+
+/** Drain a candidate source (async generator | Promise<array> | array) into a bounded array. */
+async function collectCandidates(source, cap = 64) {
+  let r = source
+  if (r && typeof r.then === 'function') r = await r
+  const out = []
+  if (r && typeof r[Symbol.asyncIterator] === 'function') {
+    for await (const c of r) { out.push(c); if (out.length >= cap) break }
+  } else if (r && typeof r[Symbol.iterator] === 'function') {
+    for (const c of r) { out.push(c); if (out.length >= cap) break }
+  } else if (r) { out.push(r) }
+  return out
 }
 
 /** Initiator (dialer) side: resolve -> punch -> gate HELLO -> IK -> resolve after first-ack. */
@@ -153,7 +182,7 @@ function initiatorHandshake(node, deps, S, dec) {
   const myConnId = randomBytes(8)
 
   return (async () => {
-    const cands = await deps.resolve(S)
+    const cands = await collectCandidates(deps.resolve(S))   // resolve is a STREAM (async gen) in the real path
     const socket = await node._ep.punch(cands, {})
     return new Promise((resolve, reject) => {
       let hs = null, helloSeen = false, settled = false
@@ -256,8 +285,9 @@ function createNode(identity, opts, deps, ep) {
  * @returns {Promise<{S:string,edPub:Buffer,edPriv:Buffer,xPub:Buffer,xPriv:Buffer}>}
  */
 export async function identity(opts = {}) {
-  const deps = await resolveDeps(opts.deps)
-  return deps.generateIdentity()
+  const inj = opts.deps || {}
+  const gen = inj.generateIdentity || (await import('./key.js')).generateIdentity  // no rendezvous just to keygen
+  return gen()
 }
 
 /**
@@ -268,7 +298,7 @@ export async function identity(opts = {}) {
  * @returns {Promise<object>} node
  */
 export async function listen(id, opts = {}) {
-  const deps = await resolveDeps(opts.deps)
+  const deps = await resolveDeps(opts.deps || {}, opts)
   const ep = opts.endpoint || await deps.createEndpoint({ port: opts.port })
   const node = createNode(id, opts, deps, ep)
   Promise.resolve()
