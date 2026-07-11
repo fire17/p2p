@@ -130,8 +130,8 @@ test('createRace consumes all three uniformly (integration smoke)', async () => 
   handle.stop()
   // resolve merges dht candidates (mdns/tracker mocks surface none here)
   const out = []
-  // short lookup window: mdns/tracker mocks surface nothing, dht mock resolves immediately
-  for await (const c of race.resolve('0QNPVP2F1Y1W9WHCRY3ZCPC5MJ', { timeout: 100 })) out.push(c)
+  // short lookup window + no LAN grace: mdns/tracker mocks surface nothing, dht mock resolves now
+  for await (const c of race.resolve('0QNPVP2F1Y1W9WHCRY3ZCPC5MJ', { timeout: 100, lanGraceMs: 0 })) out.push(c)
   assert.ok(out.some((c) => c.channel === 'dht'))
   mdns.close()
   dht.close()

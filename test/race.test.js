@@ -96,39 +96,61 @@ test('publishAll re-announces on netchange', () => {
 // ── resolve merge / dedup / rank / cap ─────────────────────────────────────────
 const C = (ip, port, proto = 'udp4', kind = 'host') => ({ proto, ip, port, kind })
 
-test('resolve merges + dedups across channels and epochs, tagging channel + score', async () => {
-  const shared = C('5.5.5.5', 100)
-  const mdns = mockChannel('mdns', 32, [{ candidates: [C('192.168.0.2', 22, 'udp4', 'lan'), shared], channel: 'mdns', ts: MIDDAY }])
-  const dht = mockChannel('dht', 20, [{ candidates: [shared, C('8.8.8.8', 80)], channel: 'dht', ts: MIDDAY }])
-  const race = createRace({ channels: [mdns, dht], now: () => MIDDAY })
+test('resolve dedups mDNS candidates across epochs, tagging channel + score', async () => {
+  const mdns = mockChannel('mdns', 32, [{ candidates: [C('192.168.0.2', 22, 'udp4', 'lan'), C('5.5.5.5', 100)], channel: 'mdns', ts: MIDDAY }])
+  const race = createRace({ channels: [mdns], now: () => MIDDAY })
 
   const out = []
-  for await (const c of race.resolve(S)) out.push(c)
+  for await (const c of race.resolve(S, { lanGraceMs: 0 })) out.push(c)
 
-  // unique candidates: lan, shared, 8.8.8.8 → 3 (shared appears in both but deduped once)
+  // mdns is queried once per epoch (yesterday/today/tomorrow) → the same 2 candidates arrive 3×
+  // and must dedup to 2 unique, each tagged + scored
   const keys = out.map(candidateKey).sort()
-  assert.deepEqual(keys, ['udp4:192.168.0.2:22', 'udp4:5.5.5.5:100', 'udp4:8.8.8.8:80'])
-  // every candidate is channel-tagged and scored
+  assert.deepEqual(keys, ['udp4:192.168.0.2:22', 'udp4:5.5.5.5:100'])
   for (const c of out) {
-    assert.ok(c.channel === 'mdns' || c.channel === 'dht')
+    assert.equal(c.channel, 'mdns')
     assert.equal(typeof c.score, 'number')
   }
-  // mdns-sourced candidates rank ahead of dht-sourced (lower score)
-  const lan = out.find((c) => c.ip === '192.168.0.2')
-  const dhtOnly = out.find((c) => c.ip === '8.8.8.8')
-  assert.ok(lan.score < dhtOnly.score)
+})
+
+test('resolve skips DHT when mDNS finds a peer; falls back to DHT only when mDNS is empty (D6)', async () => {
+  // (a) mDNS yields → DHT lookup must NOT run at all
+  const mdnsHit = mockChannel('mdns', 32, [{ candidates: [C('192.168.0.9', 1, 'udp4', 'lan')], channel: 'mdns', ts: MIDDAY }])
+  let dhtStarted = false
+  const dhtSpy = { name: 'dht', ridLen: 20, announce() {}, async *lookup() { dhtStarted = true; if (false) yield {} } }
+  let race = createRace({ channels: [mdnsHit, dhtSpy], now: () => MIDDAY })
+  let out = []
+  for await (const c of race.resolve(S, { lanGraceMs: 0 })) out.push(c)
+  assert.deepEqual(out.map(candidateKey), ['udp4:192.168.0.9:1']) // 3 epochs, deduped to 1
+  assert.equal(out[0].channel, 'mdns')
+  assert.equal(dhtStarted, false, 'DHT lookup must NOT run when mDNS already found a peer')
+
+  // (b) mDNS empty → DHT fallback runs and its candidates surface, ranked as dht (weight ≥ 2e6)
+  const mdnsEmpty = mockChannel('mdns', 32, [])
+  const dht = mockChannel('dht', 20, [{ candidates: [C('8.8.8.8', 80)], channel: 'dht', ts: MIDDAY }])
+  race = createRace({ channels: [mdnsEmpty, dht], now: () => MIDDAY })
+  out = []
+  for await (const c of race.resolve(S, { lanGraceMs: 0 })) out.push(c)
+  assert.deepEqual(out.map(candidateKey), ['udp4:8.8.8.8:80'])
+  assert.equal(out[0].channel, 'dht')
+  assert.ok(out[0].score >= 2e6)
 })
 
 test('resolve enforces per-channel and global dial caps', async () => {
   const many = Array.from({ length: 15 }, (_, i) => C('10.0.0.' + i, 3000 + i))
-  const mdns = mockChannel('mdns', 32, [{ candidates: many, channel: 'mdns', ts: MIDDAY }])
-  const dht = mockChannel('dht', 20, [{ candidates: many.map((c) => ({ ...c, ip: '11.0.0' + c.port })), channel: 'dht', ts: MIDDAY }])
-  const race = createRace({ channels: [mdns, dht], now: () => MIDDAY, perChannelCap: 8, dialCap: 12 })
+  // per-channel cap bounds a single (mDNS) channel
+  let mdns = mockChannel('mdns', 32, [{ candidates: many, channel: 'mdns', ts: MIDDAY }])
+  let race = createRace({ channels: [mdns], now: () => MIDDAY, perChannelCap: 8, dialCap: 20 })
+  let out = []
+  for await (const c of race.resolve(S, { lanGraceMs: 0 })) out.push(c)
+  assert.equal(out.length, 8, 'per-channel cap (8) bounds mDNS')
 
-  const out = []
-  for await (const c of race.resolve(S)) out.push(c)
-  assert.ok(out.length <= 12, 'global dialCap respected')
-  assert.ok(out.filter((c) => c.channel === 'mdns').length <= 8, 'per-channel cap respected')
+  // global dialCap bounds the total
+  mdns = mockChannel('mdns', 32, [{ candidates: many, channel: 'mdns', ts: MIDDAY }])
+  race = createRace({ channels: [mdns], now: () => MIDDAY, perChannelCap: 20, dialCap: 5 })
+  out = []
+  for await (const c of race.resolve(S, { lanGraceMs: 0 })) out.push(c)
+  assert.equal(out.length, 5, 'global dialCap bounds the total')
 })
 
 test('createRace rejects empty channel set', () => {

@@ -91,24 +91,29 @@ export class DHT {
 
   /** iterative get_peers toward infohash (20B). Optionally announce self under it.
    *  @returns {Promise<{peers:string[], announced:number, queried:number, tokenNodes:number}>} */
-  async getPeers(infohash, { announce = false, port = 0, rounds = 6, alpha = 8 } = {}) {
+  async getPeers(infohash, { announce = false, port = 0, rounds = 6, alpha = 8, signal, stopOnFirstPeers = false } = {}) {
     await this.ready();
     const seen = new Map();   // "host:port" -> {id?, host, port, token?, queried, dist}
     const peers = new Set();
     const withToken = [];
 
-    // seed: resolve bootstrap hosts to IPs
-    for (const b of BOOTSTRAP) {
+    // seed: resolve bootstrap hosts to IPs IN PARALLEL (a slow/dead resolver must not serialize
+    // in front of the others — this is on the latency path for the DHT fallback).
+    await Promise.all(BOOTSTRAP.map(async (b) => {
       try {
         const { address } = await dns.lookup(b.host, { family: 4 });
         const k = `${address}:${b.port}`;
         if (!seen.has(k)) seen.set(k, { host: address, port: b.port, queried: false, dist: null });
       } catch { /* skip unresolvable bootstrap */ }
-    }
+    }));
 
     const dist = (n) => (n.id ? xor(n.id, infohash) : Buffer.alloc(20, 0xff));
 
     for (let round = 0; round < rounds; round++) {
+      if (signal?.aborted) break; // caller gave up (e.g. LAN peer already found) — stop early
+      // stopOnFirstPeers: lookups (not announces) can return the moment any peer is found —
+      // shaves rounds off the latency path. OFF by default so the live gate test is unaffected.
+      if (stopOnFirstPeers && !announce && peers.size > 0) break;
       const cand = [...seen.values()].filter((n) => !n.queried)
         .sort((a, b) => cmpBuf(dist(a), dist(b))).slice(0, alpha);
       if (cand.length === 0) break;
@@ -173,10 +178,12 @@ export function createDht(opts = {}) {
     return { stop() {} };
   }
 
-  async function* lookup(rid) {
+  async function* lookup(rid, lopts = {}) {
     if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
     let res;
-    try { res = await dht.getPeers(rid, { announce: false, rounds }); } catch { return; }
+    try {
+      res = await dht.getPeers(rid, { announce: false, rounds, signal: lopts.signal, stopOnFirstPeers: true });
+    } catch { return; }
     const candidates = [];
     for (const hp of res.peers || []) {
       const i = hp.lastIndexOf(':');
