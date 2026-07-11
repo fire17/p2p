@@ -26,6 +26,9 @@ import { createGroup } from './group.js'
 const APP = Object.freeze({ MSG: 1, ACK: 2 })
 const ZERO8 = Buffer.alloc(8)
 
+/** Opt-in trace (P2P_DEBUG=1) for first-contact diagnostics — no-op by default. */
+const DBG = process.env.P2P_DEBUG ? (...a) => { try { console.error('[p2p]', ...a) } catch { /* */ } } : () => {}
+
 const asBuf = (d) => (typeof d === 'string' ? Buffer.from(d, 'utf8') : Buffer.from(d))
 
 /** App frame: [1B kind][4B seq][payload]. */
@@ -163,13 +166,40 @@ async function resolveDeps(inj = {}, opts = {}) {
   }
 }
 
-/** Drain a candidate source (async generator | Promise<array> | array) into a bounded array. */
-async function collectCandidates(source, cap = 64) {
+const DEADLINE = Symbol('deadline')
+
+/**
+ * Drain a candidate source (async generator | Promise<array> | array) into a bounded
+ * array — but DON'T wait for the whole stream to end. Real resolve() streams mDNS at
+ * ~1ms yet only ENDS at ~13s (DHT/tracker stragglers); punching must start as soon as a
+ * usable candidate lands. Strategy: block for the FIRST candidate (however long discovery
+ * takes), then a short grace window for stragglers, then return. Closes the stream on the
+ * way out so slow DHT/tracker lookups stop.
+ * @param {any} source @param {number} [cap] @param {number} [graceMs]
+ */
+async function collectCandidates(source, cap = 64, graceMs = 1500) {
   let r = source
   if (r && typeof r.then === 'function') r = await r
   const out = []
   if (r && typeof r[Symbol.asyncIterator] === 'function') {
-    for await (const c of r) { out.push(c); if (out.length >= cap) break }
+    const it = r[Symbol.asyncIterator]()
+    try {
+      const first = await it.next()                       // wait for the first candidate, no deadline
+      if (!first.done) {
+        out.push(first.value)
+        let timer
+        const grace = new Promise((res) => { timer = setTimeout(() => res(DEADLINE), graceMs); if (timer.unref) timer.unref() })
+        try {
+          while (out.length < cap) {
+            const nx = await Promise.race([it.next(), grace])
+            if (nx === DEADLINE || nx.done) break         // grace elapsed or stream ended -> punch now
+            out.push(nx.value)
+          }
+        } finally { clearTimeout(timer) }
+      }
+    } finally {
+      if (typeof it.return === 'function') { try { await it.return() } catch { /* stop the stream */ } }
+    }
   } else if (r && typeof r[Symbol.iterator] === 'function') {
     for (const c of r) { out.push(c); if (out.length >= cap) break }
   } else if (r) { out.push(r) }
@@ -184,10 +214,12 @@ function initiatorHandshake(node, deps, S, dec) {
 
   return (async () => {
     const cands = await collectCandidates(deps.resolve(S))   // resolve is a STREAM (async gen) in the real path
+    DBG('dial: collected', cands.length, 'candidates -> punch')
     // Per-connect correlation token: collapses transport's 5×-per-dialer onConnection
     // (one per v4/v6 source tuple) to ONE accept. Correlation only, NOT auth (auth stays
     // gate+Noise) — reuse myConnId (already random 8 bytes) as the nonce.
     const socket = await node._ep.punch(cands, { token: myConnId })
+    DBG('dial: punch resolved, socket ready -> awaiting HELLO')
     return new Promise((resolve, reject) => {
       let hs = null, helloSeen = false, settled = false
       const fail = (reason, err) => {
@@ -198,10 +230,12 @@ function initiatorHandshake(node, deps, S, dec) {
       }
       socket.onMessage = (buf) => {
         const f = decodeFrame(buf); if (!f) return
+        DBG('dial: recv frame type', f.type)
         if (f.type === TYPE.HELLO && !helloSeen) {
           helloSeen = true
           const { edPub, xPub } = decodeIdent(f.payload)
           if (!deps.verifyCommitment(dec.commitment, edPub, xPub)) return fail('gate')  // NOT auth — cheap prefilter (D4)
+          DBG('dial: HELLO gated OK -> send HS1')
           rec.peer.remoteStatic = Buffer.from(xPub)
           hs = deps.initiator({ localX: { pub: node._identity.xPub, priv: node._identity.xPriv }, remoteXPub: xPub })
           socket.send(encodeFrame(TYPE.HS1, myConnId, 0, 0, hs.writeMessage(encodeIdent(node._identity.edPub, node._identity.xPub))))
@@ -233,6 +267,7 @@ function acceptConnection(node, deps, socket) {
   // arrives (capped, so a dead/duplicate accept doesn't spin). HS1 itself is retransmitted
   // by wire's ARQ once the channel exists — only the pre-handshake HELLO needs this.
   const sendHello = () => { try { socket.send(encodeFrame(TYPE.HELLO, ZERO8, 0, 0, encodeIdent(id.edPub, id.xPub))) } catch { /* */ } }
+  DBG('accept: onConnection -> sending HELLO')
   sendHello()
   const timer = setInterval(() => {
     if (hs1seen || socket.closed || ++tries >= 8) { clearInterval(timer); return }
@@ -242,6 +277,7 @@ function acceptConnection(node, deps, socket) {
 
   socket.onMessage = (buf) => {
     const f = decodeFrame(buf); if (!f) return
+    DBG('accept: recv frame type', f.type)
     if (f.type === TYPE.HS1 && !rec) {
       hs1seen = true; clearInterval(timer)
       const connId = Buffer.from(f.connId)
