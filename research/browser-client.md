@@ -53,7 +53,7 @@ The existing stack, read from disk (`src/*.js`, 2026-07-12):
 | Rendezvous — WSS trackers | `src/rendezvous/tracker.js` | **PORTS AS-IS** — it already uses the **global `WebSocket`**, which is browser-native. Same `infoHashFor(rid)`. |
 | Rendezvous — DHT, mDNS | `src/rendezvous/dht.js`, `mdns.js` | **CANNOT PORT.** Both need raw UDP. Browser discovery = **trackers only** (§4.3). |
 | Framing + ARQ (seq/ack, resend, keepalive) | `src/wire.js` | **NOT NEEDED over WebRTC** (a DataChannel is already reliable+ordered over SCTP). Kept only for the WSS-relay path. See §5.3 — this is a real interop seam, handled explicitly. |
-| UDP core, STUN client, hole punch, TCP fallback | `src/transport.js` | **REPLACED** by `transport-webrtc.js` behind the identical seam. |
+| UDP core, STUN client, hole punch, TCP fallback | `src/transport.js` | **REPLACED** by `src/browser/webrtc.js` behind the identical seam. |
 
 **The seam already exists and is clean.** `src/node.js` takes `createEndpoint` via `opts.deps` /
 `opts.endpoint` and only ever calls `ep.punch(candidates, {token})` → a socket-like with
@@ -78,7 +78,7 @@ important structural finding of this study: *the browser client is a transport s
                       │                                                                          │
                       │  node.js  (unchanged: HELLO → GATE → IK → MSG/ACK outbox)                │
                       │                                                                          │
-                      │  transport-webrtc.js   ── the ONLY new module ──                         │
+                      │  src/browser/webrtc.js ── the ONLY new module ──                         │
                       │    RTCPeerConnection + RTCDataChannel (reliable, ordered)                │
                       └───────┬───────────────────────────────────────────────┬──────────────────┘
                               │                                               │
@@ -384,7 +384,7 @@ is **UNVERIFIED** but it is a full ICE+DTLS+SCTP+SRTP stack, so: substantial, ce
 
 **Recommendation (BC-6A):** ship WebRTC-for-Node as an **optional adapter, not a core dependency**:
 
-- `src/transport-webrtc.js` is written against the **standard `RTCPeerConnection` API**. In a browser
+- `src/browser/webrtc.js` is written against the **standard `RTCPeerConnection` API**. In a browser
   it uses the global. In Node it does `await import('werift')` **inside a try/catch**.
 - If the import fails (nobody installed it), the TUI simply **does not offer the WebRTC transport** and
   falls back to Option B. Nothing breaks; no install is forced.
@@ -791,7 +791,7 @@ under `spikes/`; any failure escalates before a line of real code:
 
 **P1 — the browser client (browser ↔ browser, shippable on its own).**
 `crypto-webcrypto.js` (primitive adapter) · vendored `chacha.js` (pinned + hash-checked) ·
-`transport-webrtc.js` (the only genuinely new module) · browser `tracker.js` (Buffer → Uint8Array) ·
+`src/browser/webrtc.js` (the only genuinely new module) · browser `tracker.js` (Buffer → Uint8Array) ·
 non-extractable-key storage (§8.3) · a static page served over HTTPS with a strict CSP. `key.js`,
 `noise.js`, `node.js`, `group.js` are shared source. **Deliverable: two browsers on different
 networks chat, E2E, with a verified no-MITM first ack — and the page is served from the existing
@@ -801,7 +801,7 @@ static host with no backend.**
 rendezvous channels do:
   - **`transport-wss.js`** — zero-dep blind-relay transport (§6.3), works browser↔TUI↔browser through
     any NAT. This is the floor: it makes the interop promise unconditional.
-  - **`transport-webrtc.js` in Node** via an **optional, dynamically-imported `werift`** (§6.2), so a
+  - **`src/browser/webrtc.js` in Node** via an **optional, dynamically-imported `werift`** (§6.2), so a
     user who wants direct browser↔TUI P2P installs one optional dep and the core stays zero-dep.
   **Gate:** a **TUI ↔ browser chat across two real networks**, plus the byte-exactness assertion from
   G1 holding on the live wire.
@@ -922,3 +922,22 @@ TURN field; an in-browser `p2p doctor` (ICE/STUN/tracker diagnostics, mirroring 
 §4 (signaling), §5 (transport), §6 (interop), §7 (groups) and §11 (phases) without re-researching —
 and defend it with §8–§9. Every load-bearing claim carries a URL; §12 lists everything UNVERIFIED.
 Honest status: **DESIGNED, NOT YET DEMONSTRATED** — G1–G3 are the gates that change that.*
+
+---
+
+## AS-BUILT (2026-07-12) — one WebRTC module, not two
+
+This study assumed a `src/transport-webrtc.js` separate from the browser's own transport. **The build
+collapsed them into ONE module: `src/browser/webrtc.js`.** It is written against the standard
+`RTCPeerConnection` API and takes `opts.RTCPeerConnection`, so it runs:
+
+- **in a browser** on the global `RTCPeerConnection`, and
+- **in Node** on an injected `werift` `RTCPeerConnection` (the optional dep; core `package.json` stays
+  `dependencies: {}`).
+
+Both runtimes therefore execute the **same signaling code** against the **same public WSS trackers** —
+which is the transport-swap thesis applied to the transport itself. Proven live (paired witness,
+Chromium ↔ Node/werift, real trackers, real ICE, real DataChannel, Noise IK first-ack + chat both
+ways; harness: `test/werift-tui-e2e.mjs`, self-skips without werift). A second Node-only WebRTC
+transport existed briefly and was **deleted** — shipping two overlapping WebRTC transports is a
+maintenance trap, not a feature.
