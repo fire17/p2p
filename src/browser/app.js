@@ -106,6 +106,13 @@ function newGroupSecret() {
 
 async function main() {
   try {
+    // Deep link FIRST (needs only the DOM, not the network): /app/#<26-CHAR-KEY> pre-fills the dial
+    // box; /app/#<longer group code> pre-fills the group Join box. Done before going online so a
+    // shared link is ready instantly.
+    const frag = decodeURIComponent(location.hash.replace('#', '')).trim()
+    if (frag.length === 26) { $('peerkey').value = frag.toUpperCase(); showTab('pair') }
+    else if (frag.length > 26) { $('groupSecret').value = frag; showTab('group') }
+
     const id = await identity()
     $('mykey').textContent = id.S
     status('going online…')
@@ -137,11 +144,6 @@ async function main() {
     window.__secureGroupJoin = async () => { await secureGroup.join(); return secureGroup.members() }
     window.__secureGroupSend = (text) => secureGroup && secureGroup.send(text)
     window.__secureGroupMembers = () => (secureGroup ? secureGroup.members() : [])
-
-    // Deep link: /app/#<KEY> pre-fills the dial box (a 26-char key) OR, if it's longer, a group code.
-    const frag = decodeURIComponent(location.hash.replace('#', '')).trim()
-    if (frag.length === 26) { $('peerkey').value = frag.toUpperCase(); showTab('pair') }
-    else if (frag.length > 26) { $('groupSecret').value = frag; showTab('group') }
   } catch (err) {
     status('failed to start', false)
     say(err.message, 'sys err')
