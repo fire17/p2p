@@ -189,7 +189,10 @@ const send = async () => {
   try { await current.send(text) } catch (err) { say(`send failed: ${err.message}`, 'sys err') }
 }
 $('send').onclick = send
-$('msg').onkeydown = (e) => e.key === 'Enter' && send()
+// NB: a DOM0 onkeydown that RETURNS false calls preventDefault — cancelling the keystroke. The old
+// `(e) => e.key === 'Enter' && send()` returned false for every non-Enter key, so nothing could be
+// typed. Use a statement body that returns undefined so normal typing is never cancelled.
+$('msg').onkeydown = (e) => { if (e.key === 'Enter') send() }
 
 // ── group handlers ──
 $('groupNew').onclick = async () => {
@@ -232,6 +235,6 @@ const groupSend = async () => {
   try { await group.send(text) } catch (err) { gsay(`send failed: ${err.message}`, 'sys err') }
 }
 $('groupSend').onclick = groupSend
-$('groupMsg').onkeydown = (e) => e.key === 'Enter' && groupSend()
+$('groupMsg').onkeydown = (e) => { if (e.key === 'Enter') groupSend() }
 
 main()
