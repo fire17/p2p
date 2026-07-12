@@ -96,6 +96,13 @@ function baseDeps(board, over = {}) {
       return { version: 0, flags: 0, commitment: id.xPub }
     },
     verifyCommitment: (c, _ed, x) => Buffer.compare(Buffer.from(c), Buffer.from(x)) === 0,
+    // mock of key.encodeKey: map a pubkey pair back to its registered 26-char contact string
+    encodeKey: (_ed, x) => {
+      for (const [S, id] of board.registry) {
+        if (Buffer.from(id.xPub).equals(Buffer.from(x))) return S
+      }
+      return 'UNKNOWN'
+    },
     createEndpoint: async () => board.makeEndpoint(),
     initiator: noise.initiator,
     responder: noise.responder,
@@ -253,6 +260,31 @@ test('resend buffer + exactly-once across reconnect (dropped app-ack, then repla
   assert.equal(secondAckResolved, true)
   assert.deepEqual(aMsgs, ['first', 'second'], 'no duplicate delivery after replay (exactly-once)')
   assert.equal(peer2.connected, true)
+})
+
+test('friends: BOTH sides learn the other peer\'s real 26-char key (peer.key + remoteEd)', async () => {
+  const board = makeBoard()
+  const KA = 'RRRRRRRRRRRRRRRRRRRRRRRRRR', KB = 'SSSSSSSSSSSSSSSSSSSSSSSSSS'
+  const A = await buildNode(board, KA, 'fa')
+  const B = await buildNode(board, KB, 'fb')
+
+  const bAccepted = []
+  B.node.on('peer', (p) => bAccepted.push(p))       // key must be readable IN the handler
+
+  const aPeer = await A.node.connect(KB)
+  await nextTick()
+
+  // dialer derived the key it dialed
+  assert.equal(aPeer.key, KB, "dialer's peer.key === the key it dialed (B's S)")
+  assert.ok(Buffer.isBuffer(aPeer.remoteEd) && Buffer.isBuffer(aPeer.remoteStatic))
+
+  // listener derived the DIALER's real shareable key — this is what makes friends work
+  assert.equal(bAccepted.length, 1)
+  assert.equal(bAccepted[0].key, KA, "listener's accepted peer.key === the dialer's real key (A's S)")
+  assert.ok(Buffer.isBuffer(bAccepted[0].remoteEd), 'listener captured the dialer edPub')
+  assert.ok(bAccepted[0].remoteStatic.equals(A.id.xPub), 'listener captured the dialer xPub')
+
+  A.node.close(); B.node.close()
 })
 
 test('peer RESTART (fresh instance) reply is NOT deduped against the dead session (bidirectional)', async () => {

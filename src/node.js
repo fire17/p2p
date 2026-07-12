@@ -66,6 +66,19 @@ function decodeIntro(buf) {
   return { edPub: Buffer.from(edPub), xPub: Buffer.from(xPub), instance: Buffer.from(instance) }
 }
 
+/**
+ * Record the remote's identity on the peer: both pubkeys + its shareable 26-char contact
+ * key (so EITHER side can save the other as a friend and redial later). Called before the
+ * 'peer' event fires, so handlers can read peer.key immediately.
+ */
+function setPeerIdentity(deps, peer, edPub, xPub) {
+  peer.remoteStatic = Buffer.from(xPub)
+  peer.remoteEd = Buffer.from(edPub)
+  if (typeof deps.encodeKey === 'function') {
+    try { peer.key = deps.encodeKey(edPub, xPub, 0) } catch { /* leave whatever key we had */ }
+  }
+}
+
 /** Tiny event emitter (zero-dep). */
 function emitter() {
   const m = new Map()
@@ -91,7 +104,9 @@ function makePeer(node, { S = null } = {}) {
 
   const peer = {
     S,
-    remoteStatic: null,
+    key: S,                 // the remote's shareable 26-char contact string (derived at handshake)
+    remoteStatic: null,     // remote X25519 pubkey
+    remoteEd: null,         // remote Ed25519 pubkey
     get connected() { return connected },
     /** @param {Buffer|string} data @returns {Promise<number>} resolves with appSeq on ack */
     send(data) {
@@ -180,6 +195,7 @@ async function resolveDeps(inj = {}, opts = {}) {
   }
   return {
     generateIdentity: key.generateIdentity, decodeKey: key.decodeKey, verifyCommitment: key.verifyCommitment,
+    encodeKey: key.encodeKey,                       // derive a peer's shareable 26-char key from its pubkeys
     createEndpoint: transport.createEndpoint, initiator: noise.initiator, responder: noise.responder,
     resolve, publishAll, _channels: channels, ...inj,
   }
@@ -255,7 +271,7 @@ function initiatorHandshake(node, deps, S, dec) {
           const { edPub, xPub, instance } = decodeIntro(f.payload)
           if (!deps.verifyCommitment(dec.commitment, edPub, xPub)) return fail('gate')  // NOT auth — cheap prefilter (D4)
           DBG('dial: HELLO gated OK -> send HS1')
-          rec.peer.remoteStatic = Buffer.from(xPub)
+          setPeerIdentity(deps, rec.peer, edPub, xPub)   // peer.key === the S we dialed
           peerInstance = instance
           hs = deps.initiator({ localX: { pub: node._identity.xPub, priv: node._identity.xPriv }, remoteXPub: xPub })
           socket.send(encodeFrame(TYPE.HS1, myConnId, 0, 0, hs.writeMessage(encodeIntro(node._identity.edPub, node._identity.xPub, node._instance))))
@@ -304,10 +320,11 @@ function acceptConnection(node, deps, socket) {
       let payload
       try { payload = hs.readMessage(f.payload) }
       catch (err) { node.emit('divergence', null, { reason: 'handshake', error: err }); try { socket.close() } catch { /* */ } return }
-      const { xPub, instance } = decodeIntro(payload)                // Bob's static — TOFU pin + peer key; instance = restart nonce
+      const { edPub, xPub, instance } = decodeIntro(payload)         // Bob's pubkeys — TOFU pin + peer key; instance = restart nonce
       const pkey = 'static:' + Buffer.from(xPub).toString('hex')
       rec = node._peers.get(pkey)
-      if (!rec) { rec = makePeer(node, {}); rec.peer.remoteStatic = Buffer.from(xPub); node._peers.set(pkey, rec) }
+      if (!rec) { rec = makePeer(node, {}); node._peers.set(pkey, rec) }
+      setPeerIdentity(deps, rec.peer, edPub, xPub)                   // listener learns the DIALER's real 26-char key
       // Attach BEFORE sending HS2: sending HS2 may synchronously drive the dialer to
       // completion and make it reply (e.g. outbox replay) reentrantly — our channel must
       // already be live to receive it. (Real async transport is unaffected; this is the
