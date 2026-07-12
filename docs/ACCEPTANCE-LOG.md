@@ -483,3 +483,13 @@ re-runs, so the second link must be opened in a FRESH page or it reports empty.
 **Invite dialing from the browser remains NOT shipped** (`src/browser/p2p.js` injects no `makeRace`
 seam). The app detects an `S-<tail>` share string and reports it honestly instead of misrouting it to
 the group box (`src/browser/app.js`) — documented as terminal-only + fast-follow, not papered over.
+
+**Correction to my earlier note (2026-07-12, hub-wiring).** I wrote above — and told team-lead — that
+in-browser invites were "a small `makeRace` seam" in `src/browser/p2p.js`. **That diagnosis was
+wrong**, per browser-research: in the TUI the tracker leg carries opaque IP-candidate blobs, but in
+the BROWSER it carries the WebRTC SDP offer/answer (`webrtc.js` does its own signalling over the
+tracker). Invite-scoping the browser therefore means teaching `webrtc.js` to (1) derive the infohash
+from `inv.rid('tracker', epoch, 20)` and (2) AEAD-seal the SDP blob with `inv.codec`, on both the
+publish and dial sides — plus invite-scoping the WSS-relay leg for browser↔TUI. That is a ~150-line
+feature, not a dependency seam. The Noise side (IKpsk2 + invite prologue) is already handled by
+`node.js`. Recorded so the fast-follow is scoped from the truth, not from my guess.

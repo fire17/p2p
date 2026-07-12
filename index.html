@@ -316,9 +316,9 @@
       <li><b>No backend of ours</b> Discovery rides public WebSocket trackers; the media path is a WebRTC DataChannel when it can be, and a zero-dependency <b>WSS relay</b> when it can’t. Whichever completes the verified handshake first wins.</li>
       <!-- Each claim below corresponds to a WITNESSED run in docs/ACCEPTANCE-LOG.md. Do not add one without a run. -->
       <li><b>Pair chat — verified</b> Paste a key and chat 1:1 with a browser <em>or</em> a terminal peer. Witnessed in real browsers: browser↔browser, and browser↔TUI over both a WebRTC DataChannel and the WSS relay.</li>
-      <li><b>Group chat — verified</b> Create a group from a list of keys, share the code, others join. Witnessed end to end in two real browsers, driven through the shipped buttons: create → add → join → messages both ways.</li>
+      <li><b>Group chat — verified</b> Create a group from a list of keys, share the code, others join — witnessed end to end in two real browsers through the shipped buttons, every message attributed to its real author. Create the group <em>with</em> your members up front: adding one <em>after</em> creation is best-effort today.</li>
       <li><b>Deep links — verified</b> <code>/app/#&lt;KEY&gt;</code> prefills the dial box; <code>/app/#&lt;group-code&gt;</code> prefills the group Join box. Send one link and your friend is one click from talking to you.</li>
-      <li><b>Invites are terminal-only today</b> <a href="#invites">Private invites</a> dial from the terminal; the web client takes reusable 26-char keys — paste an <code>S-…</code> share string and it says so plainly rather than misrouting it. In-browser invite dialing is a fast-follow.</li>
+      <li><b>Invites: terminal today, web client next</b> The web client takes reusable 26-char keys; open a one-time <code>S-…</code> share link and it tells you to use the CLI rather than misrouting you. <a href="#invites"><code>p2p invite</code></a> is the private path today.</li>
     </ul>
     <p class="note">A browser needs <code>https://</code> (or <code>localhost</code>) — WebCrypto and honest security both
       want a secure context.</p>

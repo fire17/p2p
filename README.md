@@ -74,13 +74,15 @@ gate we run, not a claim we make).
   the WSS relay.
 - **Group chat — verified.** Open the **Group chat** tab: create a group from a list of keys, share
   the group code, others join. Witnessed end to end in two real browsers, driven through the shipped
-  buttons — create → add → join → messages both ways.
+  buttons — create → join → messages both ways, each one attributed to its real author.
+  *Create the group **with** your members up front:* adding a member **after** creation is
+  best-effort today (a `group.js` limitation, fix queued).
 - **Deep links — verified.** `p2p.akeyo.io/app/#<KEY>` prefills the dial box;
   `p2p.akeyo.io/app/#<group-code>` prefills the group Join box. Send a friend one link and they're
   one click from talking to you.
-- **Private invites (§3) are terminal-only today.** The web client dials reusable 26-char keys; paste
-  an `S-…` share string and it tells you so plainly rather than misrouting it. In-browser invite
-  dialing is a fast-follow, not shipped.
+- **Invites: terminal today, web client next.** The web client dials reusable 26-char keys; open a
+  one-time `S-…` share link and it tells you plainly to use the CLI rather than misrouting you.
+  `p2p invite` (§3) is the private path today.
 
 Every claim above is a run recorded in [`docs/ACCEPTANCE-LOG.md`](docs/ACCEPTANCE-LOG.md).
 - A browser needs `https://` (or `localhost`): WebCrypto and honest security both want a secure

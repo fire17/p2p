@@ -61,8 +61,13 @@ gaps are listed at the bottom rather than omitted.
 
 ### Known gaps (stated, not hidden)
 
-- **Invites are terminal-only.** The browser build has no `makeRace` seam, so it cannot dial an
-  `S-…` share string; it detects one and says so rather than misrouting it. Fast-follow.
+- **Post-hoc `group.add` is best-effort** — the supported flow is creating the group **with** its
+  members. Adding a member after creation is limited today (a `group.js` limitation, fix queued).
+- **Invites are terminal-only.** The web client cannot dial an `S-…` share string; it detects one and
+  points you at the CLI rather than misrouting it. This is a real feature, not a missing seam: in the
+  browser the tracker leg carries the WebRTC SDP offer/answer, so invite-scoping it means teaching
+  `webrtc.js` to use the invite rid for the infohash **and** AEAD-seal the SDP on both publish and
+  dial (and the WSS-relay leg for browser↔TUI). Fast-follow.
 - **Invite burn/rotate is v2.** Single-use is a convention today: nothing stops a second connection
   with the same string, and `K_inv` is not retired after first contact.
 - **The peer you connect to still learns your IP.** Invites hide it from infrastructure and
