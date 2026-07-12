@@ -361,20 +361,56 @@ const DEADLINE = Symbol('deadline')
  * Drain a candidate source (async generator | Promise<array> | array) into a bounded
  * array — but DON'T wait for the whole stream to end. Real resolve() streams mDNS at
  * ~1ms yet only ENDS at ~13s (DHT/tracker stragglers); punching must start as soon as a
- * usable candidate lands. Strategy: block for the FIRST candidate (however long discovery
- * takes), then a short grace window for stragglers, then return. Closes the stream on the
- * way out so slow DHT/tracker lookups stop.
+ * usable candidate lands. Strategy: block for the FIRST candidate, then a short grace window
+ * for stragglers, then return. Closes the stream on the way out so slow lookups stop.
+ *
+ * `firstMs` — the fix for the ~13s tui→browser dial. A BROWSER publishes no candidate a TUI can
+ * punch (it has no UDP; its WebRTC offers are not p2p candidate blobs), so `first` never resolves
+ * and the dial sat waiting for the whole stream to DRAIN before it could fall back to the relay.
+ * With a relay-capable endpoint we therefore bound that first wait.
+ *
+ * But bounding it alone would be a REGRESSION dressed as a fix: a WAN tui↔tui pair whose first UDP
+ * candidate arrives from the DHT at, say, 5s would punch relay-only at the deadline and never try
+ * UDP at all — trading a slow dial for a permanently worse (relayed) route. So when the deadline
+ * fires empty we do NOT abandon the stream: it keeps draining in the background and its late
+ * candidates come back through `late`, which the caller enters into the SAME race (composePunch's
+ * addLeg). Nothing is given up; the relay just stops being blocked behind discovery.
+ *
  * @param {any} source @param {number} [cap] @param {number} [graceMs]
+ * @param {number} [firstMs] max wait for the FIRST candidate (Infinity = block, the old behaviour)
+ * @returns {Promise<{cands:object[], late:Promise<object[]>|null}>}
  */
-async function collectCandidates(source, cap = 64, graceMs = 1500) {
+async function collectCandidates(source, cap = 64, graceMs = 1500, firstMs = Infinity) {
   let r = source
   if (r && typeof r.then === 'function') r = await r
   const out = []
+  let late = null
   if (r && typeof r[Symbol.asyncIterator] === 'function') {
     const it = r[Symbol.asyncIterator]()
+    let keepStreaming = false
     try {
-      const first = await it.next()                       // wait for the first candidate, no deadline
-      if (!first.done) {
+      let deadline = null
+      let pending = null                                // the in-flight it.next(), if we raced a deadline
+      let first
+      if (firstMs === Infinity) {
+        first = await it.next()
+      } else {
+        pending = it.next()
+        first = await Promise.race([pending, new Promise((res) => { deadline = setTimeout(() => res(DEADLINE), firstMs); deadline.unref?.() })])
+        clearTimeout(deadline)
+      }
+      if (first === DEADLINE) {
+        // Discovery is slow or the peer publishes nothing punchable. Punch NOW on what the endpoint
+        // can reach without rendezvous (the relay), and let the stream keep running: anything it
+        // still finds joins the race late instead of being thrown away.
+        //
+        // `pending` MUST be handed over, not re-requested: an async generator QUEUES next() calls, so
+        // a fresh it.next() in drainRest would be served the SECOND value and the first candidate —
+        // the one this very race was waiting for — would be swallowed by the promise we walked away
+        // from. That silently emptied `late` and cost us the direct UDP route on every slow dial.
+        keepStreaming = true
+        late = drainRest(it, cap, graceMs, pending)
+      } else if (!first.done) {
         out.push(first.value)
         let timer
         const grace = new Promise((res) => { timer = setTimeout(() => res(DEADLINE), graceMs); if (timer.unref) timer.unref() })
@@ -387,11 +423,40 @@ async function collectCandidates(source, cap = 64, graceMs = 1500) {
         } finally { clearTimeout(timer) }
       }
     } finally {
-      if (typeof it.return === 'function') { try { await it.return() } catch { /* stop the stream */ } }
+      // Only stop the stream if we are DONE with it — a backgrounded drain still owns the iterator.
+      if (!keepStreaming && typeof it.return === 'function') { try { await it.return() } catch { /* stop the stream */ } }
     }
   } else if (r && typeof r[Symbol.iterator] === 'function') {
     for (const c of r) { out.push(c); if (out.length >= cap) break }
   } else if (r) { out.push(r) }
+  return { cands: out, late }
+}
+
+/**
+ * Keep draining a candidate stream we have already punched without. Resolves with whatever it still
+ * finds (empty if it finds nothing), then closes it. Never rejects — a late leg is a bonus, not a
+ * dependency, and a discovery error here must not take down a dial that is already in flight.
+ */
+async function drainRest(it, cap, graceMs, pending = null) {
+  const out = []
+  try {
+    const firstLate = await (pending || it.next())        // no deadline: this is already the slow path
+    if (!firstLate.done) {
+      out.push(firstLate.value)
+      let timer
+      const grace = new Promise((res) => { timer = setTimeout(() => res(DEADLINE), graceMs); timer.unref?.() })
+      try {
+        while (out.length < cap) {
+          const nx = await Promise.race([it.next(), grace])
+          if (nx === DEADLINE || nx.done) break
+          out.push(nx.value)
+        }
+      } finally { clearTimeout(timer) }
+    }
+  } catch { /* discovery blew up after we already punched — the legs we have still stand */ }
+  finally {
+    if (typeof it.return === 'function') { try { await it.return() } catch { /* */ } }
+  }
   return out
 }
 
@@ -408,8 +473,13 @@ function initiatorHandshake(node, deps, S, dec, ctx = {}) {
   const myConnId = randomBytes(8)
 
   return (async () => {
-    const cands = await collectCandidates(resolveFn(S))   // resolve is a STREAM (async gen) in the real path
-    DBG('dial: collected', cands.length, 'candidates -> punch')
+    // Bound the wait for the FIRST candidate ONLY when the endpoint can reach the peer without any
+    // rendezvous at all — i.e. it has the relay leg, whose topic is HKDF(S,…). Without that fallback
+    // there is nothing to punch early WITH, so we block exactly as before (an endpoint that doesn't
+    // advertise `relayGraceMs` — the browser's, a test's, invite mode's plain-UDP one — is untouched).
+    const graceMs = inv ? Infinity : (node._ep && node._ep.relayGraceMs) || Infinity
+    const { cands, late } = await collectCandidates(resolveFn(S), 64, 1500, graceMs)
+    DBG('dial: collected', cands.length, 'candidates -> punch', late ? '(discovery still running)' : '')
     // Per-connect correlation token: collapses transport's 5×-per-dialer onConnection
     // (one per v4/v6 source tuple) to ONE accept. Correlation only, NOT auth (auth stays
     // gate+Noise) — reuse myConnId (already random 8 bytes) as the nonce.
@@ -424,6 +494,7 @@ function initiatorHandshake(node, deps, S, dec, ctx = {}) {
       token: myConnId,
       nonce: inv ? probeProof(inv, myConnId) : undefined,
       S: inv ? undefined : S,
+      late,                                    // candidates discovery finds AFTER we punched — they still race
     })
     DBG('dial: punch resolved, socket ready -> awaiting HELLO')
     return new Promise((resolve, reject) => {

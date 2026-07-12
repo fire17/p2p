@@ -30,14 +30,14 @@ const crypto = () => ({
 })
 
 /** A TUI peer: node.js's DEFAULT endpoint (UDP + WSS composed), with the relay pointed at the mock. */
-async function tuiPeer(relay, { resolve, wssDelayMs = 700 } = {}) {
+async function tuiPeer(relay, { resolve, wssDelayMs = 700, relayGraceMs } = {}) {
   const id = await key.generateIdentity()
   let ep = null
   const node = await listen(id, {
     deps: {
       ...crypto(),
       createEndpoint: async (o) => (ep = await nodeTransport.createEndpoint({
-        ...o, relays: RELAYS, WebSocket: relay.WebSocket, wssDelayMs,
+        ...o, relays: RELAYS, WebSocket: relay.WebSocket, wssDelayMs, ...(relayGraceMs === undefined ? {} : { relayGraceMs }),
       })),
       resolve: async (S) => resolve(String(S)),
       publishAll: () => ({ stop() {} }),          // no mDNS / DHT / tracker — nothing announced
@@ -190,4 +190,64 @@ test('GLARE: 10 raced dials (UDP + relay legs, relay winning) each yield ONE ses
     a.node.close(); b.node.close(); relay.close()
   }
   assert.equal(ok, 10, `only ${ok}/10 raced dials produced one clean session:\n` + detail.join('\n'))
+})
+
+// ── SLOW-DIAL (task #8): punching must not wait for rendezvous to DRAIN ──────────────────────────
+//
+// A browser publishes NO candidate a TUI can punch, so `collectCandidates` never got its first
+// candidate and the dial sat until the whole stream ENDED (~13s live). The relay needs no rendezvous
+// at all — its topic is HKDF(S,…) — so the wait is now bounded (relayGraceMs).
+//
+// The trap, and why the fix is not just a timeout: bounding the wait ALONE would make a WAN pair
+// whose first UDP candidate arrives late (slow DHT) punch relay-only and NEVER try UDP — trading a
+// slow dial for a permanently worse route. So discovery keeps running past the deadline and its late
+// candidates enter the SAME race. Both halves are asserted below.
+
+/** A rendezvous stream that yields nothing for `endMs`, then ends — a browser peer, seen from a TUI. */
+const silentStream = (endMs) => async function* () {
+  await delay(endMs)
+}()
+
+test('slow-dial: a peer that publishes NO candidates is dialed WITHOUT waiting for the stream to drain', async () => {
+  const relay = mockRelay()
+  const web = await webPeer(relay)
+  // Discovery will yield nothing and only END after 12s (the live DHT/tracker straggler tail).
+  const tui = await tuiPeer(relay, { resolve: () => silentStream(12_000), relayGraceMs: 300 })
+
+  const t0 = Date.now()
+  const p = await race(tui.node.connect(web.id.S), 8000, 'tui -> web connect')
+  const took = Date.now() - t0
+  await race(p.send('fast'), 5000, 'msg')
+  await delay(50)
+
+  assert.deepEqual(web.got, ['fast'])
+  // The whole point: we punched at the grace deadline, not at stream end. Pre-fix this took 12s+.
+  assert.ok(took < 4000, `dial took ${took}ms — it must not wait for the ${12_000}ms stream to drain`)
+  tui.node.close(); web.node.close(); relay.close()
+})
+
+test('slow-dial: a LATE udp candidate still races — bounding the wait does NOT cost the direct route', async () => {
+  // The relay is DEAD (every publish dropped), so the ONLY way this dial can succeed is the udp leg
+  // that discovery produced AFTER we already punched. If late candidates were thrown away — the naive
+  // "just add a timeout" fix — this test hangs. That is precisely the regression it exists to catch.
+  const relay = mockRelay({ drop: () => true })
+  const eps = new Map()
+  const b = await tuiPeer(relay, { resolve: () => [], relayGraceMs: 200 })
+  eps.set(b.id.S, b.ep)
+  // Discovery is SLOW: the udp candidate only shows up 900ms in — long after the 200ms grace fired.
+  const slowResolve = (S) => async function* () {
+    await delay(900)
+    const ep = eps.get(S)
+    if (ep) yield { proto: 'udp4', ip: '127.0.0.1', port: ep.port4, kind: 'lan' }
+  }()
+  const a = await tuiPeer(relay, { resolve: slowResolve, relayGraceMs: 200 })
+
+  const p = await race(a.node.connect(b.id.S), 10000, 'late-candidate connect')
+  const bSide = await race(listenerPeer(b.node), 8000, 'accept')
+  await race(p.send('via the late udp leg'), 8000, 'a -> b')
+  await delay(50)
+
+  assert.deepEqual(b.got, ['via the late udp leg'], 'the late udp candidate carried the session')
+  assert.ok(bSide.connected)
+  a.node.close(); b.node.close(); relay.close()
 })

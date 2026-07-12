@@ -37,6 +37,19 @@ import { composePunch } from './compose.js'
 /** Give a punchable UDP path this long to win before the relay leg even starts knocking. */
 const WSS_DELAY_MS = 700
 
+/**
+ * How long a dial waits for rendezvous to produce its FIRST candidate before punching the relay
+ * anyway. Only reachable because the relay needs no rendezvous (its topic is HKDF(S,…)).
+ *
+ * 3s, not 300ms, on purpose: on a LAN mDNS answers in ~ms and on a WAN the trackers usually answer
+ * in ~1-2s, so a real UDP path almost always lands INSIDE this window and still gets its head start.
+ * The window only expires when discovery is genuinely slow — or when the peer publishes nothing a TUI
+ * can punch at all, which is exactly the browser case this fixes (it used to wait ~13s for the whole
+ * stream to drain). And expiring costs nothing: discovery keeps running and any UDP path it finds
+ * later still joins the race (see punch()'s late-candidate leg).
+ */
+const RELAY_GRACE_MS = 3000
+
 const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.() })
 
 /**
@@ -57,7 +70,7 @@ const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?
  */
 export async function createEndpoint({
   port = 0, S = null, wss = true, relays = RELAYS, WebSocket, now = () => Date.now(),
-  wssDelayMs = WSS_DELAY_MS, ...opts
+  wssDelayMs = WSS_DELAY_MS, relayGraceMs = RELAY_GRACE_MS, ...opts
 } = {}) {
   const udp = await createUdpEndpoint({ port, now, ...opts })
   if (!wss || !S) return udp                       // plain UDP — unchanged from v0.1.0
@@ -72,6 +85,10 @@ export async function createEndpoint({
   const ep = {
     udp,
     wss: wssEp,
+    // Tells src/node.js it may bound the wait for a first rendezvous candidate: this endpoint can
+    // reach the peer with NO rendezvous at all (the relay topic is HKDF(S,…)). An endpoint without
+    // this property — the browser's, a test's, invite mode's plain-UDP one — keeps blocking as before.
+    relayGraceMs: relayGraceMs,
     get port() { return udp.port },
     get port4() { return udp.port4 },
     get port6() { return udp.port6 },
@@ -106,9 +123,10 @@ export async function createEndpoint({
       let composite = null
       if (udpCands.length) attempts.push(udp.punch(udpCands, popts))
       if (wssCands.length) {
-        // Head start for UDP — but only when there IS a UDP path to give one to (dialing a browser
-        // must not pay the delay). And if the peer already answered on UDP within the head start, the
-        // relay is never dialed at all: no knock, no subscription, no public broker sees this pair.
+        // Head start for UDP — but only when there IS a UDP path to give one to. Dialing a peer with
+        // NO udp candidates (a browser) must not pay the delay: that is the ~13s dial. And if the peer
+        // already answered on UDP within the head start, the relay is never dialed at all — no knock,
+        // no subscription, no public broker ever sees this pair.
         attempts.push(udpCands.length
           ? sleep(wssDelayMs).then(() => {
             if (composite && composite.winner) throw new Error('relay leg not needed: UDP won')
@@ -119,6 +137,18 @@ export async function createEndpoint({
       if (!attempts.length) attempts.push(udp.punch(all, popts))   // no usable candidate: keep UDP's own error
       const p = composePunch(attempts)
       p.then((c) => { composite = c }, () => { /* all legs failed — nothing to skip */ })
+
+      // LATE CANDIDATES. node.js punched before discovery finished (it had nothing punchable yet), but
+      // the stream kept running. If it turns up a UDP path after all, enter it into the SAME race — so
+      // bounding that wait never costs us the direct route. If the relay has already won by then,
+      // composePunch closes the newcomer and nothing changes.
+      if (popts.late && !udpCands.length) {
+        Promise.resolve(popts.late).then((more) => {
+          const lateUdp = (more || []).filter((c) => c && (c.proto === 'udp4' || c.proto === 'udp6' || c.proto === 'tcp'))
+          if (!lateUdp.length || !composite || composite.winner || composite.closed) return
+          composite.addLeg(udp.punch(lateUdp, popts))
+        }).catch(() => { /* discovery failed after the punch — the legs we have still stand */ })
+      }
       return p
     },
 

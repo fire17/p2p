@@ -53,6 +53,24 @@ export function composePunch(attempts) {
       composite.closed = true
       for (const s of subs) { try { s.close() } catch { /* */ } }
     },
+    /**
+     * Enter a leg into the race LATE — after the composite already resolved.
+     *
+     * Why this exists: the dialer cannot always know its candidates up front. A peer that publishes
+     * NO UDP candidates (a browser) would otherwise hold the whole dial hostage while rendezvous
+     * drains, and bounding that wait naively would mean a slow-DHT peer NEVER gets a UDP leg at all
+     * — trading a hang for a permanently worse route. So we punch on what we have, and a candidate
+     * that shows up afterwards still gets to race. If the race is already won, addLeg closes the
+     * newcomer (wire() does that) and nothing changes.
+     * @param {Promise<object>} attempt a punch promise (sub-socket or reject)
+     */
+    addLeg(attempt) {
+      if (composite.closed) return
+      attempt.then((s) => {
+        if (composite.closed) { try { s.close() } catch { /* */ } return }
+        wire(s)
+      }).catch(() => { /* a late leg that never came up costs nothing */ })
+    },
   }
   /** Commit: this leg carries the session. Every other leg is dead weight — tear it down. */
   const commit = (winner) => {
