@@ -1,10 +1,13 @@
 // test/browser-webrtc-hardening.test.js — leak/exhaustion guards for the browser WebRTC transport.
 //
-//  • BRW-4 (HIGH, live in v0.2.0): the listener parked one RTCPeerConnection per announced offer and
-//    freed it ONLY on dc.onopen or node.close() — so unanswered offers accumulated (~12 PCs/10s) and
-//    a long-lived listener exhausted the browser. The fix TTL-reaps and caps parked offers. This is a
-//    SOAK: drive many announce cycles with fake PCs that NEVER open, assert the live/parked count
-//    stays bounded (not ~ the number created). Plus: an answered offer STILL connects (path intact).
+//  • BRW-4 / BRW-4b (HIGH, live in v0.2.0): the listener minted fresh RTCPeerConnections every
+//    announce. a84345e capped how many sat PARKED, but a REAL browser caps CUMULATIVE constructions
+//    (~500/page, non-reclaimable) — so bounding the parked set was not enough; the CONSTRUCTION RATE
+//    itself sank a long-lived tab (test/browser-pc-soak.mjs proves it in real Chromium). The fix holds
+//    a small REUSED pool and re-publishes the SAME offers, so constructions track connections, not
+//    time. This SOAK drives many announce cycles with fake PCs that NEVER open and asserts the
+//    cumulative-construction count stays ~the pool size (NOT ~ the number of cycles). Plus: an
+//    answered offer STILL connects (path intact).
 //  • BRW-5 (MED): the chunk-reassembly buffer was keyed by a sender-chosen msgId and never bounded —
 //    endless distinct partial-chunk starts exhaust memory pre-Noise. The fix caps concurrent partials
 //    and total buffered bytes; assert a flood stays bounded and delivers nothing.
@@ -60,35 +63,42 @@ function makeFakeWS(reg) {
   }
 }
 
-test('BRW-4 soak: a long-lived listener does NOT leak RTCPeerConnections (parked offers stay bounded)', async () => {
+test('BRW-4b soak: a long-lived listener does NOT churn RTCPeerConnections (constructions ~ pool size, not ~ cycles)', async () => {
   const reg = { created: 0, closed: 0, pcs: new Set(), channels: [], sent: [], sockets: [] }
   const t = createBrowserTransport({
-    trackers: ['ws://t1'],
+    trackers: ['ws://t1', 'ws://t2', 'ws://t3'], // 3 trackers, like the shipped TRACKERS
     RTCPeerConnection: makeFakePC(reg),
     WebSocket: makeFakeWS(reg),
     now: () => FIXED,
-    announceIntervalMs: 10, // fast cadence: many cycles in the soak window
-    offerTtlMs: 30, // short park-TTL so reaping is observable
+    announceIntervalMs: 5, // very fast cadence: MANY announce cycles in the soak window
+    offerRefreshMs: 20, // re-offer often (on the SAME pc — must NOT construct new PCs)
     maxPendingOffers: 8, // hard cap
+    targetParkedOffers: 6, // pool size
+    pcCreateBurst: 20, // enough tokens to fill the pool at once
+    pcCreatesPerMin: 6,
   })
   await t.createEndpoint()
   t.endpoint.onConnection(() => {})
   const handle = t.publishAll(S26)
 
   await delay(400)
-  const live1 = t._debug.liveCount(), pend1 = handle.pendingCount()
-  await delay(300)
-  const live2 = t._debug.liveCount(), pend2 = handle.pendingCount()
+  const created1 = reg.created, pend1 = handle.pendingCount(), live1 = t._debug.liveCount()
+  await delay(400)
+  const created2 = reg.created, pend2 = handle.pendingCount(), live2 = t._debug.liveCount()
+  const announces = reg.sent.filter((m) => m.offers && m.offers.length).length
   handle.stop()
   t.close()
 
-  // OLD code: `created` PCs would ALL stay live. The soak ran enough cycles that created ≫ any bound.
-  assert.ok(reg.created > 60, `soak drove many announce cycles (created ${reg.created})`)
+  // THE POINT (BRW-4b): the soak drove MANY announce cycles across 3 trackers…
+  assert.ok(announces > 60, `soak drove many announce cycles (published ${announces} offer-announces)`)
+  // …yet the CUMULATIVE construction count barely moved — constructions track the pool, not the clock.
+  // (OLD code would have constructed ~4 × 3 × cycles ≈ hundreds; the reuse pool constructs ~6.)
+  assert.ok(created2 <= 12, `cumulative RTCPeerConnection constructions stay ~pool-size, NOT ~cycles (saw ${created2} over ${announces} announces)`)
+  assert.equal(created1, created2, `no new PCs are constructed during steady-state re-offering (was ${created1}, now ${created2})`)
   assert.ok(pend1 <= 8 && pend2 <= 8, `parked offers stay within the cap (saw ${pend1}, ${pend2})`)
-  assert.ok(live2 <= 20, `live RTCPeerConnections stay BOUNDED — not ~${reg.created} (saw ${live2})`)
-  assert.ok(reg.closed >= reg.created - 20, `evicted offers are actually closed (created ${reg.created}, closed ${reg.closed})`)
+  assert.ok(live2 <= 12, `live RTCPeerConnections stay BOUNDED and constant (saw ${live2})`)
   // teardown frees everything
-  assert.equal(t._debug.liveCount(), 0, 'close() frees every RTCPeerConnection')
+  assert.equal(t._debug.liveCount(), 0, 'stop()+close() frees every RTCPeerConnection')
 })
 
 test('BRW-4: an answer within the window STILL connects — the real accept path is not broken', async () => {

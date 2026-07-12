@@ -45,19 +45,44 @@ export const ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
 ]
 
-const OFFERS_PER_ANNOUNCE = 4 // each parked offer is single-use; a few lets several dialers land
-const ANNOUNCE_INTERVAL_MS = 10_000 // trystero cadence; parked offers expire ~120s
+const ANNOUNCE_INTERVAL_MS = 10_000 // tracker keepalive cadence. NOT a PC-creation tick (see BRW-4b).
 const RECONNECT_MS = 3000
 const ICE_GATHER_MS = 3000 // cap on waiting for ICE gathering (we ship what we have)
 const DIAL_TIMEOUT_MS = 30_000
 
-// BRW-4 (leak fix): a parked, unanswered offer holds a whole RTCPeerConnection (ICE agent + STUN
-// state). It was freed ONLY on dc.onopen or node.close() — so unanswered offers accumulated at
-// ~12 PCs/10s and eventually exhausted a long-lived listener (research/wargame-findings §10.3).
-// Bound BOTH how long one is parked and how many are parked at once.
-const OFFER_TTL_MS = 120_000 // reap a parked offer unanswered this long (== tracker offer-expiry, so nothing still-serveable is dropped)
+// ── BRW-4 / BRW-4b: DO NOT CHURN RTCPeerConnections. ────────────────────────────────────────────
+// BRW-4 (a84345e) capped how many offers sit PARKED (TTL + a cap) and its soak passed — but that
+// soak ran on Node **werift** PCs, which have no per-page limit. A real browser does, and it is
+// harsher than "how many are alive":
+//
+//   MEASURED, Chromium 141 (test/browser-pc-soak.mjs + its probes):
+//     • `new RTCPeerConnection` throws "Cannot create so many PeerConnections" at the **500th
+//       CONSTRUCTION on a page** — a CUMULATIVE limit, not a concurrent one.
+//     • `pc.close()` + dropping every reference does NOT decrement it. Blink only decrements when
+//       the object is destructed by an Oilpan GC, and that GC does **not** run on its own: 450
+//       closed+dereferenced PCs, 30 s idle, still counted. Only a forced `gc()` reclaimed them —
+//       which a real page cannot call.
+//
+// ⇒ ANY creation rate proportional to TIME eventually kills a long-lived listener tab. The old
+//    listener minted OFFERS_PER_ANNOUNCE=4 fresh PCs per announce per tracker (3) every 10 s
+//    ≈ 72 PCs/min → the 500-wall in ≈7 minutes. That is the console flood the owner hit.
+//
+// THE FIX: constructions must be proportional to REAL CONNECTIONS, not to time. We hold a small
+// POOL of parked-offer PCs and RE-USE them: every announce re-publishes the SAME parked offers, and
+// staleness is handled by re-offering ON THE SAME pc (`restartIce()` + a fresh SDP) — which costs
+// ZERO new RTCPeerConnections. A pc is constructed only to fill an empty pool slot: at startup, or
+// after a slot's offer was actually consumed by a peer (or its ICE died). Steady-state churn: 0/h.
+const PARKED_OFFERS_PER_SLOT = 2 // per tracker × epoch: parked offers are single-use, 2 lets two dialers land
+const OFFER_REFRESH_MS = 120_000 // re-offer (same pc, ICE restart) — SDP stays as fresh as the old code's, free
 const CONNECT_TTL_MS = 30_000 // after an answer arrives, reap if the DataChannel never opens (ICE failed)
-const MAX_PENDING_OFFERS = 64 // hard cap on simultaneously-parked offers; oldest evicted first
+const MAX_PENDING_OFFERS = 16 // hard cap on simultaneously-parked offers; oldest evicted first
+const MAX_LIVE_PCS = 32 // hard cap on RTCPeerConnections this transport owns at once
+const MAX_TOTAL_PCS = 480 // hard stop BELOW the browser's ~500-construction wall: degrade, never throw
+const PC_CREATE_BURST = 12 // token bucket over listener pc construction: enough to fill every pool slot at once…
+const PC_CREATE_PER_MIN = 6 // …then a slow trickle, so answer-spam cannot burn the page's PC budget
+const MAX_OFFERS_PER_PUNCH = 3 // a dial answers at most this many parked offers in parallel: a few for
+// resilience (a dead parked pc doesn't strand the dial), bounded so a hostile/duplicating tracker can
+// neither flood the dialer with answerer PCs nor make one dialer open a burst of connections to a peer.
 
 /** Wait for ICE gathering to finish (or the cap) — we send one complete SDP, no trickle. */
 function whenIceGathered(pc, capMs = ICE_GATHER_MS) {
@@ -197,10 +222,16 @@ export function createBrowserTransport(opts = {}) {
   const PC = opts.RTCPeerConnection || globalThis.RTCPeerConnection
   const WS = opts.WebSocket || globalThis.WebSocket
   const now = opts.now || (() => Date.now())
-  const offerTtlMs = opts.offerTtlMs || OFFER_TTL_MS
+  // `offerTtlMs` kept as an alias so the a84345e test/opts keep working; it drives the re-offer timer.
+  const offerRefreshMs = opts.offerRefreshMs || opts.offerTtlMs || OFFER_REFRESH_MS
   const connectTtlMs = opts.connectTtlMs || CONNECT_TTL_MS
   const maxPendingOffers = opts.maxPendingOffers || MAX_PENDING_OFFERS
   const announceIntervalMs = opts.announceIntervalMs || ANNOUNCE_INTERVAL_MS
+  const parkedPerSlot = opts.parkedOffersPerSlot || PARKED_OFFERS_PER_SLOT
+  const maxLivePcs = opts.maxLivePcs || MAX_LIVE_PCS
+  const maxTotalPcs = opts.maxTotalPcs || MAX_TOTAL_PCS
+  const createPerMin = opts.pcCreatesPerMin || PC_CREATE_PER_MIN
+  const createBurst = opts.pcCreateBurst || PC_CREATE_BURST
   const myPeerId = randId20()
 
   if (!PC) throw new Error('this browser has no RTCPeerConnection — WebRTC is required')
@@ -210,13 +241,42 @@ export function createBrowserTransport(opts = {}) {
   const live = new Set() // RTCPeerConnections we own (for close())
   let onConnectionCb = null
   let closed = false
+  let totalPcs = 0 // BRW-4b: CUMULATIVE constructions this transport made — the browser's real limit
 
-  const newPc = () => {
+  // BRW-4b: token bucket bounding the RATE of listener PC construction, so a burst of hostile answers
+  // (each frees a slot → wants a refill) cannot burn through the page's ~500-construction budget.
+  // Dials do NOT draw from it — a user-initiated punch must always be able to build its answering pc.
+  let tokens = createBurst
+  let lastRefill = now()
+  const takeToken = () => {
+    const t = now()
+    tokens = Math.min(createBurst, tokens + ((t - lastRefill) / 60_000) * createPerMin)
+    lastRefill = t
+    if (tokens >= 1) { tokens -= 1; return true }
+    return false
+  }
+
+  // A pc is a scarce, non-reclaimable resource in a real browser (close() does NOT free the object —
+  // only an Oilpan GC we can't trigger does). So construction is GATED: never past the cumulative wall,
+  // never past the concurrent cap. `rated` = listener refills draw a token; dials pass `rated:false`.
+  const newPc = ({ rated = false } = {}) => {
+    if (closed) return null
+    if (totalPcs >= maxTotalPcs) return null // hard stop below the browser's own throw — degrade, don't crash
+    if (live.size >= maxLivePcs) return null
+    if (rated && !takeToken()) return null
     const pc = new PC({ iceServers })
     live.add(pc)
+    totalPcs++
     return pc
   }
-  const freePc = (pc) => { try { pc.close() } catch { /* */ } live.delete(pc) }
+  // FULLY release a pc so Blink can eventually reclaim it: close it AND null every handler we set, so
+  // no closure keeps the object (or its DataChannel) reachable. Callers also drop it from pending/pool.
+  const freePc = (pc) => {
+    if (!pc) return
+    try { pc.onicecandidate = pc.oniceconnectionstatechange = pc.onconnectionstatechange = pc.ondatachannel = pc.onnegotiationneeded = null } catch { /* */ }
+    try { pc.close() } catch { /* */ }
+    live.delete(pc)
+  }
 
   /** Open (and keep) a tracker WebSocket, dispatching relayed offers/answers to `onMsg`. */
   function openTracker(url, { persistent, onOpen, onMsg, signal }) {
@@ -296,12 +356,15 @@ export function createBrowserTransport(opts = {}) {
       return new Promise((resolve, reject) => {
         let settled = false
         const handles = []
-        const finish = (err, socket) => {
+        const dialPcs = new Set() // every answerer pc this dial built; free the losers when one wins
+        const finish = (err, socket, winner) => {
           if (settled) return
           settled = true
           clearTimeout(timer)
           ac.abort()
           for (const h of handles) h.stop()
+          for (const pc of dialPcs) if (pc !== winner) freePc(pc) // release the racing-but-lost pcs
+          dialPcs.clear()
           err ? reject(err) : resolve(socket)
         }
         const timer = setTimeout(
@@ -309,13 +372,20 @@ export function createBrowserTransport(opts = {}) {
           DIAL_TIMEOUT_MS,
         )
 
+        let answered = 0
         const onOffer = async (m, ws) => {
           if (settled) return
-          const pc = newPc()
+          // BRW-4b: a hostile/duplicating tracker can rain parked offers at a dialer; each would mint an
+          // answering pc. Bound how many one punch will answer — a real dial needs only a handful.
+          if (answered >= MAX_OFFERS_PER_PUNCH) return
+          answered++
+          const pc = newPc() // NOT rated — a user dial must always be able to build its answerer
+          if (!pc) return // at the concurrent/cumulative cap — skip this offer (the dial timer still guards)
+          dialPcs.add(pc)
           // The listener created the channel; we receive it.
           pc.ondatachannel = (ev) => {
             const dc = ev.channel
-            const deliver = () => finish(null, socketFromChannel(dc, pc))
+            const deliver = () => { pc.ondatachannel = null; finish(null, socketFromChannel(dc, pc), pc) }
             if (dc.readyState === 'open') deliver()
             else dc.onopen = deliver
           }
@@ -368,71 +438,131 @@ export function createBrowserTransport(opts = {}) {
     close() {
       closed = true
       for (const h of conns) h.stop()
-      for (const pc of live) { try { pc.close() } catch { /* */ } }
+      for (const pc of [...live]) freePc(pc) // full release (close + null handlers) so Blink can reclaim
       live.clear()
     },
   }
 
   // ── LISTENER ────────────────────────────────────────────────────────────────
   /**
-   * Stay reachable: park fresh WebRTC offers under rid(S) on every tracker, refresh on a timer,
-   * and answer-match anything that answers. When a DataChannel opens, hand it to node.js's
-   * accepter (which sends HELLO, then runs the Noise IK responder).
+   * Stay reachable: hold a SMALL, REUSED pool of parked-offer RTCPeerConnections under rid(S) on
+   * every tracker, and answer-match anything that answers. When a DataChannel opens, hand it to
+   * node.js's accepter (which sends HELLO, then runs the Noise IK responder).
+   *
+   * BRW-4b — WHY A POOL AND NOT PER-ANNOUNCE OFFERS: a real browser caps CUMULATIVE
+   * `new RTCPeerConnection` at ~500 per page and does not reclaim closed ones without a GC it won't
+   * run (measured — see the constants block + test/browser-pc-soak.mjs). So the number of PCs we ever
+   * CONSTRUCT must track the number of real CONNECTIONS, not the wall clock. We therefore build a
+   * handful of parked-offer PCs ONCE and keep re-publishing THE SAME offers every announce; staleness
+   * is refreshed by re-offering ON THE SAME pc (`iceRestart`), which costs zero new PCs. A new pc is
+   * constructed only to refill a slot whose offer was actually consumed by a peer (or whose ICE died)
+   * — and even those refills pass through a token bucket so answer-spam can't burn the page's budget.
+   * Steady-state churn for an idle listener: ZERO new PCs per hour.
    * @param {string} S our own contact string
    */
   function publishAll(S) {
-    const pending = new Map() // offer_id -> { pc, timer } (a parked, still-unanswered offer)
+    const pool = new Set() // slots: { pc, dc, offerId, refreshTimer, connectTimer, consumed }
+    const parked = new Map() // offer_id -> slot (a currently-parked, still-unanswered offer)
+    const targetPool = Math.min(maxPendingOffers, opts.targetParkedOffers || parkedPerSlot * 3)
+    let stopped = false
+    const wsList = [] // (ws, infoHash) pairs to re-announce the current pool on refresh
 
-    /** Reap a parked offer that was never answered (or whose answer never opened a channel). */
-    const evict = (offerId) => {
-      const e = pending.get(offerId)
-      if (!e) return
-      clearTimeout(e.timer)
-      pending.delete(offerId)
-      freePc(e.pc)
+    /** Fully retire a slot: stop its timers, unpark its offer, free its pc. */
+    const dropSlot = (slot) => {
+      if (slot.retired) return
+      slot.retired = true
+      clearTimeout(slot.refreshTimer)
+      clearTimeout(slot.connectTimer)
+      if (slot.offerId) parked.delete(slot.offerId)
+      pool.delete(slot)
+      freePc(slot.pc)
     }
 
-    /** Build one pc + its DataChannel + an SDP offer, ready to park on a tracker. */
-    async function makeOffer() {
-      const pc = newPc()
-      // The LISTENER creates the channel — so the dialer gets it via ondatachannel, and we end up
-      // on the side node.js expects to send HELLO.
-      const dc = pc.createDataChannel('p2p', { ordered: true }) // reliable+ordered: SCTP does the ARQ
+    /** (Re-)create an SDP offer on a slot's EXISTING pc — no new RTCPeerConnection. */
+    async function reoffer(slot) {
+      if (stopped || closed || slot.consumed || slot.retired) return
+      const pc = slot.pc
+      const oldId = slot.offerId
       const offerId = randId20()
-      dc.onopen = () => {
-        const e = pending.get(offerId)
-        if (e) { clearTimeout(e.timer); pending.delete(offerId) } // promoted to a live connection; keep pc in `live` (freed at node.close)
-        if (onConnectionCb && !closed) onConnectionCb(socketFromChannel(dc, pc))
+      try {
+        const offer = await pc.createOffer(oldId ? { iceRestart: true } : undefined) // reuse the pc; refresh ICE
+        await pc.setLocalDescription(offer)
+        await whenIceGathered(pc)
+      } catch (err) {
+        dropSlot(slot)
+        if (!closed) console.warn('[p2p] re-offer failed:', err.message)
+        topUp()
+        return
       }
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
-      await whenIceGathered(pc)
-      if (closed) { freePc(pc); return null } // transport torn down mid-offer — don't park a dead pc
-      // BRW-4: bound parked offers. Evict the oldest before parking a new one, and TTL-reap any that
-      // is never answered. `unref` so a parked offer never keeps a Node werift process alive.
-      while (pending.size >= maxPendingOffers) evict(pending.keys().next().value)
-      const timer = setTimeout(() => evict(offerId), offerTtlMs)
-      timer.unref?.()
-      pending.set(offerId, { pc, timer })
-      return { offer_id: offerId, offer: { type: 'offer', sdp: pc.localDescription.sdp } }
+      if (stopped || closed || slot.consumed || slot.retired) return
+      if (oldId) parked.delete(oldId)
+      slot.offerId = offerId
+      parked.set(offerId, slot)
+      clearTimeout(slot.refreshTimer)
+      slot.refreshTimer = setTimeout(() => reoffer(slot), offerRefreshMs)
+      slot.refreshTimer.unref?.()
+      reannounce() // publish the refreshed offer set on every open tracker
     }
 
-    const announce = async (ws, infoHash) => {
+    /** Synchronously reserve+construct one pool slot (rate-limited); kick off its first offer. */
+    const startSlot = () => {
+      if (stopped || closed || pool.size >= targetPool) return false
+      const pc = newPc({ rated: true }) // listener construction is rate-limited (token bucket + caps)
+      if (!pc) return false // at the cap / no token — stop topping up for now
+      const dc = pc.createDataChannel('p2p', { ordered: true }) // reliable+ordered: SCTP does the ARQ
+      const slot = { pc, dc, offerId: null, refreshTimer: null, connectTimer: null, consumed: false, retired: false }
+      dc.onopen = () => {
+        // Promoted to a LIVE connection: this slot's pc now belongs to the socket (freed at socket.close /
+        // node.close), so it leaves the pool WITHOUT being freed here. Refill the freed slot.
+        slot.consumed = true
+        clearTimeout(slot.refreshTimer)
+        clearTimeout(slot.connectTimer)
+        if (slot.offerId) parked.delete(slot.offerId)
+        pool.delete(slot)
+        if (onConnectionCb && !closed) onConnectionCb(socketFromChannel(dc, pc))
+        topUp()
+      }
+      pool.add(slot)
+      reoffer(slot) // async; the pc is already in the pool so topUp()'s size check is correct
+      return true
+    }
+
+    /** Keep the pool full up to targetPool (bounded by the token bucket / caps inside startSlot). */
+    function topUp() {
+      while (startSlot()) { /* fill until target or the rate/cap gate stops us */ }
+    }
+
+    /** Publish the CURRENT parked-offer set on one tracker socket. Creates NO offers. */
+    const announce = (ws, infoHash) => {
+      const offers = []
+      for (const slot of pool) {
+        if (slot.offerId && !slot.consumed && !slot.retired && slot.pc.localDescription) {
+          offers.push({ offer_id: slot.offerId, offer: { type: 'offer', sdp: slot.pc.localDescription.sdp } })
+        }
+      }
+      if (!offers.length) return
+      send(ws, { action: 'announce', info_hash: infoHash, peer_id: myPeerId, numwant: 10, uploaded: 0, downloaded: 0, left: 0, offers })
+    }
+    const reannounce = () => { for (const { ws, infoHash } of wsList) if (ws && ws.readyState === 1) announce(ws, infoHash) }
+
+    const acceptAnswer = async (m) => {
+      const slot = parked.get(m.offer_id)
+      if (!slot || slot.consumed || slot.retired) return
+      // A real dialer answered this parked offer — it is now single-use-consumed. Unpark it and stop
+      // re-offering that pc; it is committing to THIS dialer. Guard with a connect-TTL: if ICE never
+      // opens the channel, reclaim the slot (free the pc) and refill — so a failed answer is not a leak.
+      parked.delete(m.offer_id)
+      slot.offerId = null
+      clearTimeout(slot.refreshTimer)
+      slot.connectTimer = setTimeout(() => { if (!slot.consumed) { dropSlot(slot); topUp() } }, connectTtlMs)
+      slot.connectTimer.unref?.()
       try {
-        const offers = (await Promise.all(Array.from({ length: OFFERS_PER_ANNOUNCE }, makeOffer))).filter(Boolean)
-        if (!offers.length) return
-        send(ws, {
-          action: 'announce',
-          info_hash: infoHash,
-          peer_id: myPeerId,
-          numwant: 10,
-          uploaded: 0,
-          downloaded: 0,
-          left: 0,
-          offers,
-        })
+        await slot.pc.setRemoteDescription({ type: 'answer', sdp: m.answer.sdp })
+        // -> ICE connects -> dc.onopen -> onConnectionCb (above)
       } catch (err) {
-        console.warn('[p2p] announce failed:', err.message)
+        console.warn('[p2p] failed to accept an answer:', err.message)
+        dropSlot(slot)
+        topUp()
       }
     }
 
@@ -442,44 +572,33 @@ export function createBrowserTransport(opts = {}) {
       const infoHashes = announceEpochs(now()).map((ep) => infoHashFor(deriveRid(S, 'tracker', ep, 20)))
       for (const infoHash of infoHashes) {
         let timer
+        const entry = { ws: null, infoHash }
+        wsList.push(entry)
         const h = openTracker(url, {
           persistent: true,
           onOpen: (ws) => {
+            entry.ws = ws
+            topUp() // make sure the pool is full, then publish it (a keepalive re-announces the SAME offers)
             announce(ws, infoHash)
             clearInterval(timer)
-            timer = setInterval(() => announce(h.ws, infoHash), announceIntervalMs)
+            timer = setInterval(() => { entry.ws = h.ws; announce(h.ws, infoHash) }, announceIntervalMs)
           },
-          onMsg: async (m) => {
-            // Someone took one of our parked offers.
-            if (m.answer && m.offer_id && pending.has(m.offer_id)) {
-              const e = pending.get(m.offer_id)
-              // This offer is no longer "parked unanswered" — a real dialer answered. Swap the park-TTL
-              // for a shorter connect-TTL so a legit-but-slow answerer isn't reaped mid-ICE, yet a pc
-              // whose ICE never opens the channel is still reclaimed (no leak on a failed answer).
-              clearTimeout(e.timer)
-              e.timer = setTimeout(() => evict(m.offer_id), connectTtlMs)
-              e.timer.unref?.()
-              try {
-                await e.pc.setRemoteDescription({ type: 'answer', sdp: m.answer.sdp })
-                // -> ICE connects -> dc.onopen -> onConnectionCb (above)
-              } catch (err) {
-                console.warn('[p2p] failed to accept an answer:', err.message)
-              }
-            }
+          onMsg: (m) => {
+            if (m.answer && m.offer_id && parked.has(m.offer_id)) acceptAnswer(m)
           },
         })
-        stops.push(() => {
-          clearInterval(timer)
-          h.stop()
-        })
+        stops.push(() => { clearInterval(timer); h.stop() })
       }
     }
+    topUp() // build the pool immediately (don't wait for the first tracker to open)
     return {
       stop() {
+        stopped = true
         for (const s of stops) s()
-        for (const offerId of [...pending.keys()]) evict(offerId) // free every parked offer on teardown
+        for (const slot of [...pool]) dropSlot(slot) // free every parked-offer pc on teardown
       },
-      pendingCount: () => pending.size, // BRW-4 leak-monitor hook (test/soak)
+      pendingCount: () => parked.size, // BRW-4 leak-monitor hook (test/soak): parked, still-unanswered offers
+      poolCount: () => pool.size,
     }
   }
 
@@ -499,7 +618,7 @@ export function createBrowserTransport(opts = {}) {
     publishAll,
     resolve,
     close: endpoint.close,
-    _debug: { liveCount: () => live.size }, // BRW-4 leak-monitor hook: owned RTCPeerConnections
+    _debug: { liveCount: () => live.size, totalCount: () => totalPcs }, // BRW-4/4b leak-monitor hooks
   }
 }
 
