@@ -71,16 +71,42 @@ function whenIceGathered(pc, capMs = ICE_GATHER_MS) {
  * `.send(frame)` / `.onMessage(buf)` / `.close()` / `.closed` / `.rinfo`.
  * Frames are already <= node's mtu (1200 B default), far under the ~16 KiB DataChannel ceiling.
  */
-function socketFromChannel(dc, pc) {
+// DataChannel message-size discipline (research/browser-client.md §5.2). A reliable+ordered channel
+// has NO spec cap, but the cross-browser SAFE per-message size is ~16 KiB (Firefox→Chromium caps
+// there; Chromium closes the channel above ~256 KiB; no browser implements SCTP ndata yet). node.js
+// frames are ≤ mtu (1200 B default) today — but that is an accidental margin, not a designed one, so
+// we chunk here: any frame is split into ≤16 KiB pieces and reassembled on the far side. Symmetric —
+// both peers run THIS module (browser via global RTCPeerConnection, Node via an injected werift PC),
+// so the framing is understood on both ends.
+const CHUNK_HDR = 8 // msgId(4) | index(2) | total(2)
+const CHUNK_MAX = 16000 // ≤16 KiB per DataChannel message
+const CHUNK_PAYLOAD = CHUNK_MAX - CHUNK_HDR
+const MAX_CHUNKS = 4096 // ≈64 MB ceiling per message — refuse anything larger (anti-OOM)
+
+export function socketFromChannel(dc, pc) {
   dc.binaryType = 'arraybuffer'
+  let sendId = 0
+  const reasm = new Map() // msgId -> { parts, have, total, len }
   const socket = {
     closed: false,
     rinfo: { address: 'webrtc', port: 0 }, // wire.js roams by connId, not by rinfo — this is inert
     onMessage: null,
     send(frame) {
       if (socket.closed || dc.readyState !== 'open') return
+      const f = frame instanceof Uint8Array ? frame : new Uint8Array(frame)
+      const total = Math.max(1, Math.ceil(f.length / CHUNK_PAYLOAD))
+      const id = (sendId = (sendId + 1) >>> 0)
       try {
-        dc.send(frame instanceof Uint8Array ? frame : new Uint8Array(frame))
+        for (let i = 0; i < total; i++) {
+          const part = f.subarray(i * CHUNK_PAYLOAD, (i + 1) * CHUNK_PAYLOAD)
+          const msg = new Uint8Array(CHUNK_HDR + part.length)
+          const dv = new DataView(msg.buffer)
+          dv.setUint32(0, id)
+          dv.setUint16(4, i)
+          dv.setUint16(6, total)
+          msg.set(part, CHUNK_HDR)
+          dc.send(msg)
+        }
       } catch {
         /* channel died mid-send; wire's ARQ/keepalive will notice */
       }
@@ -88,12 +114,35 @@ function socketFromChannel(dc, pc) {
     close() {
       if (socket.closed) return
       socket.closed = true
+      reasm.clear()
       try { dc.close() } catch { /* */ }
       try { pc.close() } catch { /* */ }
     },
   }
   dc.onmessage = (ev) => {
-    if (socket.onMessage) socket.onMessage(Buffer.from(new Uint8Array(ev.data)))
+    if (!socket.onMessage) return
+    const b = new Uint8Array(ev.data)
+    if (b.length < CHUNK_HDR) return // malformed / runt — drop (matches wire.js decodeFrame guard)
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength)
+    const id = dv.getUint32(0)
+    const index = dv.getUint16(4)
+    const total = dv.getUint16(6)
+    const payload = b.subarray(CHUNK_HDR)
+    if (total < 1 || total > MAX_CHUNKS || index >= total) return // refuse absurd framing (anti-OOM)
+    if (total === 1) { socket.onMessage(Buffer.from(payload)); return } // fast path — unchunked
+    let asm = reasm.get(id)
+    if (!asm) { asm = { parts: new Array(total), have: 0, total, len: 0 }; reasm.set(id, asm) }
+    if (asm.total !== total || asm.parts[index]) return // inconsistent / duplicate chunk — ignore
+    asm.parts[index] = payload
+    asm.have++
+    asm.len += payload.length
+    if (asm.have === total) {
+      reasm.delete(id)
+      const out = new Uint8Array(asm.len)
+      let off = 0
+      for (const p of asm.parts) { out.set(p, off); off += p.length }
+      socket.onMessage(Buffer.from(out))
+    }
   }
   dc.onclose = () => {
     socket.closed = true
