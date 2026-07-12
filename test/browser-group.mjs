@@ -26,7 +26,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'applica
 const server = createServer(async (req, res) => {
   try {
     const p = normalize(decodeURIComponent(req.url.split('?')[0])).replace(/^(\.\.[/\\])+/, '')
-    const f = join(ROOT, p)
+    const f = p.endsWith('/') ? join(ROOT, p, 'index.html') : join(ROOT, p)
     if (!f.startsWith(ROOT)) throw 0
     const b = await readFile(f)
     res.writeHead(200, { 'content-type': MIME[extname(f)] || 'application/octet-stream' }).end(b)
@@ -45,7 +45,7 @@ try {
   for (let i = 0; i < 3; i++) {
     const pg = await (await browser.newContext()).newPage()
     pg.on('pageerror', (e) => fail(`peer${i}: ${e.message}`))
-    await pg.goto('http://localhost:8097/src/browser/index.html')
+    await pg.goto('http://localhost:8097/app/')
     await pg.waitForFunction(() => document.getElementById('mykey').textContent.length === 26, { timeout: 30_000 })
     pages.push(pg)
   }

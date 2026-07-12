@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>p2p — browser chat</title>
+
+<!--
+  The live browser p2p client, served at p2p.akeyo.io/app/. No backend of ours, no accounts, no
+  build step. Same 26-char key, same Noise IK handshake + commitment gate, same message semantics
+  as the CLI/TUI — a browser peer and a CLI peer are the same protocol on the wire.
+
+  It REUSES the one committed copy of the source: the import map below maps the bare `node:crypto`
+  specifier to /src/browser/shim/node-crypto.js (ABSOLUTE), and the module script loads
+  /src/browser/app.js — whose relative imports resolve to /src/browser/…, /src/key.js, /src/noise.js,
+  the vendored noble under /src/browser/vendor/…, etc. GitHub Pages serves the repo root, so the
+  same files that CI tests are exactly what runs here. Zero bundler, zero copy.
+
+  The import map is an inline script, so a strict CSP must allow it explicitly — by HASH, not
+  'unsafe-inline', so every OTHER inline script stays blocked (and the hash changes if the map is
+  tampered with). Recompute after editing the map:
+    node -e "const c=require('crypto'),f=require('fs');const m=f.readFileSync('app/index.html','utf8').match(/<script type=\"importmap\">([\s\S]*?)<\/script>/)[1];console.log('sha256-'+c.createHash('sha256').update(m).digest('base64'))"
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'sha256-U+ANBLecGJ+vTsTYdpIyhe5dz0rurY0PuDtEm+J2tUA='; style-src 'self' 'unsafe-inline'; connect-src wss: https:; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+
+<script type="importmap">
+{
+  "imports": {
+    "node:crypto": "/src/browser/shim/node-crypto.js"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14181d; --line: #232a32; --fg: #e6edf3; --dim: #8b97a5;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --me: #1f6feb; --grp: #a371f7;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; padding: 24px 16px;
+  }
+  main { width: 100%; max-width: 780px; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.3px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin: 0 0 12px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin-bottom: 8px; }
+  .key { display: flex; gap: 8px; align-items: center; }
+  .key code {
+    flex: 1; font-size: 16px; letter-spacing: 1.2px; word-break: break-all;
+    background: #0d1117; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
+  }
+  button {
+    background: #21262d; color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px 14px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: #2d333b; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary { background: var(--me); border-color: var(--me); }
+  button.primary:hover:not(:disabled) { filter: brightness(1.15); }
+  button.grp { background: var(--grp); border-color: var(--grp); }
+  button.grp:hover:not(:disabled) { filter: brightness(1.15); }
+  input[type=text] {
+    width: 100%; background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px 12px; font: inherit;
+  }
+  input[type=text]:focus, button:focus-visible { outline: 2px solid var(--me); outline-offset: 1px; }
+  .row { display: flex; gap: 8px; }
+  .row input { flex: 1; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tabs button { flex: 1; }
+  .tabs button[aria-selected="true"] { background: var(--me); border-color: var(--me); }
+  .tabs button.grp[aria-selected="true"] { background: var(--grp); border-color: var(--grp); }
+  .view[hidden] { display: none; }
+  ul.log { list-style: none; margin: 0; padding: 0; max-height: 40vh; overflow-y: auto; }
+  ul.log li { padding: 6px 0; border-bottom: 1px solid var(--line); word-break: break-word; }
+  ul.log li:last-child { border-bottom: 0; }
+  .who { color: var(--dim); margin-right: 8px; }
+  .me .who { color: var(--me); }
+  .grpmsg .who { color: var(--grp); }
+  .sys { color: var(--dim); font-style: italic; }
+  .sys.ok { color: var(--ok); font-style: normal; }
+  .sys.err { color: var(--err); font-style: normal; }
+  #status { font-size: 13px; color: var(--dim); margin-bottom: 16px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  .hint { color: var(--dim); font-size: 12px; margin: 8px 0 0; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 8px; max-width: 780px; }
+  footer b { color: var(--fg); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>p2p — browser chat</h1>
+  <div class="sub">No backend. No accounts. Same 26-char key & Noise IK handshake as the CLI — a browser and a terminal can chat.</div>
+
+  <div id="status"><span class="dot" id="dot"></span><span id="statusText">booting…</span></div>
+
+  <div class="panel">
+    <label for="mykey">Your key — share it so people can reach you</label>
+    <div class="key">
+      <code id="mykey">…</code>
+      <button id="copy">Copy</button>
+    </div>
+    <p class="hint">Anyone with this key can find you over free public infrastructure and open a
+      verified, end-to-end-encrypted channel. It’s safe to share — it names you and lets others
+      prove it’s really you; it can’t be used to impersonate you.</p>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button id="tabPair" class="primary" role="tab" aria-selected="true">1-to-1 chat</button>
+    <button id="tabGroup" class="grp" role="tab" aria-selected="false">Group chat</button>
+  </div>
+
+  <!-- ── 1-to-1 ────────────────────────────────────────────────────────────── -->
+  <section id="viewPair" class="view">
+    <div class="panel">
+      <label for="peerkey">Connect to a key (a browser peer, or a CLI peer)</label>
+      <div class="row">
+        <input type="text" id="peerkey" placeholder="26-char key, e.g. 072QMAE5VSHVE7WF2RGWF379HN"
+               autocomplete="off" spellcheck="false" maxlength="26" />
+        <button id="connect" class="primary">Connect</button>
+      </div>
+    </div>
+    <div class="panel">
+      <label>Chat</label>
+      <ul id="log" class="log"><li class="sys">Nothing yet. Share your key or paste someone else’s.</li></ul>
+      <div class="row" style="margin-top:12px">
+        <input type="text" id="msg" placeholder="Type a message…" autocomplete="off" disabled />
+        <button id="send" disabled>Send</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── group ─────────────────────────────────────────────────────────────── -->
+  <section id="viewGroup" class="view" hidden>
+    <div class="panel">
+      <h2>Create a group</h2>
+      <label for="groupSeed">Paste the keys of everyone you want in (space- or line-separated), then create</label>
+      <input type="text" id="groupSeed" placeholder="072QMAE5VSHVE7WF2RGWF379HN  0P9439MXSW741P86BZYG58H9PS …"
+             autocomplete="off" spellcheck="false" />
+      <div class="row" style="margin-top:10px">
+        <button id="groupNew" class="grp">Create group</button>
+      </div>
+      <label for="groupCode" style="margin-top:14px">Your group code — share it with those members so they can join</label>
+      <div class="key">
+        <code id="groupCode">— create a group, or join one below —</code>
+        <button id="groupCopy" disabled>Copy</button>
+      </div>
+      <p class="hint">Everyone you listed can join with this code. Messages are end-to-end encrypted
+        and each one is signed by its author — the infrastructure only ever sees an opaque hash and
+        ciphertext, and no member can impersonate another.</p>
+
+      <h2 style="margin-top:18px">…or join a group</h2>
+      <div class="row">
+        <input type="text" id="groupSecret" placeholder="Paste a group code you were given"
+               autocomplete="off" spellcheck="false" />
+        <button id="groupJoin">Join</button>
+      </div>
+      <p class="hint">The group’s creator must have included your key when they made it. Share your
+        key (top of the page) with them first.</p>
+      <!-- post-creation add (best-effort): kept for admins to grow an existing group -->
+      <div class="row" style="margin-top:12px" id="addRow" hidden>
+        <input type="text" id="groupAdd" placeholder="Admin: add another member by key (must already be online + joined)"
+               autocomplete="off" spellcheck="false" maxlength="26" />
+        <button id="groupAddBtn">Add</button>
+      </div>
+    </div>
+    <div class="panel">
+      <label>Group chat · <span id="groupMembers" class="who">0 members</span></label>
+      <ul id="grouplog" class="log"><li class="sys">Create a group, share the code, and add members by their key.</li></ul>
+      <div class="row" style="margin-top:12px">
+        <input type="text" id="groupMsg" placeholder="Message the group…" autocomplete="off" disabled />
+        <button id="groupSend" class="grp" disabled>Send</button>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <b>What the infrastructure sees:</b> an opaque hash and encrypted frames — never your identity,
+    never your messages. The public trackers, relays, STUN, and WebRTC’s own transport encryption are
+    all treated as hostile: security comes from the commitment inside your key plus the Noise IK
+    handshake that runs <i>on top</i> of them, exactly as the CLI does. <b>The honest caveat:</b> this
+    page is code served from a web origin, so you are trusting whoever serves it. For the strongest
+    guarantee, run the CLI.
+  </footer>
+</main>
+
+<script type="module" src="/src/browser/app.js"></script>
+</body>
+</html>

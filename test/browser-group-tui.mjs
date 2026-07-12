@@ -34,7 +34,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'applica
 const server = createServer(async (req, res) => {
   try {
     const p = normalize(decodeURIComponent(req.url.split('?')[0])).replace(/^(\.\.[/\\])+/, '')
-    const f = join(ROOT, p)
+    const f = p.endsWith('/') ? join(ROOT, p, 'index.html') : join(ROOT, p)
     if (!f.startsWith(ROOT)) throw 0
     res.writeHead(200, { 'content-type': MIME[extname(f)] || 'application/octet-stream' }).end(await readFile(f))
   } catch {
@@ -64,7 +64,7 @@ try {
   const page = await (await browser.newContext()).newPage()
   page.on('pageerror', (e) => fail('browser: ' + e.message))
   if (process.env.VERBOSE) page.on('console', (m) => console.log('  [browser]', m.text()))
-  await page.goto('http://localhost:8095/src/browser/index.html')
+  await page.goto('http://localhost:8095/app/')
   await page.waitForFunction(() => document.getElementById('mykey').textContent.length === 26, { timeout: 30_000 })
   const C = await page.textContent('#mykey')
   console.log('  browserC    ', C)

@@ -13,27 +13,36 @@ The browser runs the TUI's **own protocol source unchanged** — `src/key.js`, `
 
 - `node:crypto` → [`shim/node-crypto.js`](shim/node-crypto.js) (vendored [noble](vendor/PROVENANCE.md)
   primitives; ChaCha20-Poly1305, which no browser has, plus sync X25519/Ed25519/SHA-256/HKDF), wired
-  in by the `<script type="importmap">` in [`index.html`](index.html);
+  in by the `<script type="importmap">` in the page shell ([`/app/index.html`](../../app/index.html));
 - `Buffer` → [`shim/buffer.js`](shim/buffer.js) (a `Uint8Array` subclass).
 
-The **transport** is the only genuinely new module: [`webrtc.js`](webrtc.js) opens a WebRTC
-DataChannel behind the *same* endpoint seam `src/node.js` already injects, signalled over the
-**existing public WSS trackers** (`src/rendezvous/tracker.js`) keyed by the same `rid`. Because it
-is the identical Noise handshake over an untrusted pipe, the trackers, STUN, and WebRTC's own DTLS
-are all untrusted plumbing — the security is **≥ the TUI** (proven byte-for-byte; see the tests).
+The **transport** ([`webrtc.js`](webrtc.js)) opens a WebRTC DataChannel behind the *same* endpoint
+seam `src/node.js` already injects, signalled over the **existing public WSS trackers**
+(`src/rendezvous/tracker.js`) keyed by the same `rid`; a raced [`transport.js`](transport.js) also
+carries a zero-dep WSS-relay floor (`src/transport-wss.js`) so a browser can even reach a CLI peer.
+Because it is the identical Noise handshake over an untrusted pipe, the trackers, relays, STUN and
+WebRTC's own transport encryption are all untrusted plumbing — security is **≥ the CLI** (proven
+byte-for-byte; see the tests).
 
-## Run it
+## The page
 
-Serve this directory over HTTPS or `localhost` (SubtleCrypto/IndexedDB need a secure context):
+The shipped client is [`/app/index.html`](../../app/index.html) at the repo root — served live at
+**p2p.akeyo.io/app/**. It is a thin shell (strict CSP + an ABSOLUTE import map + `<script
+src="/src/browser/app.js">`) so the ONE committed copy of the source under `/src/browser/…` and
+`/src/…` is exactly what runs — no bundler, no fork, no duplication. [`app.js`](app.js) is the UI
+(1-to-1 + group chat); everything it imports resolves by absolute path.
+
+## Run it locally
 
 ```sh
-# from the repo root
+# from the repo root — localhost is a secure context, so WebCrypto/IndexedDB work
 python3 -m http.server 8080
-# then open  http://localhost:8080/src/browser/
+# then open  http://localhost:8080/app/
 ```
 
-Open it in two tabs (or two browsers), copy one key into the other's Connect box. They meet over the
-public trackers and chat directly, E2E. Deep link: `…/src/browser/#<26-CHAR-KEY>` pre-fills the dial box.
+Open it in two tabs (or browsers), copy one key into the other's Connect box → they meet over public
+infrastructure and chat directly, E2E. Deep links: `…/app/#<26-CHAR-KEY>` pre-fills the dial box;
+`…/app/#<GROUP-CODE>` pre-fills the group Join box.
 
 ## Tests
 

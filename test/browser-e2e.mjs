@@ -48,7 +48,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'applica
 const server = createServer(async (req, res) => {
   try {
     const path = normalize(decodeURIComponent(req.url.split('?')[0])).replace(/^(\.\.[/\\])+/, '')
-    const file = join(ROOT, path === '/' ? '/src/browser/index.html' : path)
+    const rel0 = path === '/' ? '/app/' : path; const file = rel0.endsWith('/') ? join(ROOT, rel0, 'index.html') : join(ROOT, rel0)
     if (!file.startsWith(ROOT)) throw new Error('path escape')
     const body = await readFile(file)
     res.writeHead(200, { 'content-type': MIME[extname(file)] || 'application/octet-stream' })
@@ -74,7 +74,7 @@ try {
     page.on('pageerror', (e) => fail(`[${name}] page error: ${e.message}`))
   }
 
-  const url = `http://localhost:${PORT}/src/browser/index.html`
+  const url = `http://localhost:${PORT}/app/`
   await alice.goto(url)
   await bob.goto(url)
 
@@ -124,7 +124,7 @@ try {
   const bogus = 'ZZZZZZZZZZZZZZZZZZZZZZZZZZ'
   const rejected = await bob.evaluate(async (k) => {
     try {
-      const { key } = await import('./p2p.js')
+      const { key } = await import('/src/browser/p2p.js')
       key.decodeKey(k)
       return 'accepted'
     } catch (e) {
