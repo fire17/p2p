@@ -260,6 +260,26 @@ test('psk must be 32 bytes (fail-closed on a malformed psk)', () => {
   assert.throws(() => responder({ localX: { pub: id.xPub, priv: id.xPriv }, psk: 'not-a-buffer' }), HandshakeError)
 })
 
+test('handshakePrologue: a FIXED invite-scoped value both sides derive from K_inv alone', () => {
+  const a = createInvite(K)
+  const b = createInvite(decodeInvite(encodeInvite(K)))     // Bob, from the share string only
+  const pa = a.handshakePrologue()
+  // independent of channel, epoch, and rid (that is the whole point — it MixHashes before msg1)
+  assert.ok(pa.equals(b.handshakePrologue()))
+  assert.ok(pa.equals(a.handshakePrologue()))               // stable across calls
+  assert.equal(pa.subarray(0, 10).toString('ascii'), 'p2p-inv-v1')
+  assert.equal(pa.length, 10 + 32)
+  // a different invite yields a different prologue (invite-scoped)
+  assert.equal(createInvite(generateInviteSecret()).handshakePrologue().equals(pa), false)
+  // and it drives a real IKpsk2 handshake to completion end-to-end
+  const alice = generateIdentity(), bob = generateIdentity()
+  const i = initiator({ localX: { pub: bob.xPub, priv: bob.xPriv }, remoteXPub: alice.xPub, psk: a.psk, prologue: a.handshakePrologue() })
+  const r = responder({ localX: { pub: alice.xPub, priv: alice.xPriv }, psk: b.psk, prologue: b.handshakePrologue() })
+  r.readMessage(i.writeMessage())
+  i.readMessage(r.writeMessage())
+  assert.ok(i.split().handshakeHash.equals(r.split().handshakeHash))
+})
+
 // ── frozen IKpsk2 transcript KAT (Noise §9.2 conformance canary) ────────────────
 // Fixed statics + ephemerals + psk ⇒ a deterministic wire transcript. This pins the §9.2 rule that
 // every MixHash(e) is followed by MixKey(e) in PSK mode: drop either MixKey(e) call and these bytes

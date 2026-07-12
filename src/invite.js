@@ -54,8 +54,10 @@
 //      `deriveRid(S, ...)`, and construct channels with the blob codec:
 //        createTracker({ codec: inv.codec })   // sealed SDP payload, neutral attribute name
 //        createDht({ invite: inv })            // encrypted BEP44 put/get instead of announce_peer
-//   4. The Noise calls take one extra option: `initiator({..., psk: inv.psk, prologue: inv.prologue(rid, epoch)})`
+//   4. The Noise calls take one extra option: `initiator({..., psk: inv.psk, prologue: inv.handshakePrologue()})`
 //      and the same on `responder(...)` → Noise_IKpsk2. Without `psk` the bytes are today's plain IK.
+//      (handshakePrologue() is a FIXED invite-scoped value both sides derive from K_inv alone — see
+//      its doc for why a per-rendezvous prologue is unimplementable.)
 //   5. Publisher stamps the flag when minting an invite: `encodeKey(edPub, xPub, INVITE_FLAG)`
 //      (v2's burn/rotate then stops republishing + retires K_inv after the first handshake).
 
@@ -324,7 +326,22 @@ export function createInvite(secret) {
     bepPriv: bepKeys.priv,
     /** rid_inv for a channel+epoch (§4.4) — only a K_inv holder can compute WHERE we published. */
     rid: (channel, epochStr, len) => deriveInviteRid(secret, channel, epochStr, len),
-    /** Noise prologue binding the handshake to the exact rendezvous it arrived on (§5). */
+    /**
+     * The canonical invite-scoped Noise prologue (§5), used as `initiator/responder({prologue})`.
+     *
+     * WHY A FIXED VALUE, not the study's `"p2p-inv-v1"‖rid‖epoch`: the prologue is MixHash'd at
+     * handshake START, before msg1 is parsed — so the responder would have to know the prologue
+     * before it can learn which (channel × epoch) rid the dialer actually read. It can't. A
+     * per-rendezvous prologue is therefore unimplementable as written. Instead both parties derive
+     * ONE fixed invite-scoped value from K_inv alone (no rid/epoch input): `"p2p-inv-v1"` ‖
+     * HKDF(K_inv, "p2p-rvk-handshake-v1"). It is domain-separated from every rendezvous rid ('handshake'
+     * is not a real channel, so it never collides with dht/tracker/mdns), authenticated (tamper-
+     * detected via MixHash) but not secret, and ties the handshake to THIS invite. The tighter
+     * "which exact rendezvous" binding the study wanted is already delivered by the psk (K_inv) and
+     * by the sealed blob's `ad=rid`; the prologue's job here is invite-scoping, which this achieves.
+     */
+    handshakePrologue: () => Buffer.concat([Buffer.from('p2p-inv-v1', 'ascii'), deriveInviteRid(secret, 'handshake', '', 32)]),
+    /** Low-level building block; prefer handshakePrologue(). Kept for the rid-bound variant if ever needed. */
     prologue: (rid) => Buffer.concat([Buffer.from('p2p-inv-v1', 'ascii'), Buffer.from(rid)]),
     // BEP44 salt = the rid itself (20 bytes; spec caps salt at 64). It is already
     // HKDF(K_inv, channel, epoch), so the target rotates per epoch and per invite for free, and both
