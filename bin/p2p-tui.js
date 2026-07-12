@@ -13,7 +13,7 @@
 import process from 'node:process'
 import {
   loadNode, loadOrCreateIdentity, decodeKey, TypoError,
-  peerLabel, shortId, loadFriends, addFriend, resolveFriend, peerKey,
+  peerLabel, shortId, loadFriends, addFriend, resolveFriend, peerKey, parseShare, looksLikeShare,
 } from './lib.js'
 
 const ESC = '\x1b['
@@ -178,7 +178,7 @@ function command(line) {
   const arg = rest.join(' ')
   switch (cmd) {
     case 'help': case '?':
-      add('sys', 'commands: /connect <key|friend> · /friends · /key · /peers · /clear · /quit'); break
+      add('sys', 'commands: /connect <key|S-invite|friend> · /friends · /key · /peers · /clear · /quit'); break
     case 'key':
       add('sys', 'your key (share it): ' + state.id.S); break
     case 'peers': {
@@ -193,7 +193,8 @@ function command(line) {
       break
     }
     case 'connect': case 'c':
-      dial(resolveFriend(arg, state.profile) || arg); break
+      // an invite share string is never a friend name — dial it verbatim
+      dial(looksLikeShare(arg) ? arg : (resolveFriend(arg, state.profile) || arg)); break
     case 'clear':
       state.msgs = []; render(); break
     case 'quit': case 'q': case 'exit':
@@ -206,11 +207,12 @@ function command(line) {
 
 async function dial(key) {
   key = String(key).trim().toUpperCase()
-  if (!key) { add('sys', 'usage: /connect <26-char-key>'); return }
-  try { decodeKey(key) } catch (e) {
+  if (!key) { add('sys', 'usage: /connect <26-char-key | S-invite-share>'); return }
+  let share
+  try { share = parseShare(key); decodeKey(share.S) } catch (e) {    // bare S, or a one-time invite share
     add('sys', e instanceof TypoError ? 'bad key: ' + e.message : 'bad key'); return
   }
-  add('sys', `connecting to ${shortId(key)} · resolving rendezvous, punching NAT, Noise IK…`)
+  add('sys', `connecting to ${shortId(share.S)} · resolving rendezvous, punching NAT, Noise ${share.secret ? 'IKpsk2 (private invite)' : 'IK'}…`)
   setStatus('connecting…', 'warn')
   try {
     const peer = await state.node.connect(key)

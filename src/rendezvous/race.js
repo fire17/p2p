@@ -111,6 +111,14 @@ export function createRace(cfg) {
   const now = cfg.now || (() => Date.now())
   const dialCap = cfg.dialCap ?? 20
   const perChannelCap = cfg.perChannelCap ?? 8
+  // INVITE MODE (research/metadata-privacy.md §3.2/§9, src/invite.js): with a createInvite() context
+  // the rendezvous id comes from the one-time K_inv instead of the reusable S — so a non-holder
+  // cannot even LOCATE the record. Everything else (fan-out, epochs, dedup, caps) is untouched, and
+  // without `invite` every rid is byte-identical to v0.1.0.
+  const invite = cfg.invite || null
+
+  /** rid for a channel+epoch: HKDF(K_inv,…) in invite mode, HKDF(S,…) otherwise. */
+  const ridFor = (s, ch, ep) => (invite ? invite.rid(ch.name, ep, ch.ridLen) : deriveRid(s, ch.name, ep, ch.ridLen))
 
   /** Build the per-channel info blob (dht = port only; mdns/tracker = full candidate blob). */
   function infoFor(channel, endpoint) {
@@ -137,7 +145,7 @@ export function createRace(cfg) {
         const info = infoFor(ch, endpoint)
         for (const ep of eps) {
           try {
-            ch.announce(deriveRid(s, ch.name, ep, ch.ridLen), info)
+            ch.announce(ridFor(s, ch, ep), info)
           } catch {
             /* one channel/epoch failing must not abort the others (best-effort fan-out) */
           }
@@ -201,7 +209,7 @@ export function createRace(cfg) {
     const slow = []
     for (const ch of channels) {
       for (const ep of eps) {
-        const rid = deriveRid(s, ch.name, ep, ch.ridLen)
+        const rid = ridFor(s, ch, ep)
         const isFast = CHANNEL_WEIGHT[ch.name] === 0
         const opts = isFast ? fastOpts : slowOpts
         ;(isFast ? fast : slow).push(() => tagStream(ch, ch.lookup(rid, opts)))

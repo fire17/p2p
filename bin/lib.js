@@ -4,9 +4,30 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
-import { generateIdentity, decodeKey, verifyCommitment, TypoError } from '../src/key.js'
+import { generateIdentity, decodeKey, verifyCommitment, encodeKey, TypoError } from '../src/key.js'
+import { generateInviteSecret, formatShare, parseShare, INVITE_FLAG } from '../src/invite.js'
 
-export { generateIdentity, decodeKey, verifyCommitment, TypoError }
+export { generateIdentity, decodeKey, verifyCommitment, encodeKey, TypoError }
+export { generateInviteSecret, formatShare, parseShare, INVITE_FLAG }
+
+/**
+ * Mint a fresh ONE-TIME invite for this identity (metadata privacy v1). Same keypair, but the
+ * contact string carries the INVITE flag and a per-invite secret tail: only the holder of the tail
+ * can locate (rid_inv), decrypt (k_ip) or handshake with (psk) this node's rendezvous record.
+ * The secret is NOT persisted — it lives for the life of the process that published it.
+ * @param {{edPub:Buffer,xPub:Buffer}} id
+ * @returns {{secret:Buffer, share:string}}
+ */
+export function mintInvite(id) {
+  const secret = generateInviteSecret()
+  return { secret, share: formatShare(encodeKey(id.edPub, id.xPub, INVITE_FLAG), secret) }
+}
+
+/** true if a CLI argument looks like a contact string (bare S or an S-<tail> invite share). */
+export function looksLikeShare(s) {
+  if (typeof s !== 'string') return false
+  try { const { S } = parseShare(s); return S.length === 26 } catch { return false }
+}
 
 // ── ANSI (no-op when stdout is not a TTY) ────────────────────────────────────
 export const TTY = process.stdout.isTTY

@@ -344,3 +344,60 @@ test('interval-driven tick: keepalive holds a peer past livenessMs, then death (
     assert.equal(peer2.connected, true, 'redial RE-HANDSHAKES a fresh session (not the corpse)')
   } finally { A.node.close(); B.node.close() }
 })
+
+// --- oversized payloads: FAIL LOUDLY, NEVER HANG (task #22) -------------------
+// wire.js's sendReliable throws past the mtu budget. node used to swallow that throw inside
+// wireSend, leaving the caller's send() promise pending FOREVER (an app-level deadlock). Every
+// assertion below is timeout-guarded, so a regression fails the test instead of hanging the run.
+const withTimeout = (p, ms, what) => Promise.race([
+  p,
+  new Promise((_r, rej) => setTimeout(() => rej(new Error('HUNG: ' + what + ' did not settle in ' + ms + 'ms')), ms).unref()),
+])
+
+test('send: oversized payload REJECTS (does not hang) and never enters the outbox', async () => {
+  const board = makeBoard()
+  const A = await buildNode(board, 'PPPPPPPPPPPPPPPPPPPPPPPPPP', 'oa')
+  const B = await buildNode(board, 'QQQQQQQQQQQQQQQQQQQQQQQQQQ', 'ob')
+  try {
+    const peer = await B.node.connect('PPPPPPPPPPPPPPPPPPPPPPPPPP')
+    const limit = peer.maxMessage                       // mtu(1200) - wire header(17) - AEAD tag(16) - app header(5)
+    assert.equal(limit, 1162)
+
+    const err = await withTimeout(
+      peer.send(Buffer.alloc(limit + 1, 0x41)).then(() => null, (e) => e),
+      1000, 'send(oversized)',
+    )
+    assert.ok(err instanceof RangeError, 'rejects with a RangeError, got: ' + err)
+    assert.equal(err.reason, 'oversize')
+    assert.equal(err.limit, limit)
+    assert.match(err.message, /message too large/)
+
+    // the failed send must not be parked in the outbox (it would be replayed forever on reconnect)
+    const rec = [...B.node._peers.values()].find((r) => r.peer === peer)
+    assert.equal(rec._outbox.size, 0, 'oversized message left nothing in the outbox')
+
+    // and the peer still works: the very next in-budget send goes through
+    const aMsgs = []
+    A.node.on('message', (_p, d) => aMsgs.push(d.length))
+    await withTimeout(peer.send(Buffer.alloc(limit, 0x42)), 1000, 'send(at limit)')
+    await nextTick()
+    assert.deepEqual(aMsgs, [limit], 'a payload exactly at the limit still delivers')
+  } finally { A.node.close(); B.node.close() }
+})
+
+test('send: oversized payload rejects even while DISCONNECTED (no silent queueing)', async () => {
+  const board = makeBoard()
+  const A = await buildNode(board, 'RRRRRRRRRRRRRRRRRRRRRRRRRR', 'oc')
+  const B = await buildNode(board, 'SSSSSSSSSSSSSSSSSSSSSSSSSS', 'od')
+  try {
+    const peer = await B.node.connect('RRRRRRRRRRRRRRRRRRRRRRRRRR')
+    peer.close()
+    assert.equal(peer.connected, false)
+    const err = await withTimeout(
+      peer.send(Buffer.alloc(peer.maxMessage + 1)).then(() => null, (e) => e),
+      1000, 'send(oversized, disconnected)',
+    )
+    assert.ok(err instanceof RangeError, 'rejects immediately instead of queueing a doomed message')
+    assert.equal(err.reason, 'oversize')
+  } finally { A.node.close(); B.node.close() }
+})

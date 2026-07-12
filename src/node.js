@@ -19,12 +19,16 @@
 // in docs/INTERFACES.md §src/transport.js. Needs main to ratify the seam.
 
 import { randomBytes } from 'node:crypto'
-import { createChannel, encodeFrame, decodeFrame, TYPE } from './wire.js'
+import { createChannel, encodeFrame, decodeFrame, TYPE, HEADER_LEN } from './wire.js'
 import { createGroup } from './group.js'
+import { parseShare, createInvite, hasInvite, TypoError } from './invite.js'
 
 /** App-layer message kinds (inside the encrypted DATA payload). */
 const APP = Object.freeze({ MSG: 1, ACK: 2 })
 const ZERO8 = Buffer.alloc(8)
+/** Bytes an app payload loses on the way to the wire: app header [1B kind][4B seq] + Noise AEAD tag. */
+const APP_HDR = 5
+const AEAD_TAG = 16
 
 /** Opt-in trace (P2P_DEBUG=1) for first-contact diagnostics — no-op by default. */
 const DBG = process.env.P2P_DEBUG ? (...a) => { try { console.error('[p2p]', ...a) } catch { /* */ } } : () => {}
@@ -108,9 +112,22 @@ function makePeer(node, { S = null } = {}) {
     remoteStatic: null,     // remote X25519 pubkey
     remoteEd: null,         // remote Ed25519 pubkey
     get connected() { return connected },
-    /** @param {Buffer|string} data @returns {Promise<number>} resolves with appSeq on ack */
+    /** Largest app payload that still fits the wire budget (mtu - wire header - Noise tag - app header). */
+    get maxMessage() { return node._mtu - HEADER_LEN - AEAD_TAG - APP_HDR },
+    /** @param {Buffer|string} data @returns {Promise<number>} resolves with appSeq on ack, REJECTS on a permanent send error */
     send(data) {
       const buf = asBuf(data)
+      // FAIL LOUDLY, NEVER HANG (task #22): an oversized payload makes wire.sendReliable throw. It
+      // used to be swallowed in wireSend and the caller's promise never settled — an app-level
+      // deadlock. Reject synchronously here (so it also fails while DISCONNECTED, where nothing is
+      // ever handed to wire), and reject from the send path below for any other throw.
+      const limit = peer.maxMessage
+      if (buf.length > limit) {
+        return Promise.reject(Object.assign(
+          new RangeError(`p2p: message too large: ${buf.length} bytes > ${limit} limit — chunk it before send()`),
+          { reason: 'oversize', limit, size: buf.length },
+        ))
+      }
       const seq = appSeqNext++; outbox.set(seq, buf)
       const p = new Promise((resolve, reject) => pending.set(seq, { resolve, reject }))
       wireSend(APP.MSG, seq, buf)   // queued in outbox if not connected; flushed on attach
@@ -122,10 +139,23 @@ function makePeer(node, { S = null } = {}) {
     },
   }
 
+  /** Reject + drop an outbox entry whose send can never succeed (permanent error). */
+  function failSend(seq, err) {
+    outbox.delete(seq)                               // permanent: never replay it on reconnect
+    const w = pending.get(seq)
+    if (w) { pending.delete(seq); w.reject(err) }
+    node.emit('divergence', peer, { reason: 'send', error: err })
+  }
+
   function wireSend(kind, seq, data) {
     if (!connected || !ch) return false
     try { ch.sendReliable(tx.encrypt(encodeApp(kind, seq, data))); return true }
-    catch { return false }
+    catch (err) {
+      // A MSG that wire refuses (oversize / closed channel) can never be delivered — surface it to
+      // the caller instead of silently dropping the promise on the floor. ACKs stay best-effort.
+      if (kind === APP.MSG) failSend(seq, err)
+      return false
+    }
   }
 
   function onAppCipher(cipher) {
@@ -177,19 +207,45 @@ function makePeer(node, { S = null } = {}) {
  * @param {object} inj  injected deps
  * @param {object} opts listen opts (passed to channel/endpoint factories)
  */
-async function resolveDeps(inj = {}, opts = {}) {
+async function resolveDeps(inj = {}, opts = {}, invite = null) {
   const need = ['generateIdentity', 'decodeKey', 'verifyCommitment', 'createEndpoint', 'initiator', 'responder', 'resolve', 'publishAll']
-  if (need.every((k) => typeof inj[k] === 'function')) return inj
+  if (need.every((k) => typeof inj[k] === 'function')) {
+    // Fully-mocked stack (tests). An invite still needs an invite-scoped rendezvous: honour the
+    // makeRace seam if the test provides one, otherwise the injected resolve/publishAll stand.
+    if (invite && typeof inj.makeRace === 'function') {
+      const r = inj.makeRace(invite)
+      return { ...inj, resolve: r.resolve, publishAll: r.publishAll, _channels: r.channels || [] }
+    }
+    return inj
+  }
   const [key, noise, transport, race, mdns, dht, tracker] = await Promise.all([
     import('./key.js'), import('./noise.js'), import('./transport.js'),
     import('./rendezvous/race.js'), import('./rendezvous/mdns.js'),
     import('./rendezvous/dht.js'), import('./rendezvous/tracker.js'),
   ])
+  /**
+   * Build one rendezvous race, S-mode (inv=null) or INVITE-mode (inv = createInvite(K_inv)).
+   * Invite mode changes exactly three things (research/metadata-privacy.md §9/§10, invite.js header):
+   * rids come from K_inv (`createRace({invite})`), tracker blobs are AEAD-sealed (`codec`), and the
+   * DHT switches from plaintext announce_peer to encrypted BEP44 (`invite`). Pass nothing and every
+   * byte is the v0.1.0 reusable-S wire.
+   * @param {object|null} inv
+   */
+  const makeRace = (inv = null) => {
+    const rz = opts.rendezvous || {}
+    const channels = [
+      mdns.createMdns(rz),                                             // LAN broadcast: rid_inv, plaintext TXT (LAN-only; see README)
+      dht.createDht(inv ? { ...rz, invite: inv } : rz),
+      tracker.createTracker(inv ? { ...rz, codec: inv.codec } : rz),
+    ]
+    const r = race.createRace({ channels, now: opts.now, invite: inv })
+    return { resolve: r.resolve, publishAll: r.publishAll, channels }
+  }
   let { resolve, publishAll } = inj
   let channels = []
   if (!resolve || !publishAll) {
-    channels = [mdns.createMdns(opts.rendezvous), dht.createDht(opts.rendezvous), tracker.createTracker(opts.rendezvous)]
-    const r = race.createRace({ channels, now: opts.now })
+    const r = makeRace(invite)
+    channels = r.channels
     resolve = resolve || r.resolve
     publishAll = publishAll || r.publishAll
   }
@@ -197,8 +253,44 @@ async function resolveDeps(inj = {}, opts = {}) {
     generateIdentity: key.generateIdentity, decodeKey: key.decodeKey, verifyCommitment: key.verifyCommitment,
     encodeKey: key.encodeKey,                       // derive a peer's shareable 26-char key from its pubkeys
     createEndpoint: transport.createEndpoint, initiator: noise.initiator, responder: noise.responder,
+    makeRace,                                       // per-invite rendezvous factory (dialing an invite builds its own)
     resolve, publishAll, _channels: channels, ...inj,
   }
+}
+
+/**
+ * Normalise whatever the caller passed as an invite into a createInvite() context.
+ * Accepts: an invite context (has .psk), the raw K_inv Buffer, a share string `S-<tail>`, or a bare
+ * invite token. null/undefined => reusable-S mode.
+ * @param {any} v
+ */
+function toInvite(v) {
+  if (v == null) return null
+  if (Buffer.isBuffer(v)) return createInvite(v)
+  if (typeof v === 'object' && v.psk) return v                       // already a createInvite() context
+  if (typeof v === 'string') {
+    const { secret } = parseShare(v.includes('-') ? v : 'X'.repeat(26) + '-' + v)   // bare token => treat as the tail
+    if (!secret) throw new TypoError('invite string carries no invite tail')
+    return createInvite(secret)
+  }
+  throw new TypeError('invite must be a share string, an invite token, a K_inv Buffer, or a createInvite() context')
+}
+
+/**
+ * The Noise prologue used in invite mode, on BOTH sides.
+ *
+ * DOCUMENTED DEVIATION (reported to main): metadata-privacy.md §5/§10 writes the prologue as
+ * "p2p-inv-v1" ‖ rid ‖ epoch — the rid the record was found at. The RESPONDER cannot know that rid:
+ * it announces under several (channel × epoch) rids and the dialer never tells it which one it read
+ * (the prologue is mixed BEFORE msg1 is parsed, so there is nowhere to carry a hint without a wire
+ * change). We therefore bind the prologue to a fixed, invite-scoped rid — HKDF(K_inv, "handshake") —
+ * which both sides derive independently. The security property that matters (only a K_inv holder can
+ * complete the handshake) is carried by the psk regardless; what is given up is per-rendezvous
+ * replay binding, which the psk + AEAD-sealed, rid-bound blob already cover.
+ * @param {object} inv
+ */
+function invitePrologue(inv) {
+  return inv.prologue(inv.rid('handshake', '', 32))
 }
 
 const DEADLINE = Symbol('deadline')
@@ -241,14 +333,20 @@ async function collectCandidates(source, cap = 64, graceMs = 1500) {
   return out
 }
 
-/** Initiator (dialer) side: resolve -> punch -> gate HELLO -> IK -> resolve after first-ack. */
-function initiatorHandshake(node, deps, S, dec) {
+/**
+ * Initiator (dialer) side: resolve -> punch -> gate HELLO -> IK -> resolve after first-ack.
+ * @param {object} [ctx] {resolve, invite} — invite mode dials an invite-scoped rendezvous (rid_inv +
+ *   sealed candidates) and runs Noise_IKpsk2. Absent => today's reusable-S path, byte-identical.
+ */
+function initiatorHandshake(node, deps, S, dec, ctx = {}) {
+  const inv = ctx.invite || null
+  const resolveFn = ctx.resolve || deps.resolve
   let rec = node._peers.get(S)
   if (!rec) { rec = makePeer(node, { S }); node._peers.set(S, rec) }
   const myConnId = randomBytes(8)
 
   return (async () => {
-    const cands = await collectCandidates(deps.resolve(S))   // resolve is a STREAM (async gen) in the real path
+    const cands = await collectCandidates(resolveFn(S))   // resolve is a STREAM (async gen) in the real path
     DBG('dial: collected', cands.length, 'candidates -> punch')
     // Per-connect correlation token: collapses transport's 5×-per-dialer onConnection
     // (one per v4/v6 source tuple) to ONE accept. Correlation only, NOT auth (auth stays
@@ -271,9 +369,13 @@ function initiatorHandshake(node, deps, S, dec) {
           const { edPub, xPub, instance } = decodeIntro(f.payload)
           if (!deps.verifyCommitment(dec.commitment, edPub, xPub)) return fail('gate')  // NOT auth — cheap prefilter (D4)
           DBG('dial: HELLO gated OK -> send HS1')
-          setPeerIdentity(deps, rec.peer, edPub, xPub)   // peer.key === the S we dialed
+          setPeerIdentity(deps, rec.peer, edPub, xPub)   // peer.key === the remote's BARE S (invites are one-time; the durable contact is S)
           peerInstance = instance
-          hs = deps.initiator({ localX: { pub: node._identity.xPub, priv: node._identity.xPriv }, remoteXPub: xPub })
+          // Invite mode: Noise_IKpsk2 (psk = HKDF(K_inv,"psk")) + the invite-scoped prologue. No
+          // invite => neither option is passed and the wire bytes are plain IK, unchanged.
+          const noiseOpts = { localX: { pub: node._identity.xPub, priv: node._identity.xPriv }, remoteXPub: xPub }
+          if (inv) { noiseOpts.psk = inv.psk; noiseOpts.prologue = invitePrologue(inv) }
+          hs = deps.initiator(noiseOpts)
           socket.send(encodeFrame(TYPE.HS1, myConnId, 0, 0, hs.writeMessage(encodeIntro(node._identity.edPub, node._identity.xPub, node._instance))))
         } else if (f.type === TYPE.HS2 && hs) {
           let payload
@@ -294,7 +396,15 @@ function initiatorHandshake(node, deps, S, dec) {
 /** Responder (accepter) side: send HELLO, run IK responder, key peer by remote static. */
 function acceptConnection(node, deps, socket) {
   const id = node._identity
-  const hs = deps.responder({ localX: { pub: id.xPub, priv: id.xPriv } })
+  const inv = node._invite || null
+  // Invite mode is EXCLUSIVE while it lasts: the responder runs Noise_IKpsk2 only, so a holder of the
+  // reusable S who never got K_inv cannot complete the handshake even if it somehow learns our IP
+  // (metadata-privacy §10: "success == MITM ruled out AND initiator proven to be the invitee"). The
+  // cost, stated: an ordinary reusable-S friend cannot connect to a node while it is listening for an
+  // invite. No invite => plain IK, byte-identical to v0.1.0.
+  const hs = deps.responder(inv
+    ? { localX: { pub: id.xPub, priv: id.xPriv }, psk: inv.psk, prologue: invitePrologue(inv) }
+    : { localX: { pub: id.xPub, priv: id.xPriv } })
   let rec = null, hs1seen = false, tries = 0
 
   // HELLO must RETRANSMIT: onConnection can fire (and this first HELLO go out) before the
@@ -318,7 +428,7 @@ function acceptConnection(node, deps, socket) {
       hs1seen = true; clearInterval(timer)
       const connId = Buffer.from(f.connId)
       let payload
-      try { payload = hs.readMessage(f.payload) }
+      try { payload = hs.readMessage(f.payload) }                     // in invite mode a msg1 without the psk fails HERE (fail-closed)
       catch (err) { node.emit('divergence', null, { reason: 'handshake', error: err }); try { socket.close() } catch { /* */ } return }
       const { edPub, xPub, instance } = decodeIntro(payload)         // Bob's pubkeys — TOFU pin + peer key; instance = restart nonce
       const pkey = 'static:' + Buffer.from(xPub).toString('hex')
@@ -344,18 +454,35 @@ function createNode(identity, opts, deps, ep) {
   const node = {
     on: em.on, off: em.off, emit: em.emit,
     _identity: identity, _ep: ep, _peers: new Map(),
+    _invite: opts._invite || null,                // live one-time invite (listen({invite})) -> IKpsk2 + rid_inv
     _instance: opts.instance || randomBytes(8),   // per-process nonce -> peer-restart discriminator
     _now: opts.now || (() => Date.now()),
     _keepaliveMs: opts.keepaliveMs ?? 25000,
     _mtu: opts.mtu ?? 1200,
-    /** find + handshake (first contact or reconnect); resolves after the IK first-ack. */
-    connect(S) {
+    /**
+     * find + handshake (first contact or reconnect); resolves after the IK first-ack.
+     * Accepts a bare 26-char S (reusable mode — unchanged) OR a one-time invite share string
+     * `S-<tail>` (invite mode: rid_inv + sealed candidates + Noise_IKpsk2).
+     * @param {string} share
+     */
+    connect(share) {
       return (async () => {
-        S = String(S).toUpperCase()
-        const dec = deps.decodeKey(S)               // rejects (TypoError) on checksum/alphabet — no network
+        const { S, secret } = parseShare(String(share))   // TypoError on a typo'd key or tail — no network
+        const dec = deps.decodeKey(S)                     // rejects (TypoError) on checksum/alphabet — no network
+        if (!secret && hasInvite(dec.version)) {
+          throw new TypoError('this is a one-time invite key — you need the full share string (S-…)')
+        }
         const existing = node._peers.get(S)
         if (existing && existing.peer.connected) return existing.peer
-        return initiatorHandshake(node, deps, S, dec)
+        if (!secret) return initiatorHandshake(node, deps, S, dec)   // reusable-S: identical to v0.1.0
+
+        // Invite mode: build a rendezvous scoped to THIS invite (its own rids + sealed codec). It is
+        // separate from the node's own listen-side rendezvous, so dialing an invite never disturbs it.
+        const inv = createInvite(secret)
+        if (typeof deps.makeRace !== 'function') throw new Error('p2p: invite-mode dialing needs the real rendezvous stack (no makeRace seam)')
+        const r = deps.makeRace(inv)
+        for (const c of r.channels || []) node._channels.push(c)     // closed with the node
+        return initiatorHandshake(node, deps, S, dec, { resolve: r.resolve, invite: inv })
       })()
     },
     /** @param {string[]} keys */
@@ -400,14 +527,20 @@ export async function identity(opts = {}) {
 /**
  * Go online: bind transport, publish presence in the background (instant-on), accept
  * inbound connections. Returns fast — rendezvous publishing continues async.
+ *
+ * `opts.invite` (a share string / invite token / K_inv Buffer) switches this node's PRESENCE into
+ * one-time-invite mode: candidates are published only under rid_inv = HKDF(K_inv,…) and AEAD-sealed,
+ * so nobody but the invitee can even locate — let alone read — the record, and the handshake gains
+ * the psk. Omit it and every published byte is the reusable-S v0.1.0 wire.
  * @param {object} id  identity from identity()
- * @param {object} [opts]  {port?, endpoint?, now?, keepaliveMs?, mtu?, deps?}
+ * @param {object} [opts]  {port?, endpoint?, now?, keepaliveMs?, mtu?, invite?, deps?}
  * @returns {Promise<object>} node
  */
 export async function listen(id, opts = {}) {
-  const deps = await resolveDeps(opts.deps || {}, opts)
+  const invite = toInvite(opts.invite)
+  const deps = await resolveDeps(opts.deps || {}, opts, invite)
   const ep = opts.endpoint || await deps.createEndpoint({ port: opts.port })
-  const node = createNode(id, opts, deps, ep)
+  const node = createNode(id, { ...opts, _invite: invite }, deps, ep)
   node._channels = deps._channels || []
   try {                                          // instant-on: publishAll returns fast (schedules in bg)
     const h = deps.publishAll(id.S ?? id.key, ep)

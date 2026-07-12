@@ -22,6 +22,7 @@ import {
   loadNode, loadOrCreateIdentity, saveIdentity, generateIdentity, decodeKey, TypoError, doctor,
   bold, dim, red, green, cyan, yellow, magenta, peerLabel, shortId, idFilePath,
   loadFriends, addFriend, resolveFriend, peerKey,
+  mintInvite, parseShare, looksLikeShare,
 } from './lib.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -32,24 +33,40 @@ function opts(args) {
 }
 
 // ── key display ────────────────────────────────────────────────────────────────
-function printKeyBox(S) {
-  const title = 'YOUR p2p KEY — share with a friend'
-  const W = Math.max(title.length, S.length) + 4
+function printBox(title, value, color = green) {
+  const W = Math.max(title.length, value.length) + 4
   const bar = '─'.repeat(W)
   const pad = (s) => '  ' + s + ' '.repeat(W - 2 - s.length)
   console.log('\n' + cyan('  ┌' + bar + '┐'))
   console.log(cyan('  │') + bold(pad(title)) + cyan('│'))
   console.log(cyan('  ├' + bar + '┤'))
-  console.log(cyan('  │') + bold(green(pad(S))) + cyan('│'))
+  console.log(cyan('  │') + bold(color(pad(value))) + cyan('│'))
   console.log(cyan('  └' + bar + '┘'))
-  console.log(dim('  they run:  ') + bold('p2p ' + S) + dim('   (or: p2p connect ' + S + ')') + '\n')
+  console.log(dim('  they run:  ') + bold('p2p ' + value) + dim('   (or: p2p connect ' + value + ')') + '\n')
+}
+
+function printKeyBox(S) {
+  printBox('YOUR p2p KEY — share with a friend', S)
+}
+
+/** One-time invite share string: the key + its per-invite secret tail (metadata privacy). */
+function printInviteBox(share) {
+  printBox('ONE-TIME INVITE — send to ONE person', share, yellow)
+  console.log(dim('  single-use: only the holder of this string can find, decrypt or reach this node.'))
+  console.log(dim('  it lives while this process runs — quit and the invite is gone (mint a new one).') + '\n')
 }
 
 // ── line-mode chat (stable identity, real network) ──────────────────────────────
-async function lineMode({ dialKey, ephemeral, profile }) {
+// `mintInviteMode: true` => publish under a fresh one-time K_inv instead of the reusable S.
+// The invite MUST be minted from the identity this node actually listens as — minting it earlier,
+// from a separate loadOrCreateIdentity() call, silently breaks under --ephemeral (that call returns a
+// NEW random identity every time), and the invitee then fails the commitment gate against a key
+// nobody is listening on. Caught by the two-process gate; keep the mint and the listen on one id.
+async function lineMode({ dialKey, ephemeral, profile, mintInviteMode = false }) {
   const id = loadOrCreateIdentity({ ephemeral, profile })
+  const invite = mintInviteMode ? mintInvite(id) : null
   const mod = await loadNode()
-  const node = await mod.listen(id, {})
+  const node = await mod.listen(id, invite ? { invite: invite.secret } : {})
   const getPeers = () => (node.peers ? node.peers() : [])
   let rl = null
   const printLine = (line) => {
@@ -66,16 +83,21 @@ async function lineMode({ dialKey, ephemeral, profile }) {
   node.on('disconnect', (peer) => printLine(dim('  · peer ' + peerLabel(peer) + ' disconnected')))
 
   if (dialKey) {
-    try { decodeKey(String(dialKey).trim().toUpperCase()) } catch (e) {
+    let share
+    try { share = parseShare(String(dialKey).trim()); decodeKey(share.S) } catch (e) {   // bare S or an S-<tail> invite
       if (e instanceof TypoError) { console.error(red('  ✗ bad key: ') + e.message); process.exit(2) }
       throw e
     }
     console.log(dim('  your key: ') + cyan(id.S))
-    console.log(dim('  connecting to ') + cyan(shortId(dialKey)) + dim(' · rendezvous + NAT punch + Noise IK…'))
+    console.log(dim('  connecting to ') + cyan(shortId(share.S)) +
+      dim(' · rendezvous + NAT punch + Noise ' + (share.secret ? 'IKpsk2 (private invite)…' : 'IK…')))
     try {
       const peer = await node.connect(dialKey)
       console.log('\n' + green(bold('  ✅ secure channel established — verified, no MITM')) + dim('  (peer ' + peerLabel(peer) + ')'))
     } catch (e) { console.error(red('  ✗ connect failed: ') + e.message); process.exit(3) }
+  } else if (invite) {
+    printInviteBox(invite.share)
+    console.log(dim('  listening (private invite mode) · rendezvous record is sealed — only your invitee can read it…'))
   } else {
     printKeyBox(id.S)
     console.log(dim('  listening · waiting for a friend to connect…'))
@@ -139,7 +161,8 @@ const HELP = `${bold('p2p')} — MITM-proof, zero-dependency P2P chat
   ${bold('p2p tui')} [KEY]           full-screen TUI; optionally dial KEY on start
   ${bold('p2p chat')} [KEY]          line-mode chat (scriptable)
   ${bold('p2p listen')}              line-mode: go online, print your key, wait
-  ${bold('p2p connect')} <KEY|name>  line-mode: dial a 26-char key or a saved friend
+  ${bold('p2p connect')} <KEY|SHARE|name>  line-mode: dial a key, an invite share string, or a friend
+  ${bold('p2p invite')}              mint a ONE-TIME private invite (S-…) and listen for it
   ${bold('p2p friends')}             list everyone you've connected with (reconnect by name)
   ${bold('p2p key')} [--new]         print your stable key (--new rotates it)
   ${bold('p2p doctor')}              check rendezvous reachability
@@ -157,9 +180,6 @@ async function main() {
   const positional = argv.filter((a, i) => !a.startsWith('-') && argv[i - 1] !== '--profile')
   const cmd = positional[0]
 
-  // a bare 26-char key as the first arg == connect via TUI (the friendly default)
-  const looksLikeKey = (s) => typeof s === 'string' && /^[0-9A-HJ-NP-Za-hj-np-z]{26}$/.test(s)
-
   switch (cmd) {
     case undefined:
       return launchTui(argv) // no command -> TUI listen
@@ -171,10 +191,15 @@ async function main() {
       return lineMode({ dialKey: null, ...o })
     case 'connect': case 'dial': {
       const arg = positional[1]
-      if (!arg) { console.error(red('  usage: p2p connect <26-char-key | friend-name>')); process.exit(2) }
-      const key = resolveFriend(arg, o.profile) || arg // a saved friend's name/short-id, or a raw key
+      if (!arg) { console.error(red('  usage: p2p connect <26-char-key | S-invite-share | friend-name>')); process.exit(2) }
+      // an invite share string is never a friend name — try it verbatim first
+      const key = looksLikeShare(arg) ? arg : (resolveFriend(arg, o.profile) || arg)
       return lineMode({ dialKey: key, ...o })
     }
+    case 'invite':
+      // Mint a fresh one-time K_inv for THIS identity, print the share string, and go online in
+      // invite mode: presence is published only under rid_inv, sealed under k_ip (metadata privacy).
+      return lineMode({ dialKey: null, mintInviteMode: true, ...o })
     case 'friends': case 'f': {
       const list = loadFriends(o.profile)
       if (!list.length) { console.log(dim('\n  no friends yet — connect with someone and they\'re saved here.\n')); return }
@@ -197,7 +222,7 @@ async function main() {
     case 'doctor':
       return runDoctor()
     default:
-      if (looksLikeKey(cmd)) return launchTui(argv) // `p2p <KEY>` -> TUI + dial
+      if (looksLikeShare(cmd)) return launchTui(argv) // `p2p <KEY>` / `p2p <S-INVITE>` -> TUI + dial
       console.error(red('  unknown command: ') + cmd + dim('   (try p2p --help)'))
       process.exit(2)
   }

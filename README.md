@@ -37,6 +37,24 @@ await peer.send('hey')                        // realtime, ordered, encrypted
 `identity()` is async and returns `{ S, edPub, edPriv, xPub, xPriv }` — `S` is the 26-char
 key string you share. The `message` event is `(peer, data)`. (Or just use the CLI: `p2p`.)
 
+For a **private, one-time invite** instead of your reusable key, pass the invite secret to
+`listen()` and hand the peer the share string — `connect()` takes either form:
+
+```js
+import { generateInviteSecret, formatShare, INVITE_FLAG } from '@fire17/p2p/invite'
+import { encodeKey } from '@fire17/p2p/key'
+
+// the inviter
+const secret = generateInviteSecret()                              // 128-bit K_inv — for ONE invitee
+const node = await listen(me, { invite: secret })                  // presence sealed under K_inv
+const share = formatShare(encodeKey(me.edPub, me.xPub, INVITE_FLAG), secret)   // "S-XXXX…", send out of band
+
+// the invitee (holds the share string)
+const peer = await node.connect(share)                             // sealed lookup + Noise IKpsk2
+```
+
+See **Private invites** below for exactly what this hides (and what it doesn't).
+
 CLI demo: `npx p2p-chat` (generates a key on one machine, `p2p-chat <key>` connects from another).
 
 ## How it works — the whole magic
@@ -156,6 +174,56 @@ irm https://p2p.akeyo.io/init.ps1 | iex            # Windows
 
 Then `p2p` for the full-screen chat, or `p2p key` to see your key. Full technical walkthrough
 with diagrams: **https://p2p.akeyo.io**
+
+```sh
+p2p                       # TUI: listen + chat
+p2p connect <KEY|SHARE>   # dial a 26-char key, or a one-time invite share string
+p2p <KEY|SHARE>           # same, straight into the TUI
+p2p invite                # mint a ONE-TIME private invite, print it, and listen for it
+p2p friends               # everyone you've connected with (reconnect by name)
+p2p key [--new]           # your stable key (--new rotates it)
+p2p doctor                # rendezvous reachability
+```
+
+## Private invites (metadata privacy)
+
+Your reusable key `S` is a *public* contact string: anyone holding it can look up where you
+are, and the rendezvous record it points at carries your candidate ip:ports in the clear.
+A **one-time invite** removes exactly that exposure.
+
+```sh
+p2p invite                                   # prints  S-XXXXXXXX…  (key + a per-invite secret)
+p2p connect GK0RN…7NS-YAFPE…KJ29             # the invitee dials the whole string
+```
+
+`p2p invite` mints a fresh 128-bit secret `K_inv`, hands it to you inside the share string, and
+publishes your presence under it. Everything that decides *where* you are published, *what* the
+record says, and *who* may complete the handshake is then derived from `K_inv`
+(`research/metadata-privacy.md`):
+
+- **Location** — the rendezvous id is `HKDF(K_inv, …)`, not `HKDF(S, …)`. Someone holding only your
+  reusable `S` cannot even find the record.
+- **Content** — candidates are AEAD-sealed under `HKDF(K_inv,"ip")` and padded to a fixed length, so
+  a DHT/tracker operator or a passive observer sees an opaque, constant-size ciphertext. **Your IP is
+  never in the clear on any public channel.**
+- **Handshake** — Noise upgrades from `IK` to `IKpsk2` with `psk = HKDF(K_inv,"psk")`. Someone who
+  learns your IP anyway *still* cannot complete the handshake without the invite.
+
+**Honest boundaries — what this does NOT do (yet):**
+
+- **The peer you connect to still sees your IP.** Invites hide your address from the *infrastructure*
+  and from non-invitees, not from the person you're talking to. (Hiding it from the peer needs an
+  onion transport — v3, not built.)
+- **Burn/rotate is v2, not built.** The invite is single-use *by convention* — nothing yet stops a
+  second connection with the same string, and the secret is not retired after first contact.
+- **The invite lives only while the process runs.** It is never written to disk; quit and it's gone.
+  Mint a new one per person.
+- **On the LAN, mDNS still broadcasts candidates in plaintext** (under the unlinkable invite id).
+  Local observers already see your traffic; the sealing protects the *public* channels (DHT, trackers).
+- **While listening for an invite, ordinary `S` dials are refused** — the node runs `IKpsk2` only, so
+  a friend with just your reusable key can't reach you until you go back to `p2p listen`/`p2p`.
+
+The reusable-`S` path is byte-for-byte unchanged when no invite is in play.
 
 ## Security in one paragraph
 
