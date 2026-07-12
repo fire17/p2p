@@ -7,6 +7,7 @@ import { identity, listen } from './p2p.js'
 
 const $ = (id) => document.getElementById(id)
 let node = null
+let pendingInviteNote = false
 
 // ── tiny log helpers (shared shape for the pair log #log and the group log #grouplog) ──
 function line(ul, text, cls = 'sys') {
@@ -107,10 +108,15 @@ function newGroupSecret() {
 async function main() {
   try {
     // Deep link FIRST (needs only the DOM, not the network): /app/#<26-CHAR-KEY> pre-fills the dial
-    // box; /app/#<longer group code> pre-fills the group Join box. Done before going online so a
-    // shared link is ready instantly.
+    // box; /app/#<group-code> pre-fills the group Join box. A share string (`S-<tail>`, one-time
+    // invite) is DETECTED and reported honestly — invite dialing isn't wired in the browser yet
+    // (fast-follow), so we don't silently misroute it to the group box. Done before going online.
     const frag = decodeURIComponent(location.hash.replace('#', '')).trim()
-    if (frag.length === 26) { $('peerkey').value = frag.toUpperCase(); showTab('pair') }
+    const isShareString = /^[0-9A-Za-z]{26}-\S+$/.test(frag) // 26-char S + '-' + invite tail
+    if (isShareString) {
+      showTab('pair')
+      pendingInviteNote = true // one-time invite — surfaced once we're online (say() needs the log)
+    } else if (frag.length === 26) { $('peerkey').value = frag.toUpperCase(); showTab('pair') }
     else if (frag.length > 26) { $('groupSecret').value = frag; showTab('group') }
 
     const id = await identity()
@@ -131,6 +137,9 @@ async function main() {
 
     status('online — reachable via public infrastructure', true)
     say('Online. Share your key, or paste someone else\'s and hit Connect.')
+    if (pendingInviteNote) {
+      say('This is a one-time invite link (S-…). Invite dialing isn\'t supported in the browser yet — use the CLI for the invite, or ask them for their plain 26-char key to connect here.', 'sys err')
+    }
 
     // ── programmatic hooks (used by the e2e harnesses; humans use the UI above) ──
     window.__p2pGroupSend = (keys, text) => node.group(keys).send(text)
