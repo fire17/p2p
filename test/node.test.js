@@ -255,6 +255,36 @@ test('resend buffer + exactly-once across reconnect (dropped app-ack, then repla
   assert.equal(peer2.connected, true)
 })
 
+test('peer RESTART (fresh instance) reply is NOT deduped against the dead session (bidirectional)', async () => {
+  const board = makeBoard()
+  const KA = 'PPPPPPPPPPPPPPPPPPPPPPPPPP', KB = 'QQQQQQQQQQQQQQQQQQQQQQQQQQ'
+  const echoOnMsg = (n) => n.on('message', (peer, d) => { peer.send(Buffer.from('echo:' + d.toString())) })
+  const A = await buildNode(board, KA, 'ra')
+  let B = await buildNode(board, KB, 'rb')
+  echoOnMsg(B.node)
+
+  const aGot = []
+  A.node.on('message', (_p, d) => aGot.push(d.toString()))
+
+  const peer = await A.node.connect(KB)
+  await peer.send('m1')                              // A->B m1 (seq0); B echoes -> A.delivered gets B seq0
+  await nextTick(); await nextTick()
+  assert.deepEqual(aGot, ['echo:m1'], 'A received echo:m1 (populates A dedup with B seq0)')
+
+  // B "restarts": brand-new node, SAME identity/key (deterministic), but a FRESH _instance
+  // (its outbound appSeq resets to 0). Re-registers its endpoint under the same key.
+  B.node.close()
+  B = await buildNode(board, KB, 'rb')
+  echoOnMsg(B.node)
+
+  const peer2 = await A.node.connect(KB)             // redial the restarted peer
+  await peer2.send('m2')                             // B2 replies echo:m2 with seq reset to 0
+  await nextTick(); await nextTick()
+  assert.deepEqual(aGot, ['echo:m1', 'echo:m2'],
+    'restarted peer reply delivered (instance-scoped dedup) — not silently dropped')
+  A.node.close(); B.node.close()
+})
+
 test('interval-driven tick: keepalive holds a peer past livenessMs, then death (silence) => disconnect + reconnect', async () => {
   // REAL setInterval + real clock (small windows). livenessMs=200, keepalive=40 -> if the
   // node were NOT driving tick(), the peer would die at 200ms even while linked. Surviving

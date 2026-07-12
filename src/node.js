@@ -42,19 +42,28 @@ function decodeApp(buf) {
   return { kind: buf[0], seq: buf.readUInt32BE(1), data: buf.subarray(5) }
 }
 
-/** Length-prefixed pubkey pair, used in HELLO / handshake payloads. */
-function encodeIdent(edPub, xPub) {
-  const e = asBuf(edPub), x = asBuf(xPub)
-  const b = Buffer.allocUnsafe(2 + e.length + x.length)
-  b[0] = e.length; e.copy(b, 1); b[1 + e.length] = x.length; x.copy(b, 2 + e.length)
+/**
+ * Length-prefixed [edPub][xPub][instance] used in HELLO / handshake payloads. `instance`
+ * is a per-PROCESS nonce (stable across a same-process transport-reconnect, NEW on a fresh
+ * restart) — the discriminator that lets the survivor tell "reconnect replay" (keep inbound
+ * dedup) from "peer restarted" (reset it, so the restart's reset appSeqs aren't dropped).
+ */
+function encodeIntro(edPub, xPub, instance) {
+  const e = asBuf(edPub), x = asBuf(xPub), i = asBuf(instance)
+  const b = Buffer.allocUnsafe(3 + e.length + x.length + i.length)
+  b[0] = e.length; e.copy(b, 1)
+  b[1 + e.length] = x.length; x.copy(b, 2 + e.length)
+  b[2 + e.length + x.length] = i.length; i.copy(b, 3 + e.length + x.length)
   return b
 }
-function decodeIdent(buf) {
+function decodeIntro(buf) {
   const el = buf[0]
   const edPub = buf.subarray(1, 1 + el)
   const xl = buf[1 + el]
   const xPub = buf.subarray(2 + el, 2 + el + xl)
-  return { edPub: Buffer.from(edPub), xPub: Buffer.from(xPub) }
+  const il = buf[2 + el + xl]
+  const instance = il ? buf.subarray(3 + el + xl, 3 + el + xl + il) : Buffer.alloc(0)
+  return { edPub: Buffer.from(edPub), xPub: Buffer.from(xPub), instance: Buffer.from(instance) }
 }
 
 /** Tiny event emitter (zero-dep). */
@@ -74,8 +83,9 @@ function emitter() {
 function makePeer(node, { S = null } = {}) {
   const outbox = new Map()        // appSeq -> plaintext Buffer (unacked; replayed on attach)
   const pending = new Map()       // appSeq -> {resolve,reject}
-  const delivered = new Set()     // inbound appSeq already delivered (dedup across reconnect)
+  let delivered = new Set()       // inbound appSeq already delivered (dedup within a peer INSTANCE)
   let appSeqNext = 0
+  let peerInstance = null         // remote's per-process nonce; a change => peer restarted
   let ch = null, tx = null, rx = null, socket = null
   let connected = false, established = false
 
@@ -121,7 +131,16 @@ function makePeer(node, { S = null } = {}) {
   }
 
   /** Bind a freshly-handshaked socket+session; replay any unacked outbox in order. */
-  function attach({ socket: sock, tx: txN, rx: rxN, connId }) {
+  function attach({ socket: sock, tx: txN, rx: rxN, connId, instance }) {
+    // Peer RESTART detection: a different per-process instance nonce means the remote is a
+    // fresh process with its outbound appSeq reset to 0. Its new low seqs would collide with
+    // the dead session's entries in `delivered` and be dropped as dups — so reset inbound
+    // dedup. A SAME instance (transport-reconnect of the same process) keeps `delivered` so a
+    // genuine outbox-replay retransmit is still deduped (exactly-once across reconnect holds).
+    if (instance && instance.length && peerInstance && !instance.equals(peerInstance)) {
+      delivered = new Set()
+    }
+    if (instance && instance.length) peerInstance = instance
     socket = sock; tx = txN; rx = rxN
     ch = createChannel({ connId, mtu: node._mtu, keepaliveMs: node._keepaliveMs, now: node._now, send: (frame) => socket.send(frame) })
     ch.onReliable(onAppCipher)
@@ -132,7 +151,7 @@ function makePeer(node, { S = null } = {}) {
     else node.emit('reconnect', peer)
   }
 
-  return { peer, attach, channel: () => ch, _outbox: outbox, _delivered: delivered }
+  return { peer, attach, channel: () => ch, _outbox: outbox, _delivered: () => delivered }
 }
 
 /**
@@ -221,7 +240,7 @@ function initiatorHandshake(node, deps, S, dec) {
     const socket = await node._ep.punch(cands, { token: myConnId })
     DBG('dial: punch resolved, socket ready -> awaiting HELLO')
     return new Promise((resolve, reject) => {
-      let hs = null, helloSeen = false, settled = false
+      let hs = null, helloSeen = false, settled = false, peerInstance = null
       const fail = (reason, err) => {
         if (settled) return; settled = true
         node.emit('divergence', rec.peer, { reason, error: err })
@@ -233,19 +252,20 @@ function initiatorHandshake(node, deps, S, dec) {
         DBG('dial: recv frame type', f.type)
         if (f.type === TYPE.HELLO && !helloSeen) {
           helloSeen = true
-          const { edPub, xPub } = decodeIdent(f.payload)
+          const { edPub, xPub, instance } = decodeIntro(f.payload)
           if (!deps.verifyCommitment(dec.commitment, edPub, xPub)) return fail('gate')  // NOT auth — cheap prefilter (D4)
           DBG('dial: HELLO gated OK -> send HS1')
           rec.peer.remoteStatic = Buffer.from(xPub)
+          peerInstance = instance
           hs = deps.initiator({ localX: { pub: node._identity.xPub, priv: node._identity.xPriv }, remoteXPub: xPub })
-          socket.send(encodeFrame(TYPE.HS1, myConnId, 0, 0, hs.writeMessage(encodeIdent(node._identity.edPub, node._identity.xPub))))
+          socket.send(encodeFrame(TYPE.HS1, myConnId, 0, 0, hs.writeMessage(encodeIntro(node._identity.edPub, node._identity.xPub, node._instance))))
         } else if (f.type === TYPE.HS2 && hs) {
           let payload
           try { payload = hs.readMessage(f.payload) }               // decrypt SUCCESS == first ack == MITM proof
           catch (err) { return fail('handshake', err) }             // fail CLOSED
           void payload
           const { tx, rx } = hs.split()
-          rec.attach({ socket, tx, rx, connId: myConnId })
+          rec.attach({ socket, tx, rx, connId: myConnId, instance: peerInstance })
           if (!settled) { settled = true; resolve(rec.peer) }
         } else if (rec.channel()) {
           rec.channel().onDatagram(buf, socket.rinfo)
@@ -266,7 +286,7 @@ function acceptConnection(node, deps, socket) {
   // then drops that HELLO with no recovery, and the dialer waits forever. Resend until HS1
   // arrives (capped, so a dead/duplicate accept doesn't spin). HS1 itself is retransmitted
   // by wire's ARQ once the channel exists — only the pre-handshake HELLO needs this.
-  const sendHello = () => { try { socket.send(encodeFrame(TYPE.HELLO, ZERO8, 0, 0, encodeIdent(id.edPub, id.xPub))) } catch { /* */ } }
+  const sendHello = () => { try { socket.send(encodeFrame(TYPE.HELLO, ZERO8, 0, 0, encodeIntro(id.edPub, id.xPub, node._instance))) } catch { /* */ } }
   DBG('accept: onConnection -> sending HELLO')
   sendHello()
   const timer = setInterval(() => {
@@ -284,7 +304,7 @@ function acceptConnection(node, deps, socket) {
       let payload
       try { payload = hs.readMessage(f.payload) }
       catch (err) { node.emit('divergence', null, { reason: 'handshake', error: err }); try { socket.close() } catch { /* */ } return }
-      const { xPub } = decodeIdent(payload)                          // Bob's static — TOFU pin + peer key
+      const { xPub, instance } = decodeIntro(payload)                // Bob's static — TOFU pin + peer key; instance = restart nonce
       const pkey = 'static:' + Buffer.from(xPub).toString('hex')
       rec = node._peers.get(pkey)
       if (!rec) { rec = makePeer(node, {}); rec.peer.remoteStatic = Buffer.from(xPub); node._peers.set(pkey, rec) }
@@ -292,9 +312,9 @@ function acceptConnection(node, deps, socket) {
       // completion and make it reply (e.g. outbox replay) reentrantly — our channel must
       // already be live to receive it. (Real async transport is unaffected; this is the
       // safe order either way.)
-      const hs2 = hs.writeMessage(encodeIdent(id.edPub, id.xPub))
+      const hs2 = hs.writeMessage(encodeIntro(id.edPub, id.xPub, node._instance))
       const { tx, rx } = hs.split()
-      rec.attach({ socket, tx, rx, connId })
+      rec.attach({ socket, tx, rx, connId, instance })
       socket.send(encodeFrame(TYPE.HS2, connId, 0, 0, hs2))
     } else if (rec && rec.channel()) {
       rec.channel().onDatagram(buf, socket.rinfo)
@@ -307,6 +327,7 @@ function createNode(identity, opts, deps, ep) {
   const node = {
     on: em.on, off: em.off, emit: em.emit,
     _identity: identity, _ep: ep, _peers: new Map(),
+    _instance: opts.instance || randomBytes(8),   // per-process nonce -> peer-restart discriminator
     _now: opts.now || (() => Date.now()),
     _keepaliveMs: opts.keepaliveMs ?? 25000,
     _mtu: opts.mtu ?? 1200,
