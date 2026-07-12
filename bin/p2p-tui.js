@@ -15,6 +15,7 @@ import {
   loadNode, loadOrCreateIdentity, decodeKey, TypoError,
   peerLabel, shortId, loadFriends, addFriend, resolveFriend, peerKey, parseShare, looksLikeShare,
   isOwnKey, OWN_KEY_MSG,
+  drainBounded, keyAction, createHistory, clampScroll,
 } from './lib.js'
 
 const ESC = '\x1b['
@@ -47,12 +48,22 @@ const state = {
   statusKind: 'warn', // ok|warn|err
   peers: () => [],
   scroll: 0, // lines scrolled up from bottom (0 = live)
+  unread: 0, // messages that landed while scrolled back
+  hist: createHistory(), // ↑/↓ recall of what YOU sent
 }
 
 function add(kind, text, label = '') {
+  // If the user is READING SCROLLBACK, a new message must not yank them to the bottom (that made
+  // the log unreadable the moment anyone typed). Grow the offset by the lines we just appended so
+  // the same content stays under their eyes, and count it as unread instead.
+  const before = state.scroll > 0 ? renderMsgLines(cols()).length : 0
   state.msgs.push({ kind, text, label })
   if (state.msgs.length > 5000) state.msgs.splice(0, 1000) // bound memory
-  state.scroll = 0
+  if (state.scroll > 0) {
+    const grew = renderMsgLines(cols()).length - before
+    if (grew > 0) state.scroll += grew
+    state.unread++
+  }
   render()
 }
 
@@ -120,8 +131,8 @@ function draw() {
   // message viewport (rows 2 .. H-2)
   const viewH = Math.max(1, H - 3)
   const all = renderMsgLines(W)
-  const maxScroll = Math.max(0, all.length - viewH)
-  if (state.scroll > maxScroll) state.scroll = maxScroll
+  state.scroll = clampScroll(state.scroll, all.length, viewH)
+  if (state.scroll === 0) state.unread = 0
   const end = all.length - state.scroll
   const start = Math.max(0, end - viewH)
   const window = all.slice(start, end)
@@ -129,8 +140,11 @@ function draw() {
     buf.push(moveTo(2 + i, 1) + (window[i] || '') + CLR_EOL)
   }
 
-  // status/separator line (H-1)
-  const hint = state.scroll > 0 ? P.dim(`  ⟂ scrolled ${state.scroll} lines — PgDn/End for live`) : P.dim('  ')
+  // status/separator line (H-1) — also where scrolling advertises itself
+  const hint = state.scroll > 0
+    ? P.warn(`  ⟂ scrollback ${state.scroll} line${state.scroll === 1 ? '' : 's'} up`
+      + (state.unread ? ` · ${state.unread} new below` : '') + ' — PgDn/End for live')
+    : P.dim('  ↑/↓ history · PgUp/PgDn scroll · Ctrl-C quit')
   buf.push(moveTo(H - 1, 1) + hint + CLR_EOL)
 
   // input line (H)
@@ -144,22 +158,47 @@ function draw() {
   cursor(true)
 }
 
+// ── scrolling ─────────────────────────────────────────────────────────────────
+const viewH = () => Math.max(1, rows() - 3)          // same viewport draw() uses
+const page = () => Math.max(1, rows() - 5)
+const totalLines = () => renderMsgLines(cols()).length
+function scrollBy(n) { scrollTo(state.scroll + n) }
+function scrollTo(n) {
+  state.scroll = clampScroll(n, totalLines(), viewH())
+  if (state.scroll === 0) state.unread = 0
+  render()
+}
+
 // ── input handling (raw mode) ─────────────────────────────────────────────────
+// RAW MODE means the terminal's line discipline is OFF: Ctrl-C is delivered as the byte 0x03,
+// NOT as SIGINT. So the ONLY thing that can honour Ctrl-C here is this handler — and it must do
+// so unconditionally, before anything that could throw or block. Hence the check sits first.
 function onKey(str) {
+  const act = keyAction(str)
+  if (act === 'quit-force') return forceExit(130) // Ctrl-C / Ctrl-D — always, even mid-connect
+  if (act) return doAction(act)
   for (const ch of str) {
     const code = ch.codePointAt(0)
-    if (ch === '\x03') return quit() // Ctrl-C
+    if (ch === '\x03' || ch === '\x04') return forceExit(130) // belt-and-braces (e.g. inside a paste)
     if (ch === '\r' || ch === '\n') { submit(); continue }
     if (ch === '\x7f' || ch === '\b') { state.input = state.input.slice(0, -1); render(); continue }
     if (ch === '\x15') { state.input = ''; render(); continue } // Ctrl-U clear line
-    if (str.startsWith('\x1b[')) { handleEscape(str); return } // arrow/pgup as a unit
-    if (code >= 0x20 && ch !== '\x1b') { state.input += ch; render() }
+    if (ch === '\x1b') return // a lone/unrecognised escape sequence: swallow, never print it
+    if (code >= 0x20) { state.input += ch; render() }
   }
 }
-function handleEscape(seq) {
-  if (seq === '\x1b[5~') { state.scroll += Math.max(1, rows() - 5); render() } // PgUp
-  else if (seq === '\x1b[6~') { state.scroll = Math.max(0, state.scroll - (rows() - 5)); render() } // PgDn
-  else if (seq === '\x1b[F' || seq === '\x1bOF') { state.scroll = 0; render() } // End -> live
+
+function doAction(act) {
+  switch (act) {
+    case 'hist-prev': state.input = state.hist.prev(state.input); render(); break
+    case 'hist-next': state.input = state.hist.next(state.input); render(); break
+    case 'page-up': scrollBy(page()); break
+    case 'page-down': scrollBy(-page()); break
+    case 'line-up': scrollBy(1); break
+    case 'line-down': scrollBy(-1); break
+    case 'scroll-top': scrollTo(totalLines()); break // clamped to the oldest line
+    case 'scroll-live': scrollTo(0); break
+  }
 }
 
 let inflight = Promise.resolve()
@@ -167,6 +206,7 @@ function submit() {
   const text = state.input
   state.input = ''
   if (!text.trim()) { render(); return }
+  state.hist.remember(text) // ↑/↓ recall — commands too (re-dialling a 26-char key by hand is the pain)
   if (text.startsWith('/')) return command(text.trim())
   const peers = state.peers()
   if (peers.length === 0) { add('sys', 'no peer connected yet — share your key or /connect <key>'); return }
@@ -179,7 +219,9 @@ function command(line) {
   const arg = rest.join(' ')
   switch (cmd) {
     case 'help': case '?':
-      add('sys', 'commands: /connect <key|S-invite|friend> · /friends · /key · /peers · /clear · /quit'); break
+      add('sys', 'commands: /connect <key|S-invite|friend> · /friends · /key · /peers · /clear · /quit')
+      add('sys', 'keys: ↑/↓ recall what you sent · PgUp/PgDn scroll · Home/End oldest/live · Shift+↑/↓ one line · Ctrl-C quit (always)')
+      break
     case 'key':
       add('sys', 'your key (share it): ' + state.id.S); break
     case 'peers': {
@@ -229,20 +271,55 @@ async function dial(key) {
 
 function setStatus(s, kind = 'warn') { state.status = s; state.statusKind = kind; render() }
 
-// ── lifecycle ─────────────────────────────────────────────────────────────────
-let quitting = false
-async function quit() {
-  if (quitting) return
-  quitting = true
-  try { await inflight } catch { /* drain sends */ }
-  try { state.node?.close?.() } catch { /* */ }
+// ── lifecycle: EXIT MUST ALWAYS WIN ───────────────────────────────────────────
+// The old quit() did `await inflight` behind a `quitting` re-entrancy guard. peer.send() resolves
+// only on its ACK (src/node.js), so a dead/hung peer NEVER settles it: the first Ctrl-C hung in
+// that await, and `if (quitting) return` then swallowed every retry — an unkillable process with a
+// wrecked terminal. Rules now: (1) nothing on the exit path awaits a network promise; (2) the
+// terminal is restored FIRST, so even a later throw leaves a usable shell; (3) exit is synchronous.
+
+/** Put the terminal back the way we found it. Safe to call twice, safe to call mid-crash. */
+function restoreTerminal() {
   try { process.stdin.setRawMode?.(false) } catch { /* */ }
-  cursor(true); alt(false)
-  process.stdout.write('\n')
-  process.exit(0)
+  try { process.stdin.pause() } catch { /* */ }
+  try { cursor(true) } catch { /* */ }
+  try { alt(false) } catch { /* */ }
+  try { process.stdout.write('\n') } catch { /* */ }
+}
+
+/** The last word, always. Synchronous, unconditional, never awaits anything. */
+let closed = false
+function forceExit(code = 130) {
+  restoreTerminal()
+  if (!closed) { closed = true; try { state.node?.close?.() } catch { /* */ } } // sync/best-effort in node.js
+  process.exit(code)
+}
+
+/** /quit — same teardown, but give in-flight sends a BOUNDED moment to land first. */
+async function quit() {
+  add('sys', 'closing…')
+  await drainBounded(inflight, 300) // never unbounded: a dead peer's send never settles
+  forceExit(0)
 }
 
 async function main() {
+  // Wire the escape hatches BEFORE anything that can hang (listen/dial can block on the network),
+  // and before raw mode swallows Ctrl-C. A signal must never be gated on app state.
+  process.on('SIGINT', () => forceExit(130))
+  process.on('SIGTERM', () => forceExit(143))
+  process.on('SIGHUP', () => forceExit(129))
+  // A crash in raw + alt-screen mode would otherwise hand the user a dead terminal.
+  process.on('uncaughtException', (e) => {
+    restoreTerminal()
+    console.error('p2p-tui crashed: ' + (e && e.message ? e.message : e))
+    process.exit(1)
+  })
+  process.on('unhandledRejection', (e) => {
+    restoreTerminal()
+    console.error('p2p-tui crashed: ' + (e && e.message ? e.message : e))
+    process.exit(1)
+  })
+
   const args = process.argv.slice(2)
   const ephemeral = args.includes('--ephemeral')
   const pi = args.indexOf('--profile')
@@ -274,15 +351,19 @@ async function main() {
   process.stdin.setRawMode?.(true)
   process.stdin.resume()
   process.stdin.setEncoding('utf8')
-  process.stdin.on('data', onKey)
+  process.stdin.on('data', (str) => {
+    // Ctrl-C is checked HERE, ahead of every other code path: even if onKey/render is broken or
+    // the app is mid-hang, this byte still gets the user their shell back.
+    if (str.includes('\x03')) return forceExit(130)
+    try { onKey(str) } catch { /* an input/render bug must never wedge the key loop */ }
+  })
   process.stdout.on('resize', render)
-  process.on('SIGINT', quit)
-  process.on('SIGTERM', quit)
 
   add('sys', 'welcome to p2p — share YOUR key so a friend can reach you:')
   add('sys', state.id.S)
   add('sys', ephemeral ? '(ephemeral identity — not saved)' : `(stable identity · profile "${profile}")`)
   add('sys', 'type a message to chat · /help for commands' + (dialKey ? '' : ' · /connect <key> to reach someone'))
+  add('sys', '↑/↓ recall what you sent · PgUp/PgDn scroll back · Ctrl-C always quits')
   setStatus('online (idle)', 'ok')
   if (dialKey) dial(dialKey)
   render()

@@ -18,7 +18,7 @@
 import readline from 'node:readline'
 import process from 'node:process'
 import { generateIdentity, decodeKey, verifyCommitment, TypoError } from '../src/key.js'
-import { loadOrCreateIdentity, isOwnKey, OWN_KEY_MSG } from './lib.js'
+import { loadOrCreateIdentity, isOwnKey, OWN_KEY_MSG, drainBounded } from './lib.js'
 
 // ── tiny ANSI (skipped when not a TTY) ───────────────────────────────────────
 const TTY = process.stdout.isTTY
@@ -184,10 +184,13 @@ function startRepl(node, getPeers, { isDialer = false } = {}) {
     rl.prompt()
   })
   let closing = false
+  // Ctrl-C must ALWAYS exit. peer.send() resolves only on its ACK (src/node.js), so a dead peer
+  // never settles it: the old unbounded `await inflight` hung here forever, and the `closing` guard
+  // then swallowed every further Ctrl-C. Now the drain is BOUNDED, and a second Ctrl-C forces out.
   const shutdown = async () => {
-    if (closing) return
+    if (closing) { try { rl.close() } catch {} ; process.exit(130) } // 2nd Ctrl-C — no waiting
     closing = true
-    await inflight.catch(() => {}) // confirm delivery (ACK) before tearing down
+    await drainBounded(inflight, 300) // confirm delivery (ACK) if it lands quickly; never hang on it
     console.log('\n' + dim('  closing…'))
     try {
       node.close()

@@ -53,6 +53,84 @@ export const OWN_KEY_MSG =
   "that's your OWN key — you can't chat with yourself. Run the other peer with a " +
   'different identity:  p2p --profile <name>   (or --ephemeral).'
 
+// ── teardown safety: never await a promise that may never settle ─────────────
+// peer.send() resolves ONLY on its ACK (src/node.js: pending Map appSeq -> {resolve,reject};
+// it rejects only on a PERMANENT send error). Send to a dead/hung peer and that promise NEVER
+// settles. Any shutdown path that does `await inflight` therefore hangs FOREVER — and with a
+// `closing`/`quitting` re-entrancy guard in front of it, every subsequent Ctrl-C is swallowed:
+// an unkillable process. Every teardown drain MUST be bounded by this.
+/** Await `p`, but never longer than `ms`. Resolves (never rejects) — a drain must not throw. */
+export function drainBounded(p, ms = 300) {
+  let t
+  // NB: the timer is deliberately NOT unref'd — an unref'd timer lets the event loop drain out
+  // from under a never-settling `p`, which is precisely the case this exists to survive.
+  // clearTimeout in the tail means it never holds the process open either.
+  return Promise.race([
+    Promise.resolve(p).catch(() => {}),
+    new Promise((r) => { t = setTimeout(r, ms) }),
+  ]).then(() => { clearTimeout(t) }, () => { clearTimeout(t) })
+}
+
+// ── TUI input helpers (pure — the TUI itself needs a real TTY, these do not) ──
+/**
+ * Map a raw stdin chunk (raw mode: no line discipline, so Ctrl-C arrives as the BYTE 0x03 and
+ * arrows as ESC sequences) to a TUI action. Returns null for ordinary printable text.
+ */
+export function keyAction(seq) {
+  switch (seq) {
+    case '\x03': return 'quit-force'                              // Ctrl-C  — always exits
+    case '\x04': return 'quit-force'                              // Ctrl-D  — always exits
+    case '\x1b[A': return 'hist-prev'                             // ↑  older sent line
+    case '\x1b[B': return 'hist-next'                             // ↓  newer sent line
+    case '\x1b[5~': return 'page-up'                              // PgUp    scroll back
+    case '\x1b[6~': return 'page-down'                            // PgDn    scroll forward
+    case '\x1b[1;2A': return 'line-up'                            // Shift+↑ scroll 1 line
+    case '\x1b[1;2B': return 'line-down'                          // Shift+↓ scroll 1 line
+    case '\x1b[H': case '\x1bOH': case '\x1b[1~': return 'scroll-top'   // Home
+    case '\x1b[F': case '\x1bOF': case '\x1b[4~': return 'scroll-live'  // End -> live
+    default: return null
+  }
+}
+
+/**
+ * Shell-style history ring for the input line: ↑ walks back through what YOU sent, ↓ walks
+ * forward and lands back on the half-typed draft you left behind. In memory only.
+ */
+export function createHistory(max = 500) {
+  const items = []
+  let idx = 0      // items.length == "on the live draft, not browsing"
+  let draft = ''
+  return {
+    items,
+    get size() { return items.length },
+    /** Record a submitted line (skips blanks + consecutive dupes) and return to the live draft. */
+    remember(text) {
+      if (!text || !text.trim()) return
+      if (items[items.length - 1] !== text) items.push(text)
+      if (items.length > max) items.shift()
+      idx = items.length
+      draft = ''
+    },
+    /** ↑ — returns the line to put in the input (stashing `current` as the draft on first step). */
+    prev(current = '') {
+      if (!items.length) return current
+      if (idx === items.length) draft = current
+      idx = Math.max(0, idx - 1)
+      return items[idx]
+    },
+    /** ↓ — returns the next-newer line, or the stashed draft once you walk off the end. */
+    next(current = '') {
+      if (idx >= items.length) return current
+      idx++
+      return idx === items.length ? draft : items[idx]
+    },
+  }
+}
+
+/** Clamp a scroll offset (lines ABOVE the live bottom; 0 = live) to what actually exists. */
+export const clampScroll = (scroll, totalLines, viewH) =>
+  Math.max(0, Math.min(Math.max(0, totalLines - Math.max(1, viewH)), scroll))
+
 // ── ANSI (no-op when stdout is not a TTY) ────────────────────────────────────
 export const TTY = process.stdout.isTTY
 export const c = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : String(s))
