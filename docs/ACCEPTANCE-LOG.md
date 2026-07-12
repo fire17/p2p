@@ -400,3 +400,12 @@ forwards inbound from EVERY leg and locks its outbound to whichever leg delivers
 peer's HELLO) — racing to first PEER CONTACT, not first socket. Deterministic guard:
 `test/browser-raced-transport.test.js` (5 cases). Regression: browser↔browser + browser↔TUI(relay) still
 green; **156/156 deterministic.**
+
+**Re-confirmed with DataChannel chunking live + as a PAIRED witness (2026-07-12):** after 16 KiB chunking
+landed in `webrtc.js` (8-byte `[msgId|index|total]` framing, both runtimes), the gate was re-run against a
+freshly restarted Node/werift peer on the same module. Browser log: `05A7BRK1… ✅ secure channel
+established — verified, no MITM`, RECV "hello from the TUI…", SENT "hello from the BROWSER…", ~9.7 s.
+browser-build's Node log cross-matches keys (their peer.key == my browser key and vice versa) — a real
+paired witness, not two self-reports. Chunking verified in both pairings (Node↔Node pre-flight +
+Chromium↔werift). Guard for the werift-Buffer vs browser-ArrayBuffer `dc.onmessage` normalization:
+`test/browser-webrtc-chunking.test.js`; **162/162 deterministic.**
