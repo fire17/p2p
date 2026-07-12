@@ -25,10 +25,22 @@ import * as noise from '../noise.js'
 
 const DB_NAME = 'p2p'
 const STORE = 'identity'
-const ID_KEY = 'default'
+const ID_KEY = 'default' // legacy record key for the default slot — kept so existing users don't lose their identity
 
 // ── identity storage (IndexedDB — NOT localStorage, which any XSS can read as plain text) ──
 // ponytail: raw IndexedDB, no wrapper lib. It's ~20 lines and this is the only thing we store.
+//
+// MULTIPLE IDENTITIES: one browser origin can hold MANY identities, one per SLOT. A slot is just a
+// short name; each slot is a SEPARATE IndexedDB record, so two normal tabs/windows that pick
+// different slots are genuinely different peers (the failing case was: one record → both tabs = one
+// peer → a message went to yourself). Which slot a tab uses is decided by the URL (#id=<name>) so it
+// is PER-TAB and survives reload; the records themselves persist named identities across sessions.
+// The default slot maps to the legacy 'default' key for backward compatibility.
+
+// A slot name → its IndexedDB record key. Default slot keeps the old flat key; named slots namespace.
+function slotKey(slot) {
+  return !slot || slot === 'default' ? ID_KEY : 'id:' + slot
+}
 
 function idb() {
   return new Promise((resolve, reject) => {
@@ -58,40 +70,100 @@ async function idbPut(k, v) {
   })
 }
 
-/**
- * This browser's identity — loaded from IndexedDB, or generated once and saved.
- * Same 26-char contact string as the TUI (`p2p key`): it IS the commitment to (edPub, xPub).
- * @param {{fresh?:boolean}} [opts] fresh: ignore any stored identity and mint a new one
- * @returns {Promise<{S:string, edPub:Buffer, edPriv:Buffer, xPub:Buffer, xPriv:Buffer}>}
- */
-export async function identity(opts = {}) {
-  if (!opts.fresh) {
-    const saved = await idbGet(ID_KEY).catch(() => null)
-    if (saved) {
-      const id = {
-        S: saved.S,
-        edPub: Buffer.from(saved.edPub, 'hex'),
-        edPriv: Buffer.from(saved.edPriv, 'hex'),
-        xPub: Buffer.from(saved.xPub, 'hex'),
-        xPriv: Buffer.from(saved.xPriv, 'hex'),
-      }
-      // Never trust storage blindly: the string must still be the commitment to these keys.
-      const dec = key.decodeKey(id.S)
-      if (!key.verifyCommitment(dec.commitment, id.edPub, id.xPub)) {
-        throw new Error('stored identity is corrupt (key does not match its commitment)')
-      }
-      return id
-    }
+async function idbEntries() {
+  const db = await idb()
+  return new Promise((resolve, reject) => {
+    const store = db.transaction(STORE, 'readonly').objectStore(STORE)
+    const kReq = store.getAllKeys()
+    const vReq = store.getAll()
+    const tx = kReq.transaction
+    tx.oncomplete = () => resolve(kReq.result.map((k, i) => [k, vReq.result[i]]))
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+// Turn a stored record into a live identity, verifying it still commits to its own keys.
+function hydrate(saved) {
+  const id = {
+    S: saved.S,
+    edPub: Buffer.from(saved.edPub, 'hex'),
+    edPriv: Buffer.from(saved.edPriv, 'hex'),
+    xPub: Buffer.from(saved.xPub, 'hex'),
+    xPriv: Buffer.from(saved.xPriv, 'hex'),
   }
-  const id = await makeIdentity()
-  await idbPut(ID_KEY, {
+  // Never trust storage blindly: the string must still be the commitment to these keys.
+  const dec = key.decodeKey(id.S)
+  if (!key.verifyCommitment(dec.commitment, id.edPub, id.xPub)) {
+    throw new Error('stored identity is corrupt (key does not match its commitment)')
+  }
+  return id
+}
+
+function serialize(id, slot, name) {
+  return {
     S: id.S,
     edPub: Buffer.from(id.edPub).toString('hex'),
     edPriv: Buffer.from(id.edPriv).toString('hex'),
     xPub: Buffer.from(id.xPub).toString('hex'),
     xPriv: Buffer.from(id.xPriv).toString('hex'),
-  })
-  return id
+    slot,
+    name: name || slot,
+  }
+}
+
+/**
+ * The identity for a SLOT — loaded from IndexedDB, or generated once and saved under that slot.
+ * Same 26-char contact string as the TUI (`p2p key`): it IS the commitment to (edPub, xPub).
+ *
+ * BRW-2 fix: two tabs opened first-run CONCURRENTLY on the same slot used to both see null, both
+ * mint DIFFERENT keypairs, and both write the same record → last-write-wins → the losing tab ran an
+ * unpersisted identity and lost reachability under the S it had already shared. We now serialize the
+ * create with `navigator.locks` (a per-slot lock) AND re-check storage inside the critical section,
+ * so the second tab adopts the first tab's persisted identity instead of clobbering it. The lock is a
+ * best-effort accelerant; the in-lock re-check is the actual correctness guarantee (works even where
+ * the Web Locks API is unavailable).
+ *
+ * @param {{slot?:string, name?:string, fresh?:boolean}} [opts]
+ *   slot: which identity this tab uses (default 'default'); fresh: mint a new keypair for this slot
+ * @returns {Promise<{S:string, edPub:Buffer, edPriv:Buffer, xPub:Buffer, xPriv:Buffer}>}
+ */
+export async function identity(opts = {}) {
+  const slot = opts.slot || 'default'
+  const k = slotKey(slot)
+  if (!opts.fresh) {
+    const saved = await idbGet(k).catch(() => null)
+    if (saved) return hydrate(saved)
+  }
+  const create = async () => {
+    if (!opts.fresh) {
+      // Re-check inside the critical section: a concurrent tab may have just minted this slot.
+      const again = await idbGet(k).catch(() => null)
+      if (again) return hydrate(again)
+    }
+    const id = await makeIdentity()
+    await idbPut(k, serialize(id, slot, opts.name))
+    return id
+  }
+  if (globalThis.navigator?.locks?.request) {
+    return navigator.locks.request('p2p-identity-' + slot, create)
+  }
+  return create()
+}
+
+/**
+ * Every identity this browser holds, for the UI's switcher. ponytail: read straight from the store.
+ * @returns {Promise<Array<{slot:string, name:string, S:string}>>}
+ */
+export async function listIdentities() {
+  const entries = await idbEntries().catch(() => [])
+  return entries
+    .filter(([, v]) => v && v.S)
+    .map(([recKey, v]) => ({
+      slot: v.slot || (recKey === ID_KEY ? 'default' : String(recKey).replace(/^id:/, '')),
+      name: v.name || v.slot || 'default',
+      S: v.S,
+    }))
+    .sort((a, b) => (a.slot === 'default' ? -1 : b.slot === 'default' ? 1 : a.name.localeCompare(b.name)))
 }
 
 /**
@@ -148,4 +220,4 @@ export async function listen(id, opts = {}) {
 }
 
 export { key, noise, createGroup, createSecureGroup }
-export default { identity, listen }
+export default { identity, listIdentities, listen }
