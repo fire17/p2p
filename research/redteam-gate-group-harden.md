@@ -122,3 +122,19 @@ chain from an older build won't validate — fold it into the same v0.3.0 protoc
 
 GRP cluster gated. Four fixes CONFIRMED-SHIP; one GAP (GRP-5 test is a false guard — strengthen it) and
 two blessed escalations with an honest residual on GRP-1. This lane stays resident for any further landings.
+
+## UPDATE 2026-07-12 — GRP-5 GAP CLOSED (commit 6f401cf, re-verified independently)
+
+grp-harden rewrote the GRP-5 guard to a real one (test-only; src untouched). New mechanics: capture A's
+GENUINELY-signed create off the wire → splice a confederate into `init` WITHOUT re-signing → deliver to
+a FRESH receiver (no prior copy ⇒ no opHash-dedup can mask the tamper) → assert `op-signature` divergence
+AND the confederate is absent from the fold.
+
+Re-verified myself in an isolated worktree @6f401cf:
+- **GREEN@HEAD** (init in opBytes): `✔ group GRP-5 … (init is signed)`; group-secure suite 11/11.
+- **RED** (opBytes reverted to drop the `init` term — the surgical pre-fix state): `✖ … AssertionError:
+  the tampered roster must fail the op signature (init is signed)` — under pre-fix opBytes A's genuine
+  signature still verifies over the spliced init and the confederate folds in.
+
+The test now genuinely REDs without the fix and GREENs with it — it uses A's REAL signature (not the old
+`sig:'AAAA'` shortcut), so it distinguishes old vs new opBytes. **CAG check-6 for GRP-5 is now met.**
