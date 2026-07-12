@@ -29,8 +29,9 @@
     if (key) {
       return {
         unix: 'curl -fsSL https://p2p.akeyo.io/init | sh -s -- ' + key,
-        // PowerShell can't pass args through `| iex`; install first, then run the CLI.
-        win: 'irm https://p2p.akeyo.io/init.ps1 | iex\np2p ' + key,
+        // `irm | iex` cannot pass args in PowerShell; the scriptblock form can, and init.ps1
+        // takes the key as a param (see its own usage header). Works in PS 5.1+ / pwsh 7.
+        win: '& ([scriptblock]::Create((irm https://p2p.akeyo.io/init.ps1))) ' + key,
         already: 'p2p ' + key
       }
     }
