@@ -217,7 +217,11 @@ function foldMembership(ops) {
  */
 export function createSecureGroup(node, identity, { secret, members: initial = [], create = false } = {}) {
   if (!secret) throw new TypeError('group secret G required')
-  const G = Buffer.isBuffer(secret) ? secret : Buffer.from(String(secret), 'base64')
+  // Accept a raw 32-byte secret (Buffer or Uint8Array) or its base64 string. Deliberately NOT
+  // `Buffer.isBuffer(secret)`: under the browser shim a Buffer can come from a different module
+  // instance of the shim class, and isBuffer() is instanceof-based — it would say "false" for a
+  // perfectly good buffer and we would silently base64-decode garbage.
+  const G = typeof secret === 'string' ? Buffer.from(secret, 'base64') : Buffer.from(secret)
   const groupId = groupIdFor(G)
   const gidHex = groupId.toString('hex')
   const me = String(identity.S).toUpperCase()
