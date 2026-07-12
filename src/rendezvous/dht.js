@@ -257,7 +257,7 @@ export function createDht(opts = {}) {
   function announceBep44(rid, info) {
     const candidates = (info && info.candidates) || (info && info.port ? [{ proto: 'udp4', port: info.port, kind: 'host' }] : []);
     const blob = { v: 1, ts: now(), candidates };
-    const v = inv.codec.seal(blob, rid);                  // fixed-length ciphertext (288 B « BEP44's 1000 B cap)
+    const v = inv.codec.seal(blob, rid);                  // fixed-length ciphertext (544 B « BEP44's 1000 B cap)
     const seq = Math.floor(now() / 1000);                 // monotonic per BEP44
     const sig = inv.bep44Sign(rid, seq, v);
     const target = inv.bep44Target(rid);

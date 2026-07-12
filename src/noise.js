@@ -348,6 +348,9 @@ class HandshakeState {
         this.e = genEphemeral(this._ephemeral)
         out.push(this.e.pub)
         this._mixHash(this.e.pub)
+        // Noise §9.2: in a PSK handshake every MixHash(e.public_key) is followed by MixKey(e.public_key)
+        // (so an ephemeral seeds the chaining key before any psk mixing). PSK-only ⇒ plain IK unchanged.
+        if (this.psk) this._mixKey(this.e.pub)
       } else if (token === 's') {
         out.push(this._encryptAndHash(this.s.pub))
       } else if (token === 'psk') {
@@ -380,6 +383,7 @@ class HandshakeState {
       if (token === 'e') {
         this.re = Buffer.from(take(DHLEN))
         this._mixHash(this.re)
+        if (this.psk) this._mixKey(this.re) // Noise §9.2 (PSK mode) — mirror of the write path
       } else if (token === 's') {
         const n = this.cs.hasKey ? DHLEN + TAGLEN : DHLEN
         this.rs = this._decryptAndHash(Buffer.from(take(n)))

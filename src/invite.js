@@ -32,7 +32,7 @@
 // idea (subkey per random salt), built from HKDF instead of a core we don't have.
 //
 // ── Fingerprint fixes shipped here (§6) ──────────────────────────────────────────────────────
-//   • plaintext is PADDED to a fixed 256 bytes before sealing → sealed blob is always 288 bytes,
+//   • plaintext is PADDED to a fixed 512 bytes before sealing → sealed blob is always 544 bytes,
 //     so candidate count / IPv6 presence / LAN hints never leak from ciphertext length.
 //   • the literal `a=p2p-blob:` SDP attribute name is gone (see src/rendezvous/tracker.js:
 //     the attribute name is now derived pseudorandomly from the rid — no constant tell on the wire).

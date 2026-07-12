@@ -7,8 +7,14 @@ import {
   createInvite, generateInviteSecret, encodeInvite, decodeInvite, formatShare, parseShare,
   deriveInviteRid, sealBlob, openBlob, bep44SignInput, INVITE_FLAG, hasInvite, SEALED_LEN, TypoError,
 } from '../src/invite.js'
-import { generateIdentity, encodeKey, decodeKey } from '../src/key.js'
+import { generateIdentity, encodeKey, decodeKey, verifyCommitment } from '../src/key.js'
 import { initiator, responder, HandshakeError } from '../src/noise.js'
+import { createPublicKey, createPrivateKey } from 'node:crypto'
+
+const X_PKCS8 = Buffer.from('302e020100300506032b656e04220420', 'hex')
+const xPubFromPriv = (raw) => Buffer.from(
+  createPublicKey(createPrivateKey({ key: Buffer.concat([X_PKCS8, raw]), format: 'der', type: 'pkcs8' }))
+    .export({ type: 'spki', format: 'der' }).subarray(-32))
 
 // ── KAT vectors ───────────────────────────────────────────────────────────────
 // Frozen against the implementation on 2026-07-12. They pin the four domain-separated derivations
@@ -252,4 +258,75 @@ test('psk must be 32 bytes (fail-closed on a malformed psk)', () => {
   const id = generateIdentity()
   assert.throws(() => responder({ localX: { pub: id.xPub, priv: id.xPriv }, psk: Buffer.alloc(16) }), HandshakeError)
   assert.throws(() => responder({ localX: { pub: id.xPub, priv: id.xPriv }, psk: 'not-a-buffer' }), HandshakeError)
+})
+
+// ── frozen IKpsk2 transcript KAT (Noise §9.2 conformance canary) ────────────────
+// Fixed statics + ephemerals + psk ⇒ a deterministic wire transcript. This pins the §9.2 rule that
+// every MixHash(e) is followed by MixKey(e) in PSK mode: drop either MixKey(e) call and these bytes
+// change and the test fails. The plain-IK KAT (test/vectors, cross-checked byte-exact vs snow AND
+// cacophony in noise.test.js) is untouched by this change.
+// D-INT-1 gap (documented, honest): these bytes are SELF-CONSISTENT, not cross-checked against an
+// external IKpsk2 implementation — no offline snow/cacophony IKpsk2 vector was obtainable in-tree.
+// The §9.2 arithmetic is verified by construction here; an external cross-check stays an open gap.
+const PSK_KAT = {
+  iStatic: Buffer.alloc(32, 0x11), rStatic: Buffer.alloc(32, 0x22),
+  iEph: Buffer.alloc(32, 0x33), rEph: Buffer.alloc(32, 0x44), psk: Buffer.alloc(32, 0x55),
+  prologue: Buffer.from('p2p-inv-kat-v1', 'ascii'),
+  msg1: '7b0d47d93427f8311160781c7c733fd89f88970aef490d8aa0ee19a4cb8a1b144b3944efabe6dbf0bbf813c9a6b1fd373da6585a9d41e0f4d219fb69bd0be935e96c0d71be1e166376ade348312ea05df38805151ca7280a8d862f485ce8132a85f615645466e429',
+  msg2: 'ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b23ffba215f19ad24752396197126548b8650024c78a6daf4',
+  handshakeHash: 'bcc49c7f9decc382bceae8abbaada37d1085dea47ec5a834b46c3d362a969bd4',
+  t1: 'ea3ece904ffd6892104b66770a1a400d8368bfbd6cca',
+  t2: 'c38763ce75f434021493bd57a2e613991df8df0b63bf',
+}
+
+test('KAT: IKpsk2 transcript is byte-frozen (locks in the §9.2 MixKey(e) fix)', () => {
+  const k = PSK_KAT
+  const rStaticPub = xPubFromPriv(k.rStatic)
+  const hi = initiator({ localX: { priv: k.iStatic, pub: xPubFromPriv(k.iStatic) }, remoteXPub: rStaticPub, prologue: k.prologue, psk: k.psk, _ephemeral: k.iEph })
+  const hr = responder({ localX: { priv: k.rStatic, pub: rStaticPub }, prologue: k.prologue, psk: k.psk, _ephemeral: k.rEph })
+
+  const msg1 = hi.writeMessage(Buffer.from('psk-msg1'))
+  assert.equal(msg1.toString('hex'), k.msg1)
+  assert.equal(hr.readMessage(msg1).toString(), 'psk-msg1')
+  const msg2 = hr.writeMessage(Buffer.from('psk-msg2'))
+  assert.equal(msg2.toString('hex'), k.msg2)
+  assert.equal(hi.readMessage(msg2).toString(), 'psk-msg2')
+
+  const si = hi.split(), sr = hr.split()
+  assert.equal(si.handshakeHash.toString('hex'), k.handshakeHash)
+  assert.ok(si.handshakeHash.equals(sr.handshakeHash))
+  assert.equal(si.tx.encrypt(Buffer.from('t-init')).toString('hex'), k.t1)
+  assert.equal(sr.tx.encrypt(Buffer.from('t-resp')).toString('hex'), k.t2)
+})
+
+// ── composed full-MITM (threat table row 7): commitment gate + IKpsk2 together ──────────────────
+
+test('row 7 full MITM: a substituted static is caught by the gate AND by IKpsk2 (no K_inv, no priv key)', () => {
+  // Alice mints an invite; her S commits to (edPub,xPub). Mallory sits in the middle with her OWN
+  // static keypair and no K_inv. Two independent defenses must each reject her, composed:
+  const alice = generateIdentity()
+  const inv = createInvite(K)
+  const dec = decodeKey(encodeKey(alice.edPub, alice.xPub, INVITE_FLAG))
+  const mallory = generateIdentity()
+
+  // (1) COMMITMENT GATE: Mallory sends her own pubkeys in HELLO; the gate binds them to Alice's S.
+  assert.equal(verifyCommitment(dec.commitment, mallory.edPub, mallory.xPub), false, 'gate rejects a substituted static')
+  assert.equal(verifyCommitment(dec.commitment, alice.edPub, alice.xPub), true, 'the real owner passes the gate')
+
+  // (2) IKpsk2: even if Mallory bypassed the (cheap, non-auth) gate, she lacks K_inv. Bob (the
+  // invitee) runs the responder with the real psk; Mallory initiates against Bob with her own static
+  // AND no/garbage psk. The handshake fails closed — she cannot derive Bob's ck/h.
+  const bob = generateIdentity() // the invitee (initiator side in this direction)
+  const responderHs = responder({ localX: { pub: bob.xPub, priv: bob.xPriv }, psk: inv.psk })
+  const malloryHs = initiator({ localX: { pub: mallory.xPub, priv: mallory.xPriv }, remoteXPub: bob.xPub, psk: createInvite(generateInviteSecret()).psk })
+  responderHs.readMessage(malloryHs.writeMessage())               // msg1 carries no psk token yet
+  const msg2 = responderHs.writeMessage()                          // psk mixed at end of msg2
+  assert.throws(() => malloryHs.readMessage(msg2), HandshakeError, 'IKpsk2 fails without the real K_inv')
+
+  // and the legitimate invitee (real psk, gate passes) completes end to end
+  const okRes = responder({ localX: { pub: bob.xPub, priv: bob.xPriv }, psk: inv.psk })
+  const okIni = initiator({ localX: { pub: mallory.xPub, priv: mallory.xPriv }, remoteXPub: bob.xPub, psk: inv.psk })
+  okRes.readMessage(okIni.writeMessage())
+  okIni.readMessage(okRes.writeMessage())
+  assert.ok(okIni.split().handshakeHash.equals(okRes.split().handshakeHash))
 })
