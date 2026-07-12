@@ -1,5 +1,14 @@
 # Browser-Only Client — Decision-Grade Design Study
 
+> **BUILD STATUS (2026-07-12): P1 built and VERIFIED IN A REAL BROWSER.** The design below is no
+> longer only sourced — the browser↔browser client exists (`src/browser/`), runs the TUI's own
+> protocol source unchanged via shims + vendored crypto, and was observed connecting two real
+> Chromium contexts over the live public WSS trackers with a verified Noise IK handshake in ~3.5 s,
+> plus a 3-peer group. Interop assurance is CI-gated: the real `src/noise.js` on the browser stack
+> reproduces both official Noise KAT vectors byte-exact (`test/browser-noise-parity.test.js`), and
+> the security claim is adversarially tested (`test/browser-mitm.test.js`). What is NOT yet done:
+> browser↔TUI (P2 — the `werift`-vs-WSS-relay decision below), and a two-real-networks run. See §10.
+
 **Project:** `p2p` — tiny, embeddable, zero-dependency P2P chat/data framework.
 **Problem this file solves:** ship a client that runs **entirely in a browser tab, with no backend
 of ours**, that is **interoperable** with the existing TUI/CLI (same 26-char key, same Noise IK

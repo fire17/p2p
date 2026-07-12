@@ -298,3 +298,53 @@ mechanism-proven internet rungs (DHT 5/5 + tracker 3/3, both same-machine separa
 through 6 independent terminal reviews + real-path repros that caught two real regressions (a unit-mocked
 durability gap, a one-direction reconnect gap) that `node --test` green alone never would have. v1 is
 is-done for every observable surface; XNET awaits the owner's second network.
+
+### 🏁 ZENITH MISSION CLOSED — state=`done` (2026-07-12)
+
+The zenith harness reached clean closure on the 8th terminal review (`mission-001` → `done`). Final
+blocker (README Install block advertising p2p.akeyo.io before it shipped) resolved when the owner shipped
+tasks #16/#17/#18; I independently re-verified: `https://p2p.akeyo.io/init` → **http=200, ssl_verify=0**
+(valid cert), body `#!/bin/sh # p2p installer`, and `https://p2p.akeyo.io/` serves the live SPA. The
+earlier SSL(60) was the Pages cert still provisioning. README is now accurate — docs match reality.
+
+**CLOSED AT: 28/29 VAL-* PASS · 0 FAIL · 1 owner-gated GAP (VAL-ACCEPT-XNET).** All 6 acceptance items
+observed-PASS; owner's full tree-wide suite 106/106. Informational note carried forward: several modules
+exceed DESIGN §4's ±30% per-module soft guardrail (total 3126 LOC still within the 2.5–3.5k envelope, AC6
+honesty holds) — owner will relax the §4 wording in a polish pass.
+
+**Sole remaining real work: VAL-ACCEPT-XNET** — a chat between two processes on two DISTINCT networks.
+Unobservable single-host; both internet rungs (DHT 5/5, tracker 3/3) are mechanism-proven same-machine.
+Needs the owner's second network (hotspot/VPS). Everything else: is-done, observed.
+
+### 🌐 BROWSER CLIENT P1 — browser↔browser, VERIFIED IN A REAL BROWSER (2026-07-12)
+
+Design study: `research/browser-client.md`. Build: `src/browser/` (client + shims + vendored crypto +
+WebRTC transport) — the TUI's core `src/` is untouched. The browser runs the SAME protocol source as
+the TUI (`key.js`/`noise.js`/`wire.js`/`node.js`/`group.js`) via a `node:crypto` import-map shim + a
+Buffer shim, so interop is structural (same source ⇒ same bytes), not a re-implementation.
+
+**Observed (not claimed):**
+- **BC-G1 — crypto/protocol parity (CI-gated):** the real `src/noise.js` on the browser stack (shim
+  crypto + vendored noble) reproduces BOTH official Noise KAT vectors (cacophony + snow) BYTE-EXACT,
+  and browser+TUI `deriveRid` agree — `test/browser-noise-parity.test.js`. Every primitive is byte-equal
+  to `node:crypto` — `test/browser-shim.test.js` (12 cases).
+- **BC-G2+G3 — real browser E2E:** two Chromium contexts (distinct origins) found each other over the
+  LIVE public WSS trackers and completed a verified Noise IK handshake over a real WebRTC DataChannel,
+  chatting both directions in **~3.5 s**; a bogus key is rejected locally by the checksum —
+  `test/browser-e2e.mjs` (Playwright, loaded from the npx cache so package.json stays zero-dep).
+- **BC-GROUP — groups >2 in real browsers:** 3 Chromium peers, `group.send()` pairwise fan-out, all
+  ACKed + received E2E — `test/browser-group.mjs`.
+- **BC-SEC — MITM resistance, adversarially:** the commitment gate rejects an attacker's substituted
+  keys (2¹¹⁰), Noise IK fails CLOSED against an impostor responder, the honest path still completes —
+  `test/browser-mitm.test.js`. Security on the wire is **= TUI**, by running the identical handshake.
+- **Regression:** the existing deterministic suite stays green — **104/104 `test/*.test.js`**, +26 new.
+
+**Two real CSP bugs were caught by actually running it in a browser** (import map is an inline script →
+now allowed by hash not `unsafe-inline`; `frame-ancestors` is invalid in `<meta>` → dropped) — the exact
+kind of gap `node --test` green never shows.
+
+**Remaining (honest):** browser↔TUI (P2) is DESIGNED not built — it needs the owner's interop decision
+(optional `werift` dep for direct P2P vs the zero-dep WSS-relay in `src/transport-wss.js`); and a
+two-real-networks browser↔browser run (same XNET gate the TUI has). Sender-keys groups are the P3 scale
+upgrade (pairwise fan-out is correct for small groups). Code-delivery trust (§8.4) documented, not
+eliminated.
