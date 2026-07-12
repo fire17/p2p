@@ -130,6 +130,39 @@ test('group: a member unreachable directly is still served, blind-relayed throug
   t.close()
 })
 
+test('group: join ORDER does not matter — a member that joins before it knows the membership still works', async () => {
+  // The footgun this closes (found by browser-research in a real-browser 3-party run): a member that
+  // join()s before the admin's membership chain has reached it sees an EMPTY member list, hands its
+  // sender key to nobody, and its messages then decrypt for no one — silently. ingestOp() now
+  // re-syncs sender keys whenever the chain reveals members we didn't know about.
+  const bd = board()
+  const A = await identity(), B = await identity(), C = await identity()
+  const nA = await listen(A, { endpoint: bd.endpoint(A.S), deps: rv })
+  const nB = await listen(B, { endpoint: bd.endpoint(B.S), deps: rv })
+  const nC = await listen(C, { endpoint: bd.endpoint(C.S), deps: rv })
+  const G = randomBytes(32)
+  const gA = createSecureGroup(nA, A, { secret: G, members: [B.S, C.S], create: true })
+  const gB = createSecureGroup(nB, B, { secret: G })
+  const gC = createSecureGroup(nC, C, { secret: G })
+  const got = { A: [], C: [] }
+  gA.on('message', (from, d) => got.A.push({ from, text: d.toString() }))
+  gC.on('message', (from, d) => got.C.push({ from, text: d.toString() }))
+
+  // THE WRONG ORDER on purpose: B joins first, while it still knows nothing about the group.
+  await gB.join()
+  assert.deepEqual(gB.members(), [], 'B genuinely has no membership yet — this is the hostile case')
+  await wait(60)
+
+  await gA.join(); await wait(120)                 // admin propagates the chain → B must re-sync
+  await gC.join(); await wait(120)
+
+  await gB.send('B spoke despite joining first'); await wait(200)
+  assert.equal(got.A.at(-1)?.text, 'B spoke despite joining first', 'the admin can read B')
+  assert.equal(got.A.at(-1)?.from, B.S)
+  assert.equal(got.C.at(-1)?.text, 'B spoke despite joining first', 'and so can the third member')
+  nA.close(); nB.close(); nC.close()
+})
+
 test('group: removal is cryptographic — after rotation the removed member decrypts nothing', async () => {
   const t = await threeParty()
   await t.gA.remove(t.C.S); await wait(200)

@@ -235,6 +235,8 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   const seenMsgs = new Set()
   const pending = []                // messages whose parents we haven't seen yet
   const handlers = { message: [], membership: [], divergence: [] }
+  const keyedTo = new Set()         // members who already hold my sender key (join-order independence)
+  let joined = false
 
   const emit = (ev, ...a) => { for (const fn of handlers[ev] || []) { try { fn(...a) } catch { /* handler threw */ } } }
   const membership = () => foldMembership(ops)
@@ -270,7 +272,21 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     for (const p of o.parents || []) opHeads.delete(p)
     opHeads.add(h)
     emit('membership', [...membership().members])
+    // Learning the chain can REVEAL members we didn't know existed when we joined. Without this,
+    // join-order matters: a member that join()s before the admin's chain reaches it distributes its
+    // sender key to nobody, and its messages then decrypt for no one — a silent, order-dependent
+    // dead end. Re-sync instead: anyone newly visible who lacks my sender key gets it now.
+    if (joined) syncKeys()
     return true
+  }
+
+  /** Give my sender key to every member who doesn't have it yet. Idempotent; safe to call often. */
+  function syncKeys() {
+    const todo = others().filter((S) => !keyedTo.has(S))
+    return Promise.allSettled(todo.map(async (S) => {
+      keyedTo.add(S)                                   // mark first: keeps concurrent calls idempotent
+      try { await keydistTo(S) } catch (error) { keyedTo.delete(S); throw error }  // retry on a later sync
+    }))
   }
 
   if (create) {
@@ -304,8 +320,10 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   async function rotate() {
     sendChain.ck = randomBytes(32)
     sendChain.seq = 0
+    keyedTo.clear()                  // the OLD key is void: every survivor must receive the new one
     authorOp('rotate')
-    return Promise.allSettled(others().map((S) => keydistTo(S)))
+    joined = true
+    return syncKeys()
   }
 
   function onEnvelope(peer, buf) {
@@ -392,10 +410,15 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     heads() { return [...heads] },
     on(ev, fn) { (handlers[ev] ||= []).push(fn); return this },
 
-    /** Hand my sender key to every member (do this once, after the links exist). */
+    /**
+     * Hand my sender key to every member. Call it once; ORDER DOES NOT MATTER — if the membership
+     * chain reaches us later (e.g. we joined before the admin propagated it), ingestOp re-syncs and
+     * the members we only learn about afterwards still get our key.
+     */
     async join() {
       if (!sendChain.ck) sendChain.ck = randomBytes(32)
-      return Promise.allSettled(others().map((S) => keydistTo(S)))
+      joined = true
+      return syncKeys()
     },
 
     /** Admin: add a member — signs an op, tells everyone, and gives the newcomer my sender key. */
@@ -403,7 +426,8 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
       const key = String(S).toUpperCase()
       const o = authorOp('add', key)
       await Promise.allSettled(others().map((m) => toMember(m, encodeEnv(T.OP, groupId, o))))
-      return keydistTo(key)
+      joined = true
+      return syncKeys()               // the newcomer is now visible ⇒ gets my sender key
     },
 
     /**
