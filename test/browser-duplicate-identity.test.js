@@ -16,6 +16,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { listen } from '../src/node.js'
 import { claimIdentity } from '../src/browser/p2p.js'
 import { createEndpoint as wssEndpoint, createWssRendezvous } from '../src/transport-wss.js'
@@ -117,4 +118,90 @@ test('UNGUARDED duplicate identity: BOTH tabs "connect", only ONE ever receives 
 
   tab1.node.close(); tab2.node.close(); fresh.node.close(); relay.close()
   clearInterval(hold)
+})
+
+// ── the guarded path: the zombie must be STRUCTURALLY IMPOSSIBLE ─────────────────────────────────
+
+test('GUARDED: a second tab auto-adopts a fresh identity — two REAL peers, and NO connected-but-silent tab', async () => {
+  const hold = setInterval(() => {}, 50)
+  const relay = mockRelay()
+  const RELAYS = ['ws://mock-relay']
+  const rv = createWssRendezvous({ relays: RELAYS })
+  const locks = fakeLocks()                            // ONE LockManager = one browser, many tabs
+  const deps = () => ({
+    generateIdentity: key.generateIdentity, decodeKey: key.decodeKey,
+    verifyCommitment: key.verifyCommitment, encodeKey: key.encodeKey,
+    initiator: noise.initiator, responder: noise.responder,
+    resolve: (S) => rv.resolve(String(S)), publishAll: () => ({ stop() {} }),
+  })
+
+  /**
+   * A tab going online exactly as app.js now does: claim the identity; if it is already live in
+   * another tab, adopt a FRESH one (app.js does this by minting the next free slot) and claim that.
+   * A tab therefore either owns its identity or has a different one — it never runs as a duplicate.
+   */
+  const goOnline = async (want) => {
+    let id = want
+    let lease = await claimIdentity(id.S, locks)
+    if (!lease.held) {                                 // already open in another tab -> become a new peer
+      id = await key.generateIdentity()                // (app.js: nextFreeSlot() -> identity({slot}))
+      lease = await claimIdentity(id.S, locks)
+      assert.equal(lease.held, true, 'the freshly adopted identity must be claimable')
+    }
+    const ep = wssEndpoint({ S: id.S, relays: RELAYS, WebSocket: relay.WebSocket })
+    const node = await listen(id, { endpoint: ep, deps: { ...deps(), createEndpoint: async () => ep } })
+    const got = []
+    node.on('message', (_p, m) => got.push(m.toString()))
+    return { id, node, got, lease }
+  }
+
+  const dflt = await key.generateIdentity()            // the default slot's record
+  const tab1 = await goOnline(dflt)
+  const tab2 = await goOnline(dflt)                    // a second plain tab asking for the SAME identity
+  assert.notEqual(tab2.id.S, tab1.id.S, 'the second tab must NOT come online as the same peer')
+
+  const fresh = await goOnline(await key.generateIdentity())
+
+  // Both tabs are now real, dialable peers — which is what the user wanted from two tabs.
+  const p1 = await fresh.node.connect(tab1.id.S)
+  await delay(100)
+  await p1.send('for tab1')
+  const p2 = await fresh.node.connect(tab2.id.S)
+  await delay(100)
+  await p2.send('for tab2')
+  await delay(300)
+
+  assert.deepEqual(tab1.got, ['for tab1'], 'tab1 receives its own message')
+  assert.deepEqual(tab2.got, ['for tab2'], 'tab2 receives its own message')
+
+  // THE INVARIANT: no tab may report a live peer while receiving nothing. That is the zombie, and
+  // after the fix it cannot exist — a tab either owns its identity, or it is a different peer.
+  const zombies = [tab1, tab2].filter((t) => t.node.peers().some((p) => p.connected) && t.got.length === 0)
+  assert.deepEqual(zombies, [], 'a CONNECTED-but-silent tab must be structurally impossible')
+
+  tab1.node.close(); tab2.node.close(); fresh.node.close(); relay.close()
+  clearInterval(hold)
+})
+
+// ── app.js cannot run under node --test (it needs the DOM), so tripwire its wiring in the source ──
+
+test('TRIPWIRE: app.js still wires the auto-adopt path (it cannot be exercised headlessly)', async () => {
+  const src = await readFile(new URL('../src/browser/app.js', import.meta.url), 'utf8')
+  // Anchor every pattern on the CALL SITE, never on a name that a function DECLARATION also contains
+  // — `/readAdopted\(\)/` matches `function readAdopted()` and would pass with the wiring ripped out
+  // (caught by mutating app.js and watching this test still go green).
+  const must = [
+    [/err\.reason !== 'identity-live' \|\| slotWasAskedFor/, 'auto-adopts ONLY on identity-live, and only for a slot the user did not name'],
+    [/const next = await nextFreeSlot\(\)/, 'adopts the next free slot (the same picker ＋New identity uses)'],
+    [/location\.hash = 'id=' \+ next/, 'persists the adopted slot in the URL so a reload is stable'],
+    [/sessionStorage\.setItem\(ADOPTED/, 'carries the reason across the reload'],
+    [/const adopted = readAdopted\(\)/, 'says WHY the key changed once it is back online'],
+    [/location\.reload\(\)/, 'actually restarts the tab on the adopted slot'],
+  ]
+  for (const [re, why] of must) assert.match(src, re, `app.js must still: ${why}`)
+  // And the guard it depends on must still be exported from the module app.js imports.
+  const p2p = await readFile(new URL('../src/browser/p2p.js', import.meta.url), 'utf8')
+  assert.match(p2p, /export function claimIdentity/, 'p2p.js must still export claimIdentity')
+  assert.match(p2p, /reason: 'identity-live'/, 'p2p.js must still tag the error app.js keys off')
+  assert.match(p2p, /lease\.release\(\)/, 'node.close() must release the identity for the next tab')
 })

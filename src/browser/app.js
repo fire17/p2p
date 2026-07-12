@@ -14,6 +14,19 @@ let myKey = null // this tab's own 26-char key — used to refuse dialing yourse
 // A slot name from the URL is user-controllable, so clamp it to a safe, short shape.
 const sanitizeSlot = (s) => (s || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'default'
 
+// Why this tab's identity changed under it, carried across the auto-adopt reload. sessionStorage is
+// per-TAB and survives a reload — the exact lifetime this note needs. Read ONCE, then cleared, so it
+// never re-appears on a later manual reload of the same tab.
+const ADOPTED = 'p2p-adopted-slot'
+function readAdopted() {
+  try {
+    const raw = sessionStorage.getItem(ADOPTED)
+    if (!raw) return null
+    sessionStorage.removeItem(ADOPTED)
+    return JSON.parse(raw)
+  } catch { return null }                       // private mode / bad JSON — the banner is not load-bearing
+}
+
 // The identity switcher — list every identity this browser holds; switching reloads THIS tab onto it.
 async function refreshIdSwitcher(activeSlot) {
   const sel = $('idswitch')
@@ -206,7 +219,11 @@ async function main() {
       // say what's wrong instead of moving them somewhere they didn't ask to be.
       if (err.reason !== 'identity-live' || slotWasAskedFor) throw err
       const next = await nextFreeSlot()
-      status('this identity is already open — starting a second identity…')
+      // The reload wipes the log, so the reason has to survive it — sessionStorage is per-TAB and
+      // survives a reload, which is exactly the scope we want. Boot reads it back and says it once.
+      // Without this the user's key would silently change and they would never learn why.
+      try { sessionStorage.setItem(ADOPTED, JSON.stringify({ from: slot, to: next })) } catch { /* private mode */ }
+      status('that identity is already open in another tab — starting a new one…')
       location.hash = 'id=' + next + (frag ? '&' + frag : '')   // keep any deep link across the reload
       location.reload()
       return
@@ -223,6 +240,17 @@ async function main() {
     node.on('divergence', (_peer, info) => say(`handshake failed (${info.reason}) — refusing to continue`, 'sys err'))
 
     status('online — reachable via public infrastructure', true)
+    // We were moved off a slot that was already live in another tab. Say so plainly: the user is
+    // looking at a key they did not expect, and they deserve to know why it changed.
+    const adopted = readAdopted()
+    if (adopted) {
+      say(
+        `Your “${adopted.from}” identity is already open in another tab, and one identity can only be `
+        + `online in one place — so THIS tab is now a separate identity (“${adopted.to}”), with its own `
+        + 'key above. The two tabs are now two real peers: paste one\'s key into the other and chat.',
+        'sys ok',
+      )
+    }
     say('Online. Share your key, or paste someone else\'s and hit Connect.')
     if (pendingInviteNote) {
       say('This is a one-time invite link (S-…). Invite dialing isn\'t supported in the browser yet — use the CLI for the invite, or ask them for their plain 26-char key to connect here.', 'sys err')
