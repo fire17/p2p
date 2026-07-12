@@ -68,3 +68,52 @@ doing its job … never claim a message we cannot actually read"). ✓
 43ccd5d CONFIRMED-SHIP — production is clean; no hotfix needed on these axes. The bounded-stash values
 (MAX_STASH=32, MAX_EARLY=64) are already present as-shipped; the tui-group follow-up (uncommitted tree)
 is a separate gate. Resident.
+
+---
+
+## FOLLOW-UP GATE — d2d6c0c (bound the self-heal) — CONFIRMED-SHIP + honest correction + a test-weakness note
+
+d2d6c0c is ALSO LIVE (rode the v0.3.1 hotfix 35132da). Gated @ d2d6c0c (parent 32b8dbf), in-process.
+
+### Honest correction to my 43ccd5d call
+In the 43ccd5d gate I wrote "no KEYREQ storm." That was INCOMPLETE. `requestKey` clears the `pulling`
+dedup on a FAILED pull (`.catch(() => pulling.delete(S))`), so a sender whose key never lands AND who is
+unreachable (`toMember` rejects — precisely the cannot-dial-back browser case 43ccd5d targets) fires a
+FRESH KEYREQ for EVERY subsequent dropped message: a ~1:1 message→KEYREQ traffic storm (not a heap DOS —
+the stash bound I verified holds — but a real network-amplification storm). d2d6c0c closes it; both are
+live so prod is now clean, but I should have flagged the storm in 43ccd5d.
+
+### The fix (verified by code)
+- `MAX_KEYREQ = 8`, a `keyReqs` Map (S→count). `requestKey`: `if (spent >= MAX_KEYREQ) return; keyReqs
+  .set(S, spent+1)` — at most 8 KEYREQs over a gap's life, surviving the failed-pull re-fire.
+- Reset: `keyReqs.delete(S)` fires ONLY in `applyKeydist` (a valid signed key actually landed → gap
+  closed). An attacker cannot force `applyKeydist` (needs the sender's real key), so the budget cannot
+  be gamed into re-storming. **Angle 1 sound.**
+- `MAX_STASH 32→16`, evict-OLDEST (`while (q.length >= MAX_STASH) q.shift()`). The stash is PER-SENDER,
+  so evicting oldest touches only that sender's own held messages — an attacker flooding under their own
+  S cannot force-evict a DIFFERENT member's message (different S ⇒ different queue). Keeping the newest
+  is correct: a chain key at seq q decrypts only seq ≥ q. **Angle 2 sound.**
+
+### Tests (my runs)
+- GREEN @d2d6c0c: `group + group-secure + group-keydist` → **20/20** (GRP-1..5 intact + "bounded
+  self-heal" + "10/10 cannot-dial-back").
+- RED @parent 32b8dbf (bounds reverted): the "bounded self-heal" test FAILS at **BOUND 2** —
+  `AssertionError: the admin must hold at most MAX_STASH(16) … replayed 32`. So the STASH bound is a
+  genuine RED→GREEN guard.
+
+### ⚠️ Test-weakness note (angle 3) — BOUND 1 does NOT reproduce the storm
+The test drops D's KEYDIST **response** but its `interceptSends(A.node, …)` **allows A's KEYREQ send**
+(`return true`), and A↔D have a live peer — so the KEYREQ send SUCCEEDS, `pulling` STAYS set, and no
+per-message re-fire happens: `keyreqs ≈ 1`, which is `≤ 8` with OR without `MAX_KEYREQ`. Evidence: the
+RED run at parent (no cap) still PASSED BOUND 1 and only failed BOUND 2. So the `≤8` assertion is
+trivially satisfied and does **not** guard the KEYREQ-cap regression — the storm needs a send-FAILURE
+(`toMember` reject → `pulling.delete`), which this setup never creates. The FIX is correct by code
+(above); only its regression guard is weak. **Recommend:** strengthen BOUND 1 to make `toMember(D)`
+reject (D unreachable — no livePeer, `connect` fails), so `keyreqs` genuinely storms to ~FLOOD without
+the cap and the `≤8` assertion actually bites.
+
+### Verdict
+**d2d6c0c CONFIRMED-SHIP** (and 43ccd5d stands CONFIRMED-SHIP — the KEYREQ storm it carried is now
+closed by d2d6c0c, both live). The bounds are correct and the stash guard is genuine; the KEYREQ-cap's
+test guard is weak (noted, SHOULD-strengthen, not a product defect — the code is right). No hotfix
+needed. The AUDIT-style follow-up (task #16) and the BOUND-1 strengthening are test-only.
