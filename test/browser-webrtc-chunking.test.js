@@ -66,6 +66,28 @@ test('each DataChannel message stays within the 16 KiB cross-browser limit', () 
   for (const s of sizes) assert.ok(s <= 16000, `every DataChannel message ≤16000B, saw ${s}`)
 })
 
+test('reassembly normalizes both ArrayBuffer (browser) and Buffer (werift) dc.onmessage payloads', () => {
+  // werift hands dc.onmessage a Node Buffer; browsers hand an ArrayBuffer. The merged module runs
+  // under BOTH, so socketFromChannel must accept either. Drive the receiver with each shape.
+  const big = randomBytes(50_000)
+  for (const shape of ['arraybuffer', 'buffer']) {
+    const [dcA, dcB] = channelPair()
+    // re-wire A→B to hand B the chosen shape
+    dcA.send = (msg) => {
+      const copy = msg.slice() // own bytes
+      const data = shape === 'buffer' ? Buffer.from(copy) : copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength)
+      dcB.onmessage && dcB.onmessage({ data })
+    }
+    const A = socketFromChannel(dcA, fakePc())
+    const B = socketFromChannel(dcB, fakePc())
+    const got = []
+    B.onMessage = (buf) => got.push(buf)
+    A.send(big)
+    assert.equal(got.length, 1, `${shape}: one reassembled frame`)
+    assert.equal(Buffer.compare(got[0], big), 0, `${shape}: byte-exact reassembly`)
+  }
+})
+
 test('a runt (< header) is dropped, not delivered', () => {
   const [dcA, dcB] = channelPair()
   const B = socketFromChannel(dcB, fakePc())
