@@ -1,0 +1,391 @@
+#!/bin/sh
+# p2p installer — Linux + macOS.  (Windows: init.ps1)
+#
+#   curl -fsSL p2p.akeyo.io/init | sh              install, then print next steps
+#   curl -fsSL p2p.akeyo.io/init | sh -s -- KEY    install, then chat with KEY's owner
+#   curl -fsSL p2p.akeyo.io/init | sh -s -- --force  reinstall even if up to date
+#
+# What it does, without sudo and without a package manager:
+#   1. finds a node >= 22 (PATH, or ~/.p2p/runtime); if none, downloads a PORTABLE
+#      node into ~/.p2p/runtime and verifies it against nodejs.org's SHASUMS256.txt
+#   2. fetches the p2p source into ~/.p2p/app  (skips if already up to date)
+#   3. drops a `p2p` shim in ~/.local/bin and puts that dir on PATH
+#   4. logs every step to ~/.p2p/install.log — on ANY failure it prints that path
+#
+# Your identity/friends (~/.p2p/*.json) are NEVER touched by an update.
+#
+# POSIX sh only (dash-clean): no [[ ]], no arrays, no `local`.
+
+set -e
+
+# ── config (override via env) ───────────────────────────────────────────────────
+# PRODUCTION DEFAULT: the GitHub tarball of the p2p repo. `P2P_SRC` may also be a
+# local directory (used by the installer's own tests: P2P_SRC=/path/to/repo sh ./init).
+P2P_SRC="${P2P_SRC:-https://github.com/fire17/p2p/archive/refs/heads/main.tar.gz}"
+NODE_DIST="${P2P_NODE_DIST:-https://nodejs.org/dist/latest-v22.x}"   # portable node source
+NODE_MIN=22
+P2P_HOME="${P2P_HOME:-$HOME/.p2p}"
+BIN_DIR="${P2P_BIN_DIR:-$HOME/.local/bin}"
+APP_DIR="$P2P_HOME/app"
+RUNTIME_DIR="$P2P_HOME/runtime"
+LOG="$P2P_HOME/install.log"
+
+# ── args ────────────────────────────────────────────────────────────────────────
+FORCE=0
+KEY=""
+for a in "$@"; do
+  case "$a" in
+    --force|--reinstall) FORCE=1 ;;
+    -h|--help) echo "usage: init [--force] [KEY]"; exit 0 ;;
+    -*) echo "  ! unknown flag: $a" >&2 ;;
+    *) [ -z "$KEY" ] && KEY="$a" ;;
+  esac
+done
+
+# ── logging + failure reporting ─────────────────────────────────────────────────
+mkdir -p "$P2P_HOME" 2>/dev/null || true
+chmod 700 "$P2P_HOME" 2>/dev/null || true
+
+STEP="startup"
+say()  { printf '%s\n' "  $*"; }
+stamp() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "?"; }
+log()  { printf '[%s] %s\n' "$(stamp)" "$*" >>"$LOG" 2>/dev/null || true; }
+step() { STEP="$1"; log "STEP $1"; }
+
+on_exit() {
+  code=$?
+  [ "$code" -eq 0 ] && exit 0
+  log "FAILED during step '$STEP' (exit $code)"
+  [ -n "$ERRFILE" ] && [ -s "$ERRFILE" ] && { log "--- error output ---"; cat "$ERRFILE" >>"$LOG" 2>/dev/null || true; log "--- end ---"; }
+  echo "" >&2
+  echo "  ✗ p2p install FAILED (step: $STEP)" >&2
+  [ -n "$ERRFILE" ] && [ -s "$ERRFILE" ] && sed 's/^/    /' "$ERRFILE" >&2
+  echo "" >&2
+  echo "  full log:  $LOG" >&2
+  echo "  please send this file to us for debugging." >&2
+  echo "" >&2
+  [ -n "$TMPD" ] && rm -rf "$TMPD" 2>/dev/null || true
+  exit "$code"
+}
+ERRFILE=""
+TMPD=""
+trap on_exit EXIT
+
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/p2p-install.XXXXXX")"
+ERRFILE="$TMPD/err"
+: >"$ERRFILE"
+
+# run a command, tee its output to the log, keep the last error text for the report
+run() { log "\$ $*"; if "$@" >>"$LOG" 2>"$ERRFILE"; then cat "$ERRFILE" >>"$LOG" 2>/dev/null || true; : >"$ERRFILE"; else cat "$ERRFILE" >>"$LOG" 2>/dev/null || true; return 1; fi; }
+# die: keep whatever the failing tool printed (curl/tar/…) in the log, then set OUR message
+die() {
+  if [ -n "$ERRFILE" ] && [ -s "$ERRFILE" ]; then
+    log "--- tool stderr ---"; cat "$ERRFILE" >>"$LOG" 2>/dev/null || true; log "--- end ---"
+  fi
+  printf '%s\n' "$1" >"$ERRFILE" 2>/dev/null || true
+  return 1
+}
+
+# ── platform ────────────────────────────────────────────────────────────────────
+step "detect-platform"
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+case "$OS" in
+  Linux)  NPLAT=linux ;;
+  Darwin) NPLAT=darwin ;;
+  *) die "unsupported OS '$OS' — this script covers Linux and macOS; Windows users run init.ps1"; ;;
+esac
+case "$ARCH" in
+  x86_64|amd64)   NARCH=x64 ;;
+  arm64|aarch64)  NARCH=arm64 ;;
+  armv7l)         NARCH=armv7l ;;
+  ppc64le)        NARCH=ppc64le ;;
+  s390x)          NARCH=s390x ;;
+  *) die "unsupported CPU arch '$ARCH' — no portable node build exists for it"; ;;
+esac
+NODE_PLAT="$NPLAT-$NARCH"
+
+log "=============================================================="
+log "p2p install start — OS=$OS ARCH=$ARCH node-target=$NODE_PLAT"
+log "HOME=$HOME P2P_HOME=$P2P_HOME src=$P2P_SRC force=$FORCE key=${KEY:-<none>}"
+echo ""
+say "p2p installer  ·  $OS/$ARCH"
+
+# ── downloader (curl or wget) ───────────────────────────────────────────────────
+if command -v curl >/dev/null 2>&1; then
+  fetch() { curl -fsSL --retry 2 -o "$2" "$1"; }
+  fetch_stdout() { curl -fsSL --retry 2 "$1"; }
+elif command -v wget >/dev/null 2>&1; then
+  fetch() { wget -q -O "$2" "$1"; }
+  fetch_stdout() { wget -q -O - "$1"; }
+else
+  step "find-downloader"; die "neither curl nor wget found — install one and re-run"
+fi
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else echo ""; fi
+}
+
+# ── 1. node >= 22 ───────────────────────────────────────────────────────────────
+step "find-node"
+node_major() { "$1" -e 'process.stdout.write(String(process.versions.node.split(".")[0]))' 2>/dev/null || echo 0; }
+node_ok() { [ -x "$1" ] || command -v "$1" >/dev/null 2>&1 || return 1; m="$(node_major "$1")"; [ -n "$m" ] && [ "$m" -ge "$NODE_MIN" ] 2>/dev/null; }
+
+NODE=""
+if [ "${P2P_FORCE_NODE_BOOTSTRAP:-0}" = "1" ]; then
+  log "P2P_FORCE_NODE_BOOTSTRAP=1 — skipping PATH/runtime node discovery"
+else
+  if [ -x "$RUNTIME_DIR/bin/node" ] && node_ok "$RUNTIME_DIR/bin/node"; then
+    NODE="$RUNTIME_DIR/bin/node"
+    log "using bootstrapped node: $NODE ($("$NODE" --version))"
+  elif command -v node >/dev/null 2>&1 && node_ok node; then
+    NODE="$(command -v node)"
+    log "using PATH node: $NODE ($("$NODE" --version))"
+  fi
+fi
+
+if [ -n "$NODE" ]; then
+  say "✓ node $("$NODE" --version) (>= v$NODE_MIN)  ·  $NODE"
+else
+  found="$(command -v node 2>/dev/null || true)"
+  [ -n "$found" ] && log "PATH node too old: $found $("$found" --version 2>/dev/null)"
+  say "↓ no node >= v$NODE_MIN found — downloading a portable one (no sudo, no package manager)…"
+
+  step "node-shasums"
+  SUMS="$TMPD/SHASUMS256.txt"
+  fetch "$NODE_DIST/SHASUMS256.txt" "$SUMS" 2>"$ERRFILE" || die "could not fetch $NODE_DIST/SHASUMS256.txt (offline? proxy?)"
+  TARBALL="$(grep -E "  node-v[0-9.]+-$NODE_PLAT\.tar\.gz\$" "$SUMS" | awk '{print $2}' | head -n 1)"
+  [ -n "$TARBALL" ] || die "nodejs.org has no build for $NODE_PLAT in $NODE_DIST (see $SUMS)"
+  WANT_SHA="$(grep -E "  $(printf '%s' "$TARBALL" | sed 's/\./\\./g')\$" "$SUMS" | awk '{print $1}' | head -n 1)"
+  log "node tarball=$TARBALL sha256=$WANT_SHA"
+
+  step "node-download"
+  say "  ↓ $TARBALL"
+  fetch "$NODE_DIST/$TARBALL" "$TMPD/$TARBALL" 2>"$ERRFILE" || die "download failed: $NODE_DIST/$TARBALL"
+
+  step "node-verify-checksum"
+  GOT_SHA="$(sha256_of "$TMPD/$TARBALL")"
+  if [ -n "$GOT_SHA" ] && [ -n "$WANT_SHA" ]; then
+    [ "$GOT_SHA" = "$WANT_SHA" ] || die "checksum MISMATCH for $TARBALL
+  expected $WANT_SHA
+  got      $GOT_SHA"
+    say "  ✓ sha256 verified"
+    log "sha256 OK"
+  else
+    log "WARN: no sha256 tool available — skipped checksum (will still verify node runs)"
+    say "  ! no sha256 tool found — skipping checksum (node will still be run-verified)"
+  fi
+
+  step "node-extract"
+  rm -rf "$RUNTIME_DIR.new"
+  mkdir -p "$RUNTIME_DIR.new"
+  run tar -xzf "$TMPD/$TARBALL" -C "$RUNTIME_DIR.new" --strip-components 1 || die "could not extract $TARBALL"
+  [ -x "$RUNTIME_DIR.new/bin/node" ] || die "extracted archive has no bin/node"
+
+  step "node-verify-runs"
+  node_ok "$RUNTIME_DIR.new/bin/node" || die "the downloaded node does not run, or reports < v$NODE_MIN ($("$RUNTIME_DIR.new/bin/node" --version 2>&1 || true))"
+  rm -rf "$RUNTIME_DIR"
+  mv "$RUNTIME_DIR.new" "$RUNTIME_DIR"
+  NODE="$RUNTIME_DIR/bin/node"
+  say "✓ node $("$NODE" --version) installed to $RUNTIME_DIR"
+  log "bootstrapped node $("$NODE" --version) at $NODE"
+fi
+
+# remember WHICH node worked, so the shim keeps working even if the user's PATH changes
+# later (e.g. a version manager unloads). Not a *.json file — user data is untouched.
+printf '%s\n' "$NODE" >"$P2P_HOME/node.path" 2>/dev/null || true
+
+# ── 2. fetch the p2p source ─────────────────────────────────────────────────────
+step "fetch-source"
+STAGE="$TMPD/stage"
+mkdir -p "$STAGE"
+case "$P2P_SRC" in
+  /*|./*|../*)
+    [ -d "$P2P_SRC" ] || die "P2P_SRC='$P2P_SRC' is not a directory"
+    say "↓ copying p2p source from $P2P_SRC"
+    # COPYFILE_DISABLE: stop macOS bsdtar emitting ._ AppleDouble/xattr noise
+    ( COPYFILE_DISABLE=1; export COPYFILE_DISABLE; cd "$P2P_SRC" && tar -cf - --exclude .git --exclude node_modules --exclude scratch . ) 2>>"$LOG" \
+      | ( cd "$STAGE" && tar -xf - ) 2>>"$LOG" \
+      || die "could not copy source from $P2P_SRC"
+    ;;
+  *.tar.gz|*.tgz)
+    say "↓ downloading p2p source…"
+    log "source tarball: $P2P_SRC"
+    fetch "$P2P_SRC" "$TMPD/src.tar.gz" 2>"$ERRFILE" || die "could not download the p2p source: $P2P_SRC
+  (if the repo is private or not published yet, set P2P_SRC to a local path or another tarball URL)"
+    run tar -xzf "$TMPD/src.tar.gz" -C "$STAGE" --strip-components 1 || die "the downloaded source archive is not a valid .tar.gz"
+    ;;
+  *)
+    die "unsupported P2P_SRC '$P2P_SRC' — use a local directory or a .tar.gz URL"
+    ;;
+esac
+[ -f "$STAGE/package.json" ] && [ -f "$STAGE/bin/p2p.js" ] || die "fetched source is missing package.json or bin/p2p.js — wrong URL?"
+
+pkg_version() { "$NODE" -e 'const fs=require("fs");try{process.stdout.write(String(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).version||"0.0.0"))}catch{process.stdout.write("")}' "$1" 2>/dev/null || echo ""; }
+# semver-ish compare, prerelease tags ignored: prints gt|lt|eq for $1 vs $2
+ver_cmp() { "$NODE" -e 'const p=v=>String(v).split("-")[0].split(".").map(n=>parseInt(n,10)||0);const a=p(process.argv[1]),b=p(process.argv[2]);let r="eq";for(let i=0;i<3;i++){const x=a[i]||0,y=b[i]||0;if(x!==y){r=x>y?"gt":"lt";break}}console.log(r)' "$1" "$2" 2>>"$LOG"; }
+
+NEW_VER="$(pkg_version "$STAGE/package.json")"
+[ -n "$NEW_VER" ] || die "could not read a version out of the fetched package.json"
+log "fetched p2p version: $NEW_VER"
+
+# ── 3. install / skip / update ──────────────────────────────────────────────────
+step "version-check"
+OLD_VER=""
+[ -f "$APP_DIR/package.json" ] && OLD_VER="$(pkg_version "$APP_DIR/package.json")"
+
+ACTION="install"
+if [ -n "$OLD_VER" ]; then
+  CMP="$(ver_cmp "$OLD_VER" "$NEW_VER")"
+  log "installed=$OLD_VER available=$NEW_VER cmp=$CMP force=$FORCE"
+  [ -n "$CMP" ] || die "could not compare versions ('$OLD_VER' vs '$NEW_VER') — see $LOG"
+  if [ "$FORCE" = "1" ]; then ACTION="reinstall"
+  elif [ "$CMP" = "lt" ]; then ACTION="update"
+  else ACTION="skip"
+  fi
+fi
+
+case "$ACTION" in
+  skip)
+    say "✓ p2p $OLD_VER already installed and up to date (latest: $NEW_VER) — skipping"
+    say "  (re-run with --force to reinstall)"
+    ;;
+  *)
+    step "install-app"
+    [ "$ACTION" = "update" ]    && say "↑ updating p2p $OLD_VER → $NEW_VER  (your identity + friends are preserved)"
+    [ "$ACTION" = "reinstall" ] && say "↻ reinstalling p2p $NEW_VER (--force)"
+    [ "$ACTION" = "install" ]   && say "↓ installing p2p $NEW_VER"
+    # atomic-ish swap: only ~/.p2p/app is replaced. ~/.p2p/*.json (identity, friends)
+    # and ~/.p2p/runtime live OUTSIDE app and are never touched.
+    rm -rf "$APP_DIR.new" "$APP_DIR.old"
+    mv "$STAGE" "$APP_DIR.new" || die "could not stage the new app dir"
+    if [ -d "$APP_DIR" ]; then mv "$APP_DIR" "$APP_DIR.old" || die "could not move the old app aside"; fi
+    mv "$APP_DIR.new" "$APP_DIR" || { [ -d "$APP_DIR.old" ] && mv "$APP_DIR.old" "$APP_DIR"; die "could not move the new app into place (old app restored)"; }
+    rm -rf "$APP_DIR.old"
+    say "✓ p2p $NEW_VER installed to $APP_DIR"
+    log "app installed: $ACTION -> $NEW_VER"
+    ;;
+esac
+
+# ── 4. the `p2p` launcher on PATH ───────────────────────────────────────────────
+step "launcher"
+mkdir -p "$BIN_DIR" || die "could not create $BIN_DIR"
+SHIM="$BIN_DIR/p2p"
+cat >"$SHIM" <<'SHIM_EOF'
+#!/bin/sh
+# p2p launcher (generated by the p2p installer — safe to delete along with ~/.p2p)
+P2P_HOME="${P2P_HOME:-$HOME/.p2p}"
+APP="$P2P_HOME/app"
+ok22() { m="$("$1" -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"; [ -n "$m" ] && [ "$m" -ge 22 ] 2>/dev/null; }
+NODE=""
+PINNED=""
+[ -f "$P2P_HOME/node.path" ] && PINNED="$(cat "$P2P_HOME/node.path" 2>/dev/null)"
+if [ -x "$P2P_HOME/runtime/bin/node" ] && ok22 "$P2P_HOME/runtime/bin/node"; then
+  NODE="$P2P_HOME/runtime/bin/node"                       # the installer's portable node
+elif [ -n "$PINNED" ] && [ -x "$PINNED" ] && ok22 "$PINNED"; then
+  NODE="$PINNED"                                          # the node the installer verified
+elif command -v node >/dev/null 2>&1 && ok22 node; then
+  NODE="node"                                             # whatever is on PATH now
+else
+  echo "p2p: no node >= 22 found. Re-run the installer:  curl -fsSL p2p.akeyo.io/init | sh" >&2
+  exit 1
+fi
+[ -f "$APP/bin/p2p.js" ] || { echo "p2p: $APP is missing. Re-run:  curl -fsSL p2p.akeyo.io/init | sh" >&2; exit 1; }
+exec "$NODE" "$APP/bin/p2p.js" "$@"
+SHIM_EOF
+chmod +x "$SHIM" || die "could not chmod +x $SHIM"
+say "✓ launcher: $SHIM"
+log "shim written: $SHIM"
+
+# ── 5. PATH ─────────────────────────────────────────────────────────────────────
+step "path"
+ON_PATH=0
+case ":$PATH:" in *":$BIN_DIR:"*) ON_PATH=1 ;; esac
+RC_TOUCHED=""
+if [ "$ON_PATH" = "0" ]; then
+  # append an idempotent marked block to the shell rc(s) we can identify
+  BLOCK_START="# >>> p2p >>>"
+  BLOCK_END="# <<< p2p <<<"
+  SH_NAME="$(basename "${SHELL:-/bin/sh}")"
+  RCS=""
+  case "$SH_NAME" in
+    zsh)  RCS="${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash) RCS="$HOME/.bashrc"; [ "$OS" = "Darwin" ] && RCS="$HOME/.bash_profile" ;;
+    fish) RCS="$HOME/.config/fish/config.fish" ;;
+    *)    RCS="$HOME/.profile" ;;
+  esac
+  RC_ADDED=0
+  for rc in $RCS; do
+    mkdir -p "$(dirname "$rc")" 2>/dev/null || true
+    RC_TOUCHED="$rc"
+    if [ -f "$rc" ] && grep -qF "$BLOCK_START" "$rc" 2>/dev/null; then
+      log "PATH block already present in $rc"
+      continue
+    fi
+    if [ "$SH_NAME" = "fish" ]; then
+      { echo ""; echo "$BLOCK_START"; echo "fish_add_path $BIN_DIR"; echo "$BLOCK_END"; } >>"$rc"
+    else
+      { echo ""; echo "$BLOCK_START"; echo "export PATH=\"$BIN_DIR:\$PATH\""; echo "$BLOCK_END"; } >>"$rc"
+    fi
+    log "appended PATH block to $rc"
+    RC_ADDED=1
+  done
+  if [ "$RC_ADDED" = "1" ]; then say "✓ added $BIN_DIR to PATH in $RC_TOUCHED"
+  else say "· $BIN_DIR already in $RC_TOUCHED (not on PATH in this shell yet)"; fi
+else
+  log "$BIN_DIR already on PATH"
+fi
+
+step "done"
+log "SUCCESS — p2p $NEW_VER ($ACTION), node $("$NODE" --version), shim $SHIM"
+rm -rf "$TMPD"; TMPD=""
+# INSTALL IS COMPLETE from here on. Disarm the failure trap + set -e so that anything
+# below (launching the TUI, a missing /dev/tty, the user hitting ^C) can never be
+# mis-reported as "install failed".
+trap - EXIT
+set +e
+
+# ── 6. next step / auto-launch ──────────────────────────────────────────────────
+echo ""
+say "✓ p2p is ready."
+if [ "$ON_PATH" = "0" ]; then
+  say "  PATH updated — restart your shell, or run:  export PATH=\"$BIN_DIR:\$PATH\""
+fi
+echo ""
+
+# TTY detection: `curl … | sh` puts the SCRIPT on stdin, so `p2p` (a full-screen TUI)
+# must never be auto-launched blindly — it would eat the script as keystrokes. We launch
+# only with a real terminal, taking stdin from /dev/tty so the piped case still works.
+# /dev/tty must be OPENED to know: a `-c`/`-r` test still passes with no controlling tty.
+have_tty=0
+if [ -t 1 ]; then
+  if [ -t 0 ]; then have_tty=1
+  elif ( exec 3</dev/tty ) 2>/dev/null; then have_tty=2   # 2 = must redirect stdin
+  fi
+fi
+
+if [ -n "$KEY" ]; then
+  if [ "$have_tty" != "0" ]; then
+    say "→ connecting to $KEY …"
+    echo ""
+    if [ "$have_tty" = "1" ]; then "$SHIM" "$KEY"; else "$SHIM" "$KEY" </dev/tty; fi
+    exit $?
+  else
+    say "no terminal detected — run this yourself to chat with that key:"
+    say "    $SHIM $KEY"
+  fi
+else
+  say "next:"
+  say "    p2p          launch the chat TUI (and print your key)"
+  say "    p2p key      just print your 26-char key — share it with a friend"
+  say "    p2p KEY      connect to a friend's key"
+  say "    p2p doctor   check that rendezvous is reachable"
+  if [ "$ON_PATH" = "0" ]; then
+    echo ""
+    say "  (until you restart your shell, use the full path: $SHIM)"
+  fi
+fi
+echo ""
