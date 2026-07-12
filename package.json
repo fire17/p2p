@@ -13,6 +13,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "node --test",
+    "test:live": "P2P_LIVE=1 node --test",
     "chat": "node bin/p2p-chat.js"
   },
   "files": ["src", "bin", "DESIGN.md", "README.md", "CHANGELOG.md"],
