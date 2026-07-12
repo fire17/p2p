@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.2] — 2026-07-12
+
+### Added / Fixed
+
+- **Boot guard — the site can never silently hang again.** If the app fails to start it now shows the
+  actual reason (too-old browser → "needs iOS 16.4+/Chrome 89+", a file missing from the server, a
+  thrown error, or blocked storage) instead of an endless "booting…". Ships `app/boot-guard.js` (the
+  file v0.3.1 already referenced — resolves a dangling 404) plus a deploy-graph test that walks the
+  real module graph and fails CI on the exact class of bug that took the site down (Jekyll-excluded
+  files, CSP-hash drift) — a green unit suite is no longer enough to call a deploy healthy.
+- **IndexedDB hang + data-integrity guards.** `indexedDB.open` can throw, block, or never settle on
+  mobile (esp. private mode) — that used to hang the boot forever; now guarded with a 5s timeout that
+  reports the reason. And `identity()` no longer silently mints a fresh key on top of broken storage
+  (a key that couldn't survive a reload) — a storage failure is fatal and explained.
+- **Faster tui→web dial** — a terminal dialing a browser no longer waits ~13s for the rendezvous
+  stream to drain; it punches as soon as the relay is reachable, while a direct UDP path still races
+  and wins whenever it lands (WAN tui↔tui is unaffected — it never touches the relay).
+- **CLI Ctrl+C always exits, everywhere** — the last front-end (`p2p group`) joins the rest; a hung
+  peer can no longer trap any of `p2p`, `p2p connect/chat`, `p2p-tui`, or `p2p group`.
+
+Minimum browser (import-map floor): Safari 16.4+, Chrome 89+, Firefox 108+, Samsung Internet 15+.
+
 ## [0.3.1] — 2026-07-12
 
 ### Fixed
