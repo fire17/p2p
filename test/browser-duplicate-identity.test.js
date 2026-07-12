@@ -194,9 +194,15 @@ test('TRIPWIRE: app.js still wires the auto-adopt path (it cannot be exercised h
     [/err\.reason !== 'identity-live' \|\| slotWasAskedFor/, 'auto-adopts ONLY on identity-live, and only for a slot the user did not name'],
     [/const next = await nextFreeSlot\(\)/, 'adopts the next free slot (the same picker ＋New identity uses)'],
     [/location\.hash = 'id=' \+ next/, 'persists the adopted slot in the URL so a reload is stable'],
-    [/sessionStorage\.setItem\(ADOPTED/, 'carries the reason across the reload'],
     [/const adopted = readAdopted\(\)/, 'says WHY the key changed once it is back online'],
-    [/location\.reload\(\)/, 'actually restarts the tab on the adopted slot'],
+    // The reload must be anchored to the auto-adopt SEQUENCE, not matched on its own: a bare
+    // /location\.reload\(\)/ also matches the idswitch handler further down the file, so deleting
+    // ONLY the auto-adopt reload — which strands the tab offline — still passed. Require the three
+    // steps together and in order, inside a window too tight to reach the idswitch reload.
+    [
+      /sessionStorage\.setItem\(ADOPTED[\s\S]{0,400}?location\.hash = 'id=' \+ next[\s\S]{0,200}?location\.reload\(\)/,
+      'carries the reason across the reload, sets the adopted slot in the hash, and THEN reloads — as one sequence',
+    ],
   ]
   for (const [re, why] of must) assert.match(src, re, `app.js must still: ${why}`)
   // And the guard it depends on must still be exported from the module app.js imports.
