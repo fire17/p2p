@@ -27,7 +27,7 @@ import dgram from 'node:dgram'
 import { randomBytes } from 'node:crypto'
 import { createTracker } from '../src/rendezvous/tracker.js'
 import { createDht } from '../src/rendezvous/dht.js'
-import { createMdns } from '../src/rendezvous/mdns.js'
+import { createMdns, _internals as mdnsInternals } from '../src/rendezvous/mdns.js'
 import { createInvite, generateInviteSecret, openBlob, deriveInviteRid, SEALED_LEN } from '../src/invite.js'
 import { generateIdentity, deriveRid } from '../src/key.js'
 import { createChannel, encodeFrame, decodeFrame, TYPE } from '../src/wire.js'
@@ -35,6 +35,7 @@ import { createEndpoint } from '../src/transport.js'
 import { Observer, CAND_SETS, assertNoLeak, trackerSurface, dhtSurface, mdnsBus, settle } from './observer.js'
 
 const EPOCH = '2026-07-12'
+const { decode: decodeDns } = mdnsInternals   // read the raw multicast frames as a LAN listener would
 
 // ── surface drivers: seal `cands` onto a REAL surface, return the operator's captured view ─────────
 
@@ -208,34 +209,79 @@ test('leak-monitor: no pre-auth unbounded allocation — accept table stays boun
   socks.forEach((s) => s.close()); ep.close()
 })
 
-// ══ 7. mDNS invite-mode surface — the KNOWN LAN LEAK, pinned (MDNS-1) ══════════════════════════════
+// ══ 7. mDNS invite-mode surface — MDNS-1 FIXED: the LAN blob is now SEALED ═════════════════════════
 //
-// ESCALATION / KNOWN GAP. §7 lists mDNS TXT (invite mode) among the no-plaintext-IP surfaces, but the
-// shipped system does NOT seal it: node.js:294 wires `mdns.createMdns(rz)` with NO codec, so invite-
-// mode mDNS broadcasts the FULL plaintext candidate blob on the LAN (an accepted LAN-only tradeoff —
-// wargame-findings MDNS-1). createMdns has NO codec seam, so this monitor CANNOT make mDNS sealed
-// without editing src/rendezvous/mdns.js — which is out of this lane's single-writer scope.
+// This test used to PIN the leak: createMdns had no codec seam, node.js wired it without one, and so
+// invite-mode mDNS broadcast the FULL plaintext candidate blob — IP and port in the clear — to every
+// device on the LAN, while the tracker and DHT surfaces for the SAME invite were already sealed. It
+// was a tripwire, written to flip the day mdns.js gained a codec. That day came: mdns.js now takes the
+// same `codec` seam as createTracker, and node.js passes `inv.codec` to it in invite mode.
 //
-// So this test PINS the current documented reality instead of asserting a false green: mDNS invite-
-// mode TXT DOES carry the plaintext IP, and it is LAN-only. It is a TRIPWIRE — the day mdns.js gains
-// a codec (MDNS-1 fixed) or mDNS is ever wired to a non-LAN surface, this flips and forces a review,
-// at which point the assertion below becomes `assertNoLeak(observer, cands)`. Reported to main.
+// WHAT WE OBSERVE MATTERS. The old pinned test watched the DECODED lookup record — which can never be
+// sealed, because the invitee is precisely the party entitled to read it. A privacy claim has to be
+// made against what a PASSIVE LAN LISTENER sees, so we wiretap the RAW multicast bytes leaving the
+// socket. That is the surface an attacker on the coffee-shop wifi actually has.
+//
+// Both properties are asserted together, because sealing is only a win if discovery still works:
+//   • a passive LAN listener learns NOTHING (assertNoLeak: no IP, no port, no structure, fixed size);
+//   • a K_inv holder still finds and reads the record (discovery reliability is UNCHANGED).
 
-test('leak-monitor: mDNS invite-mode TXT is the KNOWN plaintext LAN leak (MDNS-1) — pinned tripwire', async () => {
+/** A mock mDNS socket bus that also TAPS every multicast frame — a passive listener on the LAN. */
+function mdnsWiretap(observer) {
   const { factory } = mdnsBus()
+  return () => {
+    const sock = factory()
+    const send = sock.send.bind(sock)
+    sock.send = (buf, port, addr, cb) => {
+      observer.text(Buffer.from(buf).toString('latin1'))          // everything on the wire, verbatim
+      try {
+        for (const t of decodeDns(Buffer.from(buf)).txt) {        // and the sealed value itself, for the
+          if (!t.strings.length || !t.strings[0].startsWith('rid=')) continue   // fixed-length check (D)
+          observer.bytes(Buffer.from(t.strings.slice(1).join(''), 'base64'))
+        }
+      } catch { /* not a TXT answer (a query) — nothing sealed to capture */ }
+      return send(buf, port, addr, cb)
+    }
+    return sock
+  }
+}
+
+test('leak-monitor: mDNS invite-mode TXT is SEALED (MDNS-1 FIXED) — nothing leaks to the LAN', async () => {
+  const inv = createInvite(generateInviteSecret())
   const observer = new Observer('mdns')
-  const responder = createMdns({ socketFactory: factory, now: () => 1000 })
-  const seeker = createMdns({ socketFactory: factory, now: () => 2000 })
-  const rid = Buffer.alloc(32, 0x5a)
+  const factory = mdnsWiretap(observer)
   const cands = CAND_SETS.ipv4
+  const rid = inv.rid('mdns', EPOCH, 32)                          // where the invite actually lives
+
+  const responder = createMdns({ socketFactory: factory, codec: inv.codec, now: () => 1000 })
+  const seeker = createMdns({ socketFactory: factory, codec: inv.codec, now: () => 2000 })
   responder.announce(rid, { candidates: cands })
   const got = []
-  for await (const rec of seeker.lookup(rid, { timeout: 200 })) { observer.text(JSON.stringify(rec)); got.push(rec) }
+  for await (const rec of seeker.lookup(rid, { timeout: 200 })) got.push(rec)
   responder.close(); seeker.close()
 
-  // PINNED reality: createMdns has no codec → the plaintext IP IS on the LAN wire. When MDNS-1 is
-  // fixed (seal the TXT), delete this expectation and switch to `assertNoLeak(observer, cands)`.
-  assert.equal(observer.wire().includes(cands[0].ip), true,
-    'MDNS-1 (known): invite-mode mDNS TXT carries the plaintext IP — LAN-only accepted tradeoff, tracked')
-  assert.deepEqual(got[0]?.candidates, cands, 'and a LAN peer reads it directly (no seal on this surface)')
+  // A: no plaintext IP · B: no plaintext port · C: no marker/structure · D: every sealed value is
+  // exactly SEALED_LEN, so the candidate COUNT does not leak through the length either.
+  assertNoLeak(observer, cands)
+
+  // …and discovery still works for the party that is supposed to find it. Sealing a channel that no
+  // longer discovers anything would be a regression dressed up as a fix.
+  assert.deepEqual(got[0]?.candidates, cands, 'a K_inv holder still resolves the record — discovery intact')
+})
+
+test('leak-monitor: a NON-holder on the same LAN cannot open the sealed mDNS record', async () => {
+  const inv = createInvite(generateInviteSecret())
+  const eavesdropper = createInvite(generateInviteSecret())        // same LAN, different (or no) invite
+  const observer = new Observer('mdns')
+  const factory = mdnsWiretap(observer)
+  const rid = inv.rid('mdns', EPOCH, 32)
+
+  const responder = createMdns({ socketFactory: factory, codec: inv.codec, now: () => 1000 })
+  const spy = createMdns({ socketFactory: factory, codec: eavesdropper.codec, now: () => 2000 })
+  responder.announce(rid, { candidates: CAND_SETS.ipv4 })
+  const got = []
+  for await (const rec of spy.lookup(rid, { timeout: 200 })) got.push(rec)   // knows WHERE, not WHAT
+  responder.close(); spy.close()
+
+  assert.deepEqual(got, [], 'a wrong-key listener opens nothing — the record is fail-closed, not just obscured')
 })

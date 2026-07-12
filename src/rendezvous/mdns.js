@@ -140,26 +140,51 @@ function decode(buf) {
   return { questions, txt }
 }
 
-// ── TXT payload: string[0]="rid=<hex>", remaining strings joined = base64(JSON blob) ──
+// ── blob codec seam (metadata-privacy §4.1/§4.3 — the SAME seam createTracker already has) ──────
+// The TXT record carries OPAQUE BYTES. The default codec is plaintext JSON — byte-identical to
+// v0.1.0 (reusable-S mode, where the candidates are public by construction anyway). INVITE mode
+// passes src/invite.js's `inv.codec`, which AEAD-seals the candidate blob under k_ip=HKDF(K_inv,"ip")
+// and pads it to a FIXED length, so a passive LAN listener sees only fixed-size ciphertext.
+//
+// MDNS-1 (wargame-findings): until this seam existed, invite-mode mDNS broadcast the FULL plaintext
+// candidate blob — IP and port in the clear — to every device on the LAN, while the tracker and DHT
+// surfaces for the same invite were already sealed. That is exactly the "IP never plaintext on any
+// channel" rule, broken on the one channel nobody was watching.
+//
+// The rid is UNCHANGED (it is already rid_inv in invite mode — only a K_inv holder can compute it),
+// so discovery reliability is untouched: the same peers find the same record on the same query. Only
+// the PAYLOAD goes opaque.
+const JSON_CODEC = {
+  sealed: false,
+  seal: (blob) => Buffer.from(JSON.stringify(blob), 'utf8'),
+  open: (bytes) => { try { return JSON.parse(bytes.toString('utf8')) } catch { return null } },
+}
 
-/** @param {Buffer} rid @param {object} blob @returns {string[]} */
-function encodeTxt(rid, blob) {
-  const b64 = Buffer.from(JSON.stringify(blob), 'utf8').toString('base64')
+// ── TXT payload: string[0]="rid=<hex>", remaining strings joined = base64(codec-sealed blob) ──
+
+/** @param {Buffer} rid @param {object} blob @param {object} [codec] @returns {string[]} */
+function encodeTxt(rid, blob, codec = JSON_CODEC) {
+  const b64 = Buffer.from(codec.seal(blob, rid)).toString('base64')
   const chunks = []
   for (let i = 0; i < b64.length; i += 200) chunks.push(b64.slice(i, i + 200))
   return ['rid=' + rid.toString('hex'), ...chunks]
 }
 
-/** @param {string[]} strings @returns {{ridHex:string, blob:object}|null} */
-function decodeTxt(strings) {
+/**
+ * @param {string[]} strings @param {object} [codec]
+ * @returns {{ridHex:string, blob:object}|null} null on a foreign rid, a wrong key, tamper, or corrupt
+ *   bytes — a record we cannot open is simply ignored (same rule as the tracker's codec seam).
+ */
+function decodeTxt(strings, codec = JSON_CODEC) {
   if (!strings.length || !strings[0].startsWith('rid=')) return null
   const ridHex = strings[0].slice(4)
-  try {
-    const blob = JSON.parse(Buffer.from(strings.slice(1).join(''), 'base64').toString('utf8'))
-    return { ridHex, blob }
-  } catch {
-    return null
-  }
+  let bytes
+  try { bytes = Buffer.from(strings.slice(1).join(''), 'base64') } catch { return null }
+  // The rid is carried in the clear (it must be — it is the lookup key, and in invite mode it is
+  // itself derived from K_inv), so it is available as the AEAD's associated data on both sides.
+  const blob = codec.open(bytes, Buffer.from(ridHex, 'hex'))
+  if (!blob) return null
+  return { ridHex, blob }
 }
 
 // ── channel instance ──────────────────────────────────────────────────────────
@@ -172,10 +197,15 @@ function decodeTxt(strings) {
  * @param {string} [opts.mcastAddr]
  * @param {number} [opts.port]
  * @param {number} [opts.ttl] TXT TTL seconds
+ * @param {{sealed:boolean, seal:Function, open:Function}} [opts.codec] blob codec. Default = plaintext
+ *   JSON (v0.1.0 wire, reusable-S mode — byte-identical). Pass an src/invite.js `inv.codec` for INVITE
+ *   MODE: the candidate blob is AEAD-sealed under k_ip and padded to a fixed length, so a passive LAN
+ *   listener reads neither the IP, nor the port, nor the size of the candidate set (MDNS-1).
  * @returns {{name:'mdns', ridLen:32, announce:Function, lookup:Function, close:Function}}
  */
 export function createMdns(opts = {}) {
   const now = opts.now || (() => Date.now())
+  const codec = opts.codec || JSON_CODEC        // invite mode passes src/invite.js's inv.codec (sealed)
   // NOTE: dgram.createSocket(type, cb) treats a 2nd arg as a callback — passing options there
   // silently DROPS them (reuseAddr lost → EADDRINUSE on the 2nd same-host bind). Options must go
   // in a single object with a `type` field. (Mock factories in tests ignore the args entirely.)
@@ -208,9 +238,11 @@ export function createMdns(opts = {}) {
     if (pkt.questions.some((q) => q.name === SERVICE) && announcements.size) {
       respond()
     }
-    // feed TXT answers to active lookups
+    // feed TXT answers to active lookups. In invite mode this OPENS the sealed blob with our k_ip:
+    // a record we cannot open (someone else's invite, a foreign p2p peer, tamper) yields null and is
+    // simply dropped here — the same fail-closed rule the tracker's codec seam follows.
     for (const t of pkt.txt) {
-      const dec = decodeTxt(t.strings)
+      const dec = decodeTxt(t.strings, codec)
       if (dec) for (const cb of listeners) cb(dec)
     }
   })
@@ -242,7 +274,7 @@ export function createMdns(opts = {}) {
       name: SERVICE,
       type: TYPE_TXT,
       ttl,
-      strings: encodeTxt(rid, blob),
+      strings: encodeTxt(rid, blob, codec),
     }))
     if (answers.length) sendMcast(encodeResponse(answers))
   }

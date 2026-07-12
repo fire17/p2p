@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { createMdns, _internals } from '../src/rendezvous/mdns.js'
+import { createInvite, generateInviteSecret, SEALED_LEN } from '../src/invite.js'
 
 const { encodeQuery, encodeResponse, decode, encodeTxt, decodeTxt, encodeName, readName, SERVICE } = _internals
 
@@ -154,4 +155,34 @@ test('LIVE: two real-socket instances discover cross-instance over multicast', a
     a.close()
     b.close()
   }
+})
+
+// ── MDNS-1: the codec seam (mirrors createTracker's) ────────────────────────────────────────────
+// Sealing the invite-mode blob must not cost the reusable-S wire a single byte, and must not cost
+// discovery a single record. Both halves are asserted here; the LAN-privacy half lives in
+// test/leak-monitor.test.js (which wiretaps the real multicast frames).
+
+test('codec seam: NO codec ⇒ the TXT payload is byte-identical to the v0.1.0 wire (base64 JSON)', () => {
+  const rid = Buffer.alloc(32, 0xab)
+  const blob = { v: 1, ts: 123, candidates: [{ proto: 'udp4', ip: '10.0.0.1', port: 4000, kind: 'lan' }] }
+  const strings = encodeTxt(rid, blob)                       // default codec — reusable-S mode
+  const legacy = Buffer.from(JSON.stringify(blob), 'utf8').toString('base64')   // what v0.1.0 emitted
+  assert.equal(strings[0], 'rid=' + rid.toString('hex'), 'the rid line is unchanged')
+  assert.equal(strings.slice(1).join(''), legacy, 'the payload is the same bytes as before the seam')
+})
+
+test('codec seam: a sealed codec round-trips, and a WRONG key opens nothing (fail-closed)', () => {
+  const rid = Buffer.alloc(32, 0x5a)
+  const blob = { v: 1, ts: 7, candidates: [{ proto: 'udp4', ip: '198.51.100.23', port: 45678, kind: 'srflx' }] }
+  const mine = createInvite(generateInviteSecret())
+  const theirs = createInvite(generateInviteSecret())
+
+  const strings = encodeTxt(rid, blob, mine.codec)
+  const payload = strings.slice(1).join('')
+  assert.equal(payload.includes('198.51.100.23'), false, 'the IP is not in the sealed payload')
+  assert.equal(Buffer.from(payload, 'base64').length, SEALED_LEN, 'sealed to a FIXED length — no size side-channel')
+
+  assert.deepEqual(decodeTxt(strings, mine.codec).blob, blob, 'the K_inv holder reads it back exactly')
+  assert.equal(decodeTxt(strings, theirs.codec), null, 'a different invite opens nothing')
+  assert.equal(decodeTxt(strings), null, 'and neither does a plaintext (reusable-S) reader')
 })

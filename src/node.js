@@ -286,15 +286,18 @@ async function resolveDeps(inj = {}, opts = {}, invite = null) {
   /**
    * Build one rendezvous race, S-mode (inv=null) or INVITE-mode (inv = createInvite(K_inv)).
    * Invite mode changes exactly three things (research/metadata-privacy.md §9/§10, invite.js header):
-   * rids come from K_inv (`createRace({invite})`), tracker blobs are AEAD-sealed (`codec`), and the
-   * DHT switches from plaintext announce_peer to encrypted BEP44 (`invite`). Pass nothing and every
-   * byte is the v0.1.0 reusable-S wire.
+   * rids come from K_inv (`createRace({invite})`), the candidate blob is AEAD-sealed on EVERY channel
+   * that carries one (`codec` — tracker and mDNS), and the DHT switches from plaintext announce_peer
+   * to encrypted BEP44 (`invite`). Pass nothing and every byte is the v0.1.0 reusable-S wire.
    * @param {object|null} inv
    */
   const makeRace = (inv = null) => {
     const rz = opts.rendezvous || {}
     const channels = [
-      mdns.createMdns(rz),                                             // LAN broadcast: rid_inv, plaintext TXT (LAN-only; see README)
+      // MDNS-1: mDNS carries the FULL candidate blob (DESIGN D6), so in invite mode it takes the same
+      // seal as the tracker. Before this it broadcast the IP:port in the CLEAR to the whole LAN while
+      // the other two surfaces for the same invite were sealed — the one channel nobody watched.
+      mdns.createMdns(inv ? { ...rz, codec: inv.codec } : rz),
       dht.createDht(inv ? { ...rz, invite: inv } : rz),
       tracker.createTracker(inv ? { ...rz, codec: inv.codec } : rz),
     ]
