@@ -17,7 +17,18 @@
 - **Status:** code is correct; treat the INTERFACES "be64" phrasing as superseded by this
   entry. Verified by KAT byte-exactness against two independent audited impls.
 
-## D-INT-3 — WSS tracker is a v1 stub, not D6's live matchmaker (cross-net = DHT alone)
+## D-INT-3 — WSS tracker was a v1 stub — RESOLVED 2026-07-12 (matchmaker landed)
+
+> **RESOLVED** in commit 69d8976: the tracker is now D6's live matchmaker (persistent WSS,
+> candidate blob carried in the offer SDP, real `lookup()` peer discovery). Verified live —
+> tracker-only two-process discovery returns `channel: tracker` in ~0.55s over real public
+> WebTorrent trackers, and a full tracker-only two-process chat delivered end-to-end. So
+> **cross-network discovery is no longer DHT-only** — it is now mDNS (LAN) + DHT + tracker,
+> the full 3-channel race per D6. The deferral below is kept for history; it no longer holds.
+> (Cross-network real-NAT between two DISTINCT networks is still owner-gated / unobserved —
+> that's VAL-ACCEPT-XNET, separate from this rendezvous-redundancy divergence.)
+
+<details><summary>Original deferral (historical)</summary>
 
 - **Where:** `src/rendezvous/tracker.js` — `createTracker().lookup()` is an empty async
   generator (yields no peers); `announce()` is an echo-only probe; the full candidate blob
@@ -37,6 +48,8 @@
   main reason the cross-network claim is "machinery ready," not "redundantly ready."**
 - **Status:** intentional scope cut, product works for v1. When P1 adds the tracker
   matchmaker, restore the 3-channel race and update DESIGN D6 + this entry.
+
+</details>
 
 - **Where:** `src/key.js` `encodeKey`/`decodeKey`; the 130-bit layout's first 5 bits are
   labelled "version/flags" in DESIGN D2 / INTERFACES.
