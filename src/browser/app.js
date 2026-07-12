@@ -3,11 +3,33 @@
 // One copy of this file runs everywhere — /app/index.html loads it by absolute path and its relative
 // imports resolve against /src/browser/.
 
-import { identity, listen } from './p2p.js'
+import { identity, listIdentities, listen } from './p2p.js'
 
 const $ = (id) => document.getElementById(id)
 let node = null
 let pendingInviteNote = false
+let myKey = null // this tab's own 26-char key — used to refuse dialing yourself
+
+// A slot name from the URL is user-controllable, so clamp it to a safe, short shape.
+const sanitizeSlot = (s) => (s || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'default'
+
+// The identity switcher — list every identity this browser holds; switching reloads THIS tab onto it.
+async function refreshIdSwitcher(activeSlot) {
+  const sel = $('idswitch')
+  if (!sel) return
+  const ids = await listIdentities().catch(() => [])
+  sel.innerHTML = ''
+  for (const it of ids) {
+    const o = document.createElement('option')
+    o.value = it.slot
+    o.textContent = `${it.name} · ${it.S.slice(0, 6)}…`
+    if (it.slot === activeSlot) o.selected = true
+    sel.append(o)
+  }
+  if (!ids.some((i) => i.slot === activeSlot)) { // brand-new slot not yet persisted — still show it
+    const o = document.createElement('option'); o.value = activeSlot; o.textContent = activeSlot; o.selected = true; sel.append(o)
+  }
+}
 
 // ── tiny log helpers (shared shape for the pair log #log and the group log #grouplog) ──
 function line(ul, text, cls = 'sys') {
@@ -111,7 +133,20 @@ async function main() {
     // box; /app/#<group-code> pre-fills the group Join box. A share string (`S-<tail>`, one-time
     // invite) is DETECTED and reported honestly — invite dialing isn't wired in the browser yet
     // (fast-follow), so we don't silently misroute it to the group box. Done before going online.
-    const frag = decodeURIComponent(location.hash.replace('#', '')).trim()
+    // The hash carries TWO things now: an optional identity slot (`id=<name>`) that picks WHICH of
+    // this browser's identities this tab uses (so two normal windows can be two different peers), and
+    // the existing deep link (a 26-char key / group code / share string). Parse the slot out first,
+    // then treat whatever remains exactly as before.
+    const rawHash = decodeURIComponent(location.hash.replace(/^#/, ''))
+    let slot = 'default'
+    const fragParts = []
+    for (const seg of rawHash.split('&')) {
+      const m = /^id=(.+)$/.exec(seg)
+      if (m) slot = sanitizeSlot(m[1])
+      else if (seg) fragParts.push(seg)
+    }
+    const frag = fragParts.join('&').trim()
+
     const isShareString = /^[0-9A-Za-z]{26}-\S+$/.test(frag) // 26-char S + '-' + invite tail
     if (isShareString) {
       showTab('pair')
@@ -119,8 +154,11 @@ async function main() {
     } else if (frag.length === 26) { $('peerkey').value = frag.toUpperCase(); showTab('pair') }
     else if (frag.length > 26) { $('groupSecret').value = frag; showTab('group') }
 
-    const id = await identity()
+    const id = await identity({ slot })
+    myKey = id.S
     $('mykey').textContent = id.S
+    $('idname').textContent = slot
+    await refreshIdSwitcher(slot)
     status('going online…')
 
     node = await listen(id)
@@ -160,6 +198,24 @@ async function main() {
   }
 }
 
+// ── identity handlers ──
+// Switch this tab to another identity — reload onto its slot (the slot is read at boot).
+$('idswitch').onchange = () => {
+  const next = $('idswitch').value
+  location.hash = 'id=' + next
+  location.reload()
+}
+// Mint a brand-new identity and open it in a NEW window — so you instantly have a second peer to chat
+// with. The new window boots on a fresh slot, which first-runs a new keypair (BRW-2-safe).
+$('newId').onclick = async () => {
+  const ids = await listIdentities().catch(() => [])
+  const used = new Set(ids.map((i) => i.slot))
+  let n = ids.length + 1
+  let next = 'id-' + n
+  while (used.has(next)) next = 'id-' + (++n)
+  window.open(location.pathname + '#id=' + next, '_blank')
+}
+
 // ── pair handlers ──
 $('copy').onclick = async () => {
   try { await navigator.clipboard.writeText($('mykey').textContent) } catch { /* clipboard blocked */ }
@@ -169,6 +225,12 @@ $('copy').onclick = async () => {
 $('connect').onclick = async () => {
   const S = $('peerkey').value.trim().toUpperCase()
   if (!S) return
+  if (myKey && S === myKey) {
+    // Dialing your own key connects you to yourself — the exact "message went to myself" trap. Refuse
+    // it and point at the fix: a second identity in this browser, or an incognito window.
+    say('That\'s your OWN key — you can\'t chat with yourself. Click “＋ New identity” (top) to open a second identity in another window, or use an incognito window, then dial THAT window\'s key.', 'sys err')
+    return
+  }
   $('connect').disabled = true
   say(`dialing ${S}… (deriving the rendezvous id, then connecting over public infrastructure)`)
   try {

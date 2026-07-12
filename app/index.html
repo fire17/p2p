@@ -51,6 +51,13 @@
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
   label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin-bottom: 8px; }
   .key { display: flex; gap: 8px; align-items: center; }
+  .idbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .idbar label { flex: 0 0 auto; }
+  select {
+    background: #0d1117; color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 9px 12px; font: inherit; cursor: pointer; flex: 1; min-width: 140px;
+  }
+  select:focus-visible { outline: 2px solid var(--me); outline-offset: 1px; }
   .key code {
     flex: 1; font-size: 16px; letter-spacing: 1.2px; word-break: break-all;
     background: #0d1117; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
@@ -102,7 +109,12 @@
   <div id="status"><span class="dot" id="dot"></span><span id="statusText">booting…</span></div>
 
   <div class="panel">
-    <label for="mykey">Your key — share it so people can reach you</label>
+    <div class="idbar">
+      <label style="margin:0">Identity</label>
+      <select id="idswitch" aria-label="Switch identity"></select>
+      <button id="newId" title="Create a new identity in a separate window">＋ New identity</button>
+    </div>
+    <label for="mykey" style="margin-top:14px">Your key (identity: <b id="idname">default</b>) — share it so people can reach you</label>
     <div class="key">
       <code id="mykey">…</code>
       <button id="copy">Copy</button>
@@ -110,6 +122,9 @@
     <p class="hint">Anyone with this key can find you over free public infrastructure and open a
       verified, end-to-end-encrypted channel. It’s safe to share — it names you and lets others
       prove it’s really you; it can’t be used to impersonate you.</p>
+    <p class="hint">Two windows on this browser share one identity by default — so they’re the same
+      person and can’t chat. Click <b>＋ New identity</b> to open a second one in a new window, then
+      dial that window’s key from here.</p>
   </div>
 
   <div class="tabs" role="tablist">
