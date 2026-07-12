@@ -163,7 +163,9 @@ verify_source_archive() {
   say "↓ verifying source integrity…"
   fetch "$P2P_SRC_SUMS" "$TMPD/src.sums" 2>"$ERRFILE" || die "could not fetch the source checksum manifest: $P2P_SRC_SUMS"
   _name="$(basename "$P2P_SRC")"
-  _want="$(grep -E "  $(printf '%s' "$_name" | sed 's/\./\\./g')\$" "$TMPD/src.sums" | awk '{print $1}' | head -n 1)"
+  # exact match on the manifest's filename field — no regex escaping of the name needed
+  # (parity with init.ps1's full [Regex]::Escape; format is "<sha256>  <name>").
+  _want="$(awk -v n="$_name" '$2 == n { print $1; exit }' "$TMPD/src.sums")"
   [ -n "$_want" ] || die "the source manifest ($P2P_SRC_SUMS) has no SHA256 entry for '$_name'
   — is it the right manifest for this archive?"
   [ "$_got" = "$_want" ] || die "source checksum MISMATCH for $_name

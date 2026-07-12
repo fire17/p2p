@@ -77,6 +77,18 @@ Verify locally before uploading (this is exactly what the installer does):
 ( cd dist && shasum -a 256 -c SHASUMS256.txt )    # must print "OK" for every line
 ```
 
+### Windows smoke run (required before advertising the Windows path as hardened)
+
+`init.ps1`'s source-verify path (`VerifySourceArchive`) is the symmetric twin of the POSIX
+one, but it has **not** been executed on a real Windows/PowerShell host — the fix was
+developed and end-to-end verified on macOS, and `test/installer-verify.sh` only exercises
+`init`. Before a release advertises Windows as integrity-checked, do a one-time `pwsh` smoke
+run on a real Windows box (PowerShell 5.1 and 7): a good `.zip` asset installs, a tampered
+`.zip` is rejected with `source checksum MISMATCH`, and a manifest with no matching entry is
+rejected — mirroring the good / tampered / no-entry cases that `test/installer-verify.sh`
+runs against `init`. `Get-FileHash` ships with PowerShell 5.1+, so there is no "no hash tool"
+case to test on Windows.
+
 ---
 
 ## What a same-repo checksum does and does not protect against
