@@ -146,6 +146,32 @@ test('ChaCha20-Poly1305: shim FAILS CLOSED on a tampered tag', () => {
   assert.throws(() => d.final(), 'a tampered tag MUST throw')
 })
 
+test('Ed25519 sign/verify: shim === node, cross-verifies both directions (src/sign.js path)', () => {
+  const ED_PKCS8 = Buffer.from('302e020100300506032b657004220420', 'hex')
+  const ED_SPKI = Buffer.from('302a300506032b6570032100', 'hex')
+  const kp = shim.generateKeyPairSync('ed25519')
+  const priv32 = Buffer.from(kp.privateKey.export({ format: 'jwk' }).d, 'base64url')
+  const pub32 = Buffer.from(kp.privateKey.export({ format: 'jwk' }).x, 'base64url')
+  const msg = Buffer.from('a group membership op that must be authenticated')
+
+  const shimPriv = shim.createPrivateKey({ key: Buffer.concat([ED_PKCS8, priv32]), format: 'der', type: 'pkcs8' })
+  const shimPub = shim.createPublicKey({ key: Buffer.concat([ED_SPKI, pub32]), format: 'der', type: 'spki' })
+  const nodePriv = real.createPrivateKey({ key: Buffer.concat([ED_PKCS8, priv32]), format: 'der', type: 'pkcs8' })
+  const nodePub = real.createPublicKey({ key: Buffer.concat([ED_SPKI, pub32]), format: 'der', type: 'spki' })
+
+  const shimSig = shim.sign(null, msg, shimPriv)
+  const nodeSig = real.sign(null, msg, nodePriv)
+  assert.equal(hex(shimSig), hex(nodeSig), 'Ed25519 signature bytes must be identical (deterministic)')
+
+  // cross-verify: node verifies the shim's sig, shim verifies node's sig
+  assert.equal(real.verify(null, msg, nodePub, shimSig), true, 'node must verify a shim signature')
+  assert.equal(shim.verify(null, msg, shimPub, nodeSig), true, 'shim must verify a node signature')
+  // tamper -> false, never throw
+  const bad = Buffer.from(shimSig)
+  bad[0] ^= 1
+  assert.equal(shim.verify(null, msg, shimPub, bad), false, 'a tampered signature must verify false')
+})
+
 test('timingSafeEqual: matches node semantics (equal, unequal, length mismatch throws)', () => {
   const a = Buffer.alloc(14, 3)
   const b = Buffer.alloc(14, 3)

@@ -7,6 +7,7 @@
 //                 timingSafeEqual
 //   src/wire.js   randomBytes
 //   src/node.js   randomBytes
+//   src/sign.js   sign · verify · createPrivateKey · createPublicKey   (Ed25519 group-op sigs)
 //   src/rendezvous/tracker.js  (default import) crypto.randomBytes
 //
 // THE POINT: with this shim + the Buffer shim, a browser runs src/key.js, src/noise.js,
@@ -142,6 +143,29 @@ export function randomBytes(n) {
   return out
 }
 
+/**
+ * Ed25519 detached sign, Node's shape: sign(null, msg, privKeyObject). `algorithm` is null for
+ * Ed25519 (the algo is fixed by the key). Used by src/sign.js for group-op signatures.
+ * @param {null} _algorithm must be null for Ed25519
+ * @param {Buffer} msg @param {KeyObject} privKey an Ed25519 private KeyObject
+ * @returns {Buffer} 64-byte detached signature
+ */
+export function sign(_algorithm, msg, privKey) {
+  if (privKey.asymmetricKeyType !== 'ed25519') throw new TypeError('sign: Ed25519 key required')
+  return Buffer.from(ed25519.sign(Buffer.from(msg), privKey._raw))
+}
+
+/**
+ * Ed25519 detached verify, Node's shape: verify(null, msg, pubKeyObject, sig) -> boolean.
+ * @param {null} _algorithm must be null for Ed25519
+ * @param {Buffer} msg @param {KeyObject} pubKey an Ed25519 public KeyObject @param {Buffer} sig 64 bytes
+ * @returns {boolean}
+ */
+export function verify(_algorithm, msg, pubKey, sig) {
+  if (pubKey.asymmetricKeyType !== 'ed25519') throw new TypeError('verify: Ed25519 key required')
+  return ed25519.verify(Buffer.from(sig), Buffer.from(msg), pubKey._raw)
+}
+
 /** Streaming SHA-256 (`createHash('sha256').update(a).update(b).digest()`). */
 export function createHash(algorithm) {
   if (algorithm !== 'sha256') throw new TypeError('only sha256 is supported')
@@ -263,5 +287,7 @@ export default {
   generateKeyPairSync,
   hkdfSync,
   randomBytes,
+  sign,
+  verify,
   timingSafeEqual,
 }
