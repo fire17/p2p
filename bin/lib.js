@@ -29,6 +29,30 @@ export function looksLikeShare(s) {
   try { const { S } = parseShare(s); return S.length === 26 } catch { return false }
 }
 
+// ── own-key guard: the #1 footgun ────────────────────────────────────────────
+// Two `p2p` sessions on the same profile share ONE identity, so `p2p connect <own-key>`
+// (or bare `p2p <own-key>`) silently tries to talk to yourself and never connects. Resolve
+// the dial target's 26-char S (bare key OR the S half of an S-<tail> invite share) and compare
+// it to THIS session's own key on the KEYPAIR COMMITMENT — not the raw string. decodeKey is
+// case-insensitive (Crockford ambiguity mapped) AND flag-independent: a one-time invite of your
+// OWN key encodes to a different S (the INVITE_FLAG bit is set) but the same 14-byte commitment,
+// so the string compare misses it while the commitment compare catches it. A malformed target
+// returns false (its bad-key error is handled by the normal dial path). Mirrors the browser
+// client's own-key guard (commit 2054f5d).
+export function isOwnKey(target, ownKey) {
+  if (!ownKey) return false
+  try {
+    const a = decodeKey(parseShare(String(target).trim()).S).commitment
+    const b = decodeKey(String(ownKey).trim()).commitment
+    return a.equals(b)
+  } catch { return false }
+}
+
+/** The actionable refuse message printed at every dial entry point when you dial your OWN key. */
+export const OWN_KEY_MSG =
+  "that's your OWN key — you can't chat with yourself. Run the other peer with a " +
+  'different identity:  p2p --profile <name>   (or --ephemeral).'
+
 // ── ANSI (no-op when stdout is not a TTY) ────────────────────────────────────
 export const TTY = process.stdout.isTTY
 export const c = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : String(s))

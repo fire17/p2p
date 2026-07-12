@@ -22,7 +22,7 @@ import {
   loadNode, loadOrCreateIdentity, saveIdentity, generateIdentity, decodeKey, TypoError, doctor,
   bold, dim, red, green, cyan, yellow, magenta, peerLabel, shortId, idFilePath,
   loadFriends, addFriend, resolveFriend, peerKey,
-  mintInvite, parseShare, looksLikeShare,
+  mintInvite, parseShare, looksLikeShare, isOwnKey, OWN_KEY_MSG,
 } from './lib.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -64,6 +64,8 @@ function printInviteBox(share) {
 // nobody is listening on. Caught by the two-process gate; keep the mint and the listen on one id.
 async function lineMode({ dialKey, ephemeral, profile, mintInviteMode = false }) {
   const id = loadOrCreateIdentity({ ephemeral, profile })
+  // own-key guard: refuse dialing yourself BEFORE any network work (never go online to self-dial).
+  if (dialKey && isOwnKey(dialKey, id.S)) { console.error(red('  ✗ ') + OWN_KEY_MSG); process.exit(2) }
   const invite = mintInviteMode ? mintInvite(id) : null
   const mod = await loadNode()
   const node = await mod.listen(id, invite ? { invite: invite.secret } : {})

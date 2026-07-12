@@ -18,7 +18,7 @@
 import readline from 'node:readline'
 import process from 'node:process'
 import { generateIdentity, decodeKey, verifyCommitment, TypoError } from '../src/key.js'
-import { loadOrCreateIdentity } from './lib.js'
+import { loadOrCreateIdentity, isOwnKey, OWN_KEY_MSG } from './lib.js'
 
 // ── tiny ANSI (skipped when not a TTY) ───────────────────────────────────────
 const TTY = process.stdout.isTTY
@@ -235,6 +235,8 @@ async function runConnect(be, KEY) {
     throw e
   }
   const id = await be.identity()
+  // own-key guard: refuse dialing yourself BEFORE any network work (self-dial never connects).
+  if (isOwnKey(KEY, id.S)) { console.error(red('  ✗ ') + OWN_KEY_MSG); process.exit(2) }
   const node = await be.listen(id, {}) // we also listen, so the peer can reach us back
   if (!be.real) {
     console.log(

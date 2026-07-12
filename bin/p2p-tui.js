@@ -14,6 +14,7 @@ import process from 'node:process'
 import {
   loadNode, loadOrCreateIdentity, decodeKey, TypoError,
   peerLabel, shortId, loadFriends, addFriend, resolveFriend, peerKey, parseShare, looksLikeShare,
+  isOwnKey, OWN_KEY_MSG,
 } from './lib.js'
 
 const ESC = '\x1b['
@@ -212,6 +213,8 @@ async function dial(key) {
   try { share = parseShare(key); decodeKey(share.S) } catch (e) {    // bare S, or a one-time invite share
     add('sys', e instanceof TypoError ? 'bad key: ' + e.message : 'bad key'); return
   }
+  // own-key guard: dialing your own key never connects (you'd be talking to yourself).
+  if (isOwnKey(share.S, state.id.S)) { add('sys', '✗ ' + OWN_KEY_MSG); setStatus('online (idle)', 'ok'); return }
   add('sys', `connecting to ${shortId(share.S)} · resolving rendezvous, punching NAT, Noise ${share.secret ? 'IKpsk2 (private invite)' : 'IK'}…`)
   setStatus('connecting…', 'warn')
   try {
