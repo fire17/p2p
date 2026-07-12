@@ -16,7 +16,9 @@ gaps are listed at the bottom rather than omitted.
   terminal runs (`key.js`, `noise.js`, `wire.js`, `node.js`, `group.js`) over a `node:crypto` →
   WebCrypto shim. Same key format, same commitment gate, same Noise IK, same MITM proof. Witnessed
   in a real browser: **browser ↔ browser**, and **browser ↔ TUI** over both a WebRTC DataChannel and
-  the zero-dependency WSS relay — a paired witness, not two self-reports.
+  the zero-dependency WSS relay — a paired witness, not two self-reports. Ships **pair chat and group
+  chat**: two real browsers create/join a group through the shipped buttons and exchange E2E group
+  messages over public infrastructure.
 - **Private one-time invites — metadata privacy v1.** `p2p invite` mints a 128-bit `K_inv` and
   publishes presence under it: the rendezvous id is `HKDF(K_inv,…)` (a non-holder cannot even
   *locate* the record), candidates are AEAD-sealed under `HKDF(K_inv,"ip")` and padded to a fixed
@@ -59,9 +61,9 @@ gaps are listed at the bottom rather than omitted.
 ### Known gaps (stated, not hidden)
 
 - **Invites are terminal-only.** The browser build has no `makeRace` seam, so `connect('S-…')`
-  throws there; the web client dials reusable keys.
-- **No group UI in the browser** — the group engine runs and is tested there, but the shipped UI is
-  1:1 chat.
+  throws there; the web client dials reusable keys (and its key input is capped at 26 chars).
+- **No deep-link into the web client yet** — you paste the key into the app rather than following a
+  `…/app/#<KEY>` URL.
 - **`createSecureGroup` is not exported from the package** (`.`, `./invite`, `./key` only) — usable
   from a checkout and inside the browser build.
 - **Invite burn/rotate is v2.** Single-use is a convention today: nothing stops a second connection

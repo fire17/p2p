@@ -314,8 +314,8 @@
 
     <ul class="facts" style="margin-top:18px">
       <li><b>No backend of ours</b> Discovery rides public WebSocket trackers; the media path is a WebRTC DataChannel when it can be, and a zero-dependency <b>WSS relay</b> when it can’t. Whichever completes the verified handshake first wins.</li>
-      <li><b>Deep link</b> <code>p2p.akeyo.io/app/#&lt;KEY&gt;</code> opens the app with that peer’s key already filled in.</li>
-      <li><b>Honest limits</b> The browser UI is <b>1:1 chat</b> today — the group engine runs in the browser and is covered by tests, but there’s no group UI yet. <a href="#invites">Private invites</a> are terminal-only: the web client dials reusable keys.</li>
+      <li><b>Pair and group chat</b> Paste a key to chat 1:1 with a browser <em>or</em> a terminal peer — or open the <b>Group chat</b> tab, create a group from a list of keys, and share the group code. Two real browsers driving those buttons is an acceptance test we run.</li>
+      <li><b>Honest limit</b> <a href="#invites">Private invites</a> are terminal-only: the web client dials reusable 26-char keys, not <code>S-…</code> share strings.</li>
     </ul>
     <p class="note">A browser needs <code>https://</code> (or <code>localhost</code>) — WebCrypto and honest security both
       want a secure context.</p>
