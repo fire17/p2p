@@ -21,6 +21,13 @@ import { fileURLToPath } from 'node:url'
 import { join, dirname, extname, normalize } from 'node:path'
 import { identity as nodeIdentity, listen as nodeListen } from '../src/node.js'
 import * as wss from '../src/transport-wss.js'
+import { skipLiveScript } from './live-gate.mjs'
+
+// This harness stands up a REAL WSS endpoint on the REAL public brokers (wss.createEndpoint({S}) with
+// the global WebSocket). `node --test` auto-runs every .mjs under test/, so without this it would dial
+// them on every plain test run. It only LOOKED safe: the playwright import below exits early when
+// playwright is absent — an accident of this machine's setup, not a gate.
+if (skipLiveScript('browser-tui-e2e.mjs')) process.exit(0)
 
 let chromium
 try {

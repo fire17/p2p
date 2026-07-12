@@ -20,6 +20,12 @@ import { join, dirname, extname, normalize } from 'node:path'
 import { identity as nodeIdentity, listen as nodeListen } from '../src/node.js'
 import { createSecureGroup } from '../src/group.js'
 import * as wss from '../src/transport-wss.js'
+import { skipLiveScript } from './live-gate.mjs'
+
+// Real WSS endpoints on the REAL public brokers (wss.createEndpoint({S}) with the global WebSocket),
+// and `node --test` auto-runs every .mjs under test/. The playwright import below is not a gate — it
+// exits early only because playwright happens to be absent here. This is.
+if (skipLiveScript('browser-group-tui.mjs')) process.exit(0)
 
 let chromium
 try {
