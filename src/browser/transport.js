@@ -19,6 +19,62 @@
 import { createBrowserTransport } from './webrtc.js'
 
 /**
+ * Compose several transport punches into ONE socket that races to first PEER CONTACT, not first
+ * socket. Each attempt is a Promise resolving to a sub-socket (or rejecting). The returned composite
+ * forwards inbound frames from EVERY sub-socket to node.js and LOCKS its outbound to whichever
+ * transport delivered the first inbound frame (the peer's HELLO). Exported for direct testing.
+ * @param {Array<Promise<object>>} attempts  punch promises (sub-socket or reject)
+ * @returns {Promise<object>} the composite socket (resolves once ≥1 leg is up; rejects if all fail)
+ */
+export function composePunch(attempts) {
+  if (!attempts.length) return Promise.reject(new Error('raced transport: no usable candidate'))
+  const wrapped = attempts.map((a) => a.then((s) => ({ s })).catch((e) => ({ e })))
+  const subs = []
+  let nodeHandler = null
+  let outbound = null
+  const composite = {
+    closed: false,
+    rinfo: { address: 'raced', port: 0 },
+    set onMessage(fn) { nodeHandler = typeof fn === 'function' ? fn : null },
+    get onMessage() { return nodeHandler },
+    send(frame) {
+      const targets = outbound ? [outbound] : subs
+      for (const s of targets) { try { s.send(frame) } catch { /* dead leg */ } }
+    },
+    close() {
+      composite.closed = true
+      for (const s of subs) { try { s.close() } catch { /* */ } }
+    },
+  }
+  const wire = (s) => {
+    if (subs.includes(s)) return
+    subs.push(s)
+    s.onMessage = (buf, ri) => {
+      if (!outbound) outbound = s // first peer contact wins the outbound lock
+      if (nodeHandler) nodeHandler(buf, ri)
+    }
+  }
+  return new Promise((resolve, reject) => {
+    let pending = wrapped.length
+    let resolved = false
+    const errs = []
+    for (const a of wrapped) {
+      a.then(({ s, e }) => {
+        if (s) {
+          wire(s)
+          if (!resolved) { resolved = true; resolve(composite) }
+        } else if (e) {
+          errs.push(e)
+        }
+        if (--pending === 0 && !resolved) {
+          reject(new Error('raced transport: all paths failed (' + errs.map((x) => x && x.message).join('; ') + ')'))
+        }
+      })
+    }
+  })
+}
+
+/**
  * @param {object} [opts] {trackers, iceServers, relays, RTCPeerConnection, WebSocket, now,
  *                          wss?:boolean(default true), webrtc?:boolean(default true)}
  * @returns {Promise<{createEndpoint:Function, publishAll:Function, resolve:Function, close:Function}>}
@@ -61,22 +117,26 @@ export async function createRacedTransport(opts = {}) {
     },
 
     /**
-     * Race a dial across whichever transports have a matching candidate. node.js hands us the
-     * merged candidate list from resolve(); we split by kind, punch each in parallel, first
-     * settled socket wins and the losers are dropped. (node.js runs the Noise handshake over the
-     * winner; a lost punch just leaves an idle socket that gets GC'd / closed on node.close.)
+     * Race a dial across whichever transports have a matching candidate — correctly. node.js hands
+     * us the merged candidate list; we punch each kind in parallel. The naive "first socket to
+     * resolve wins" is WRONG: the WSS punch resolves OPTIMISTICALLY (on a tracker SUBACK, before any
+     * peer answers), so it would always beat WebRTC and starve a peer that is only reachable over
+     * WebRTC (e.g. a Node/werift peer not on the relay) — the dial then hangs waiting for a HELLO
+     * that never comes on the wrong pipe.
+     *
+     * So we return a COMPOSITE socket that fronts every sub-socket: it forwards inbound frames from
+     * ALL of them to node.js, and LOCKS its outbound to whichever transport delivered the first
+     * inbound frame (the peer's HELLO). Since the peer only ever answers on the transport it is
+     * actually reachable on, the handshake naturally proceeds over that one; the other leg stays
+     * silent and is closed. This races to first real PEER CONTACT, not first socket.
      */
     punch(cands, popts = {}) {
-      const attempts = []
       const webrtcCands = cands.filter((c) => c && (c.channel === 'webrtc' || c.s))
       const wssCands = cands.filter((c) => c && c.proto === 'wss')
+      const attempts = []
       if (webrtcEndpoint && webrtcCands.length) attempts.push(webrtcEndpoint.punch(webrtcCands, popts))
       if (wssEndpoint && wssCands.length) attempts.push(wssEndpoint.punch(wssCands, popts))
-      if (!attempts.length) return Promise.reject(new Error('raced transport: no usable candidate'))
-      // Promise.any → first transport to produce a live socket wins; reject only if ALL fail.
-      return Promise.any(attempts).catch((e) => {
-        throw new Error('raced transport: all paths failed (' + (e.errors || []).map((x) => x.message).join('; ') + ')')
-      })
+      return composePunch(attempts)
     },
 
     close() {

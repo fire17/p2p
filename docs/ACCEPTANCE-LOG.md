@@ -371,3 +371,32 @@ imports that would throw in a browser).
 delivers browser↔TUI without it, at the cost of relayed latency); P3 sender-keys groups
 (browser-build); the two-real-networks run (the WSS relay traverses NAT by construction, so this path
 is inherently network-independent — unlike the UDP path's XNET gate).
+
+### 🌐 BROWSER CLIENT — WERIFT DIRECT GATE (Chromium ↔ Node/werift over a real RTCDataChannel), VERIFIED (2026-07-12)
+
+The OPTIONAL direct browser↔TUI P2P path (owner chose BOTH). browser-build ran **my** `src/browser/webrtc.js`
+on the Node side with werift 0.23.0's RTCPeerConnection injected — ONE signaling implementation, one
+tracker protocol, two runtimes (the transport-swap principle applied to the interop gate itself). A real
+Chromium then dialed that live Node/werift peer over the public WSS trackers:
+
+```
+BROWSER key = 0XGWBPFY2DWK2S08QCGNPSBT32
+DIALING werift Node peer: 0DRW1GTDMBD3P0K6WE3M7J49D0
+✔ VERIFIED Noise IK first-ack over the werift DataChannel in 6.0s
+  ✅ secure channel established with 0DRW1GTD… — verified, no MITM
+  RECV: "hello from the TUI — werift DataChannel, Noise IK on top"
+  SENT: "hello from the BROWSER — Chromium ↔ werift, Noise IK verified"
+```
+
+So browser↔TUI now has BOTH paths proven: the zero-dep WSS relay (above) AND direct WebRTC P2P. Chromium
+and Node speak the SAME signaling code against the SAME public trackers — the strongest possible interop
+witness.
+
+**Real bug this gate caught + fixed** (`src/browser/transport.js`): the raced transport used `Promise.any`
+on the two punches, but the WSS punch resolves OPTIMISTICALLY (on a tracker SUBACK, before any peer
+answers) — so it always beat WebRTC and starved a peer reachable only over WebRTC (the werift node isn't
+on the relay), hanging the dial on the wrong pipe. Fixed with `composePunch()`: a composite socket that
+forwards inbound from EVERY leg and locks its outbound to whichever leg delivers the first frame (the
+peer's HELLO) — racing to first PEER CONTACT, not first socket. Deterministic guard:
+`test/browser-raced-transport.test.js` (5 cases). Regression: browser↔browser + browser↔TUI(relay) still
+green; **156/156 deterministic.**
