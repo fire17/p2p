@@ -3,10 +3,12 @@
 > Tiny, zero-dependency P2P chat framework. One 26-char key is your whole contact
 > surface — copy it to a friend, they find you and message you: direct, E2E-encrypted,
 > **provably MITM-proof on first contact**, through NAT, with **no coordinator server of
-> ours**. Embed it as the messaging backbone of any project.
+> ours**. Runs in a terminal *and* in a browser tab. Embed it as the messaging backbone of
+> any project.
 
-**Status: v0.1 in active build.** See `DESIGN.md` for the full protocol and `docs/` for the
-premortem, interfaces, and API. This README fills in as modules land + verify.
+**Status: v0.2 — shipped surfaces:** terminal (TUI + CLI), browser client, private one-time
+invites, sender-key groups, zero-dep WSS relay + WebRTC. `DESIGN.md` has the protocol,
+`docs/` the interfaces and the acceptance log, `research/` the studies behind each design call.
 
 ## Why
 
@@ -16,53 +18,142 @@ premortem, interfaces, and API. This README fills in as modules land + verify.
   BitTorrent Mainline DHT, public WebSocket trackers); we operate none of it.
 - **MITM-proof first contact** — the 26-char key commits to your identity keys; the first
   ack a peer decrypts is a cryptographic proof no man-in-the-middle is present.
-- **Small** — the whole thing targets ~2.5–3.5k LOC.
+- **One protocol, two runtimes** — the browser client loads *the same source files* the
+  terminal runs (`key.js`, `noise.js`, `wire.js`, `node.js`, `group.js`), so a browser tab and
+  a terminal are the same peer to each other.
 
-## Quickstart
+---
 
-```js
-import { identity, listen } from '@fire17/p2p'
+# Play with everything
 
-// Machine A
-const me = await identity()          // { S: "5J8K…26 chars", ... }  ← share me.S
-const node = await listen(me)
-node.on('message', (peer, data) => console.log(data.toString()))   // (peer, data)
+Four surfaces, in the order they take to try. Everything below is shipped and tested; the
+honest limits of each are stated inline, not buried.
 
-// Machine B (holds A's key string)
-const node = await listen(await identity())
-const peer = await node.connect('5J8K…')   // resolves only after the MITM-proof handshake
-await peer.send('hey')                        // realtime, ordered, encrypted
+## 1. The terminal (TUI + CLI)
+
+```sh
+curl -fsSL https://p2p.akeyo.io/init | sh          # macOS / Linux
+irm https://p2p.akeyo.io/init.ps1 | iex            # Windows
 ```
 
-`identity()` is async and returns `{ S, edPub, edPriv, xPub, xPriv }` — `S` is the 26-char
-key string you share. The `message` event is `(peer, data)`. (Or just use the CLI: `p2p`.)
-
-For a **private, one-time invite** instead of your reusable key, pass the invite secret to
-`listen()` and hand the peer the share string — `connect()` takes either form:
-
-```js
-import { generateInviteSecret, formatShare, INVITE_FLAG } from '@fire17/p2p/invite'
-import { encodeKey } from '@fire17/p2p/key'
-
-// the inviter
-const secret = generateInviteSecret()                              // 128-bit K_inv — for ONE invitee
-const node = await listen(me, { invite: secret })                  // presence sealed under K_inv
-const share = formatShare(encodeKey(me.edPub, me.xPub, INVITE_FLAG), secret)   // "S-XXXX…", send out of band
-
-// the invitee (holds the share string)
-const peer = await node.connect(share)                             // sealed lookup + Noise IKpsk2
+```sh
+p2p                       # the TUI: go online, show your key, chat          [default]
+p2p key                   # print your stable key (--new rotates it)
+p2p connect <KEY|name>    # dial a 26-char key, or a saved friend by name
+p2p <KEY>                 # same, straight into the TUI
+p2p invite                # mint a ONE-TIME private invite + listen for it   (see §3)
+p2p friends               # everyone you've connected with — reconnect by name
+p2p doctor                # can the free infra see you? (STUN / DHT / trackers)
+p2p chat [KEY]            # line-mode chat (scriptable / pipeable, no full screen)
+p2p --selftest            # two in-process nodes end-to-end — proves the plumbing
 ```
 
-See **Private invites** below for exactly what this hides (and what it doesn't).
+**The 60-second demo.** On machine A run `p2p` and copy the key from the box. On machine B run
+`p2p <that key>`. B prints `✅ secure channel established — verified, no MITM` — that line is a
+proof, not a hope (§ *Why the first ack proves nobody is in the middle*). Type; it arrives.
 
-CLI demo: `npx p2p-chat` (generates a key on one machine, `p2p-chat <key>` connects from another).
+Your identity is stable across restarts (`~/.p2p/<profile>.json`, mode 0600). Everyone you
+connect with is saved to a friends list, so later it's just `p2p connect <name>`.
+`--ephemeral` gives you a throwaway identity; `--profile <name>` keeps a separate one.
 
-## How it works — the whole magic
+## 2. The web client — no install
+
+**→ Try it in your browser: [p2p.akeyo.io/app/](https://p2p.akeyo.io/app/)**
+
+Open the tab, share your key, chat. It is not a demo or a re-implementation: the browser loads
+the *same* `key.js` / `noise.js` / `wire.js` / `node.js` the terminal runs, over a small
+`node:crypto` → WebCrypto shim. Same key format, same commitment gate, same Noise IK handshake,
+same MITM proof — so **a browser tab and a terminal can chat to each other** (that pairing is a
+gate we run, not a claim we make).
+
+- **No install, no backend of ours.** Discovery goes over public WebSocket trackers; the media
+  path is a WebRTC DataChannel when it can be, and a zero-dependency **WSS relay** when it
+  can't. Whichever completes the verified handshake first wins.
+- **Deep link:** `p2p.akeyo.io/app/#<KEY>` opens the app with that peer's key prefilled.
+- **Honest limits (today):** the browser UI is **1:1 chat** — the group engine runs in the
+  browser and is covered by tests, but there is no group UI yet. And **private invites (§3) are
+  terminal-only**: the web client dials reusable keys, not `S-…` share strings.
+- A browser needs `https://` (or `localhost`): WebCrypto and honest security both want a secure
+  context.
+
+## 3. Private invites — metadata privacy (terminal)
+
+Your reusable key `S` is a *public* contact string: anyone holding it can look up **where** you
+are, and the record it points at carries your candidate ip:ports **in the clear**. A one-time
+invite removes exactly that exposure.
+
+```sh
+p2p invite                          # prints  S-XXXXXXXX…   (your key + a per-invite secret)
+p2p connect GK0RN…7NS-YAFPE…KJ29    # the invitee dials the whole string
+```
+
+`p2p invite` mints a fresh 128-bit secret `K_inv` and publishes your presence under *it*. Where
+you are published, what the record says, and who may complete the handshake are all then derived
+from `K_inv` (`research/metadata-privacy.md`):
+
+| | reusable key `S` | one-time invite |
+|---|---|---|
+| **Where** you're published | `HKDF(S, …)` — any `S` holder can find it | `HKDF(K_inv, …)` — **non-holders can't even locate it** |
+| **What** the record says | your ip:ports, in plaintext | AEAD-sealed under `HKDF(K_inv,"ip")`, padded to a fixed size — an opaque, constant-length ciphertext |
+| **Who** can handshake | anyone holding `S` (Noise `IK`) | only the invitee (Noise `IKpsk2`, `psk = HKDF(K_inv,"psk")`) |
+
+**Your IP is never in the clear on any public channel** in invite mode — not to a DHT node, not
+to a tracker operator, not to a passive observer.
+
+**Honest boundaries — what invites do NOT do (yet):**
+
+- **The peer you connect to still sees your IP.** Invites hide your address from the
+  *infrastructure* and from non-invitees — not from the person you're talking to. Hiding it from
+  the peer needs an onion transport (v3; researched, not built).
+- **Burn/rotate is v2, not built.** The invite is single-use *by convention*: nothing yet stops a
+  second connection with the same string, and `K_inv` is not retired after first contact.
+- **The invite lives only while the process runs.** It's never written to disk — quit and it's
+  gone. Mint one per person.
+- **On the LAN, mDNS still broadcasts candidates in plaintext** (under the unlinkable invite id).
+  Anyone on your LAN can see your IP by being on your LAN; the sealing protects the *public*
+  channels — DHT and trackers.
+- **While you're listening for an invite, ordinary `S` dials are refused** — the node runs
+  `IKpsk2` only. That exclusivity is *what makes* "only the invitee can complete the handshake"
+  true. Go back to `p2p` for normal reachability.
+
+The reusable-`S` path is **byte-for-byte unchanged** when no invite is in play.
+
+## 4. Groups (>2) — the library
+
+Groups are a library feature (no CLI verb yet). Two flavours:
+
+```js
+node.group([keyA, keyB, keyC]).send('hi all')     // pairwise fan-out: one authenticated link per member
+```
+
+```js
+import { createSecureGroup } from './src/group.js'               // see the note below
+const g = createSecureGroup(node, me, { secret, create: true })  // sender-key E2E group
+await g.join()
+g.on('message', (from, data) => console.log(from, data.toString()))
+await g.send('hi all')                                           // ONE ciphertext, fanned to n
+```
+
+The secure group encrypts **once** per message under a sender key, fans the ciphertext out, and
+signs it — so a member **cannot forge another member's authorship**. A member who can't be
+reached directly is **blind-relayed** through another member (the relay can't read it). Removing
+a member is **cryptographic**: rotate, and the removed member decrypts nothing afterwards. Join
+order doesn't matter. Every one of those properties is a test in `test/group-secure.test.js`,
+and the browser runs this same `group.js` unchanged.
+
+> **Known gap (v0.2):** `node.group()` is reachable from the published package, but
+> `createSecureGroup` is **not** — the package export map exposes `.`, `./invite` and `./key`, so
+> the sender-key group is usable from a checkout (and inside the browser build) but not yet via a
+> `@fire17/p2p/group` import. Adding that subpath is a one-line change and is queued.
+
+---
+
+# How it works — the whole magic
 
 The hard question p2p answers: **how do two computers on different networks find each other
-and talk directly, with no server of ours in the middle?** Three ideas stacked.
+and talk directly, with no server of ours in the middle?**
 
-### 1. Your key is your identity
+## 1. Your key is your identity
 
 The 26-char key you share is not random — it's a **fingerprint of your public keys**:
 
@@ -72,7 +163,7 @@ The 26-char key you share is not random — it's a **fingerprint of your public 
 │ version 5b │ commitment 110b                   │ checksum 15b │
 │            │ = first 110 bits of               │ (catches     │
 │ crypto     │   SHA-256(edPubkey ‖ xPubkey)     │  typos       │
-│ agility    │   → binds you to your keypairs     │  offline)    │
+│ agility    │   → binds you to your keypairs    │  offline)    │
 └────────────┴───────────────────────────────────┴──────────────┘
 ```
 
@@ -80,19 +171,18 @@ So the string simultaneously **names you** and lets a friend **verify** it's rea
 nobody can mint a string that points at your identity but is secretly theirs (that would
 need a second-preimage on 110 bits, ~2¹¹⁰ work).
 
-### 2. Discovery without a server — a shared secret meeting-point on infra that already exists
+## 2. Discovery without a server
 
 Both peers hash the key the same way to get an identical **rendezvous id** — a secret
 meeting-point only holders can compute (`rid = HKDF(key, epoch)`). Then they leave a note at
-that id on **free public infrastructure we don't run** — the note is only ever an opaque hash
-+ an IP address, never your identity or messages.
+that id on **free public infrastructure we don't run**.
 
 ```mermaid
 flowchart LR
   K["your 26-char key"] -->|"HKDF(key, today)"| R["rendezvous id<br/>(secret, only holders can derive)"]
   R --> M["mDNS<br/>(same Wi-Fi)"]
   R --> D["BitTorrent<br/>Mainline DHT<br/>(the internet)"]
-  R --> T["WebSocket<br/>trackers<br/>(the internet)"]
+  R --> T["WebSocket<br/>trackers<br/>(internet + browsers)"]
   M --> C["your friend gets<br/>your IP:port candidates"]
   D --> C
   T --> C
@@ -102,15 +192,15 @@ flowchart LR
 ```
 
 We publish to all three at once and race the reads. **mDNS** covers the same network; the
-**BitTorrent DHT** and **WebSocket trackers** are two independent internet paths (millions of
-existing nodes / community servers) — we're just guests, using their normal "announce / find"
-under our secret id. No coordinator of ours, and no single point of failure.
+**BitTorrent DHT** and **WebSocket trackers** are two independent internet paths — we're guests,
+using their normal "announce / find" under our secret id. In **invite mode** that id comes from
+`K_inv` instead, and the note itself is sealed (§3).
 
-### 3. NAT traversal — punch a hole, no relay
+## 3. NAT traversal — punch a hole, no relay
 
-Now each side knows the other's public IP. Home routers (NAT) drop unexpected packets, so both
-peers fire a UDP packet at each other **at the same instant** — the outbound packet props your
-own firewall open just long enough for the reply to get in. Both open at once → a direct path.
+Home routers drop unexpected packets, so both peers fire a UDP packet at each other **at the
+same instant** — the outbound packet props your own firewall open just long enough for the reply
+to get in.
 
 ```mermaid
 sequenceDiagram
@@ -127,13 +217,14 @@ sequenceDiagram
   Note over A,B: both firewalls now open → direct link
 ```
 
-~70–90% of pairs connect directly (STUN → hole-punch); the ladder falls back IPv6 → LAN →
-punch → TCP simultaneous-open → relay-through-a-mutual-peer when a network is stubborn.
+Most pairs connect directly (STUN → hole-punch). The ladder falls back IPv6 → LAN → punch →
+TCP simultaneous-open, and in the browser: **WebRTC DataChannel → WSS relay** as the floor. The
+relay carries only ciphertext — it is a postbox, never a party to the handshake.
 
-### 4. The MITM-proof first contact — the first ack is a cryptographic proof
+## 4. The MITM-proof first contact
 
-Once connected, your friend fetches your public keys over the punched path, checks they hash
-to the fingerprint **inside your key**, then runs a standard **Noise IK** handshake:
+Your friend fetches your public keys over the punched path, checks they hash to the fingerprint
+**inside your key**, then runs a standard **Noise IK** handshake:
 
 ```mermaid
 sequenceDiagram
@@ -146,96 +237,75 @@ sequenceDiagram
   Note over B: decrypts only if A holds A's private key<br/>⇒ provably no man-in-the-middle
 ```
 
-The first message your friend can **decrypt** could only be produced by the holder of your
-real private key. An impostor who intercepted everything but lacks it can never produce it —
-so `✅ secure channel established — verified, no MITM` is a proof, not a hope. After that it's
-a direct, ChaCha20-Poly1305-encrypted UDP link (ordered, retransmitted on loss).
+The first message your friend can **decrypt** could only be produced by the holder of your real
+private key. An impostor who intercepted everything but lacks it can never produce it — so
+`✅ secure channel established — verified, no MITM` is a proof. In invite mode the same handshake
+runs as `IKpsk2`, which additionally proves the *dialer* is the one invitee.
 
-### 5. Every path — staying connected
+## 5. Staying connected
 
 Keepalives hold the NAT mapping open; if a peer goes silent past a liveness window the node
-fires `disconnect`. Reconnecting redials and replays any buffered messages **exactly-once**
-(each side carries a per-process instance nonce so a restarted peer's fresh message numbers
-aren't mistaken for duplicates). Friends you've connected with are saved to
-`~/.p2p/friends.json`, so you can `p2p connect <name>` them again anytime.
+fires `disconnect`. Reconnecting redials and replays buffered messages **exactly-once** (each
+side carries a per-process instance nonce, so a restarted peer's fresh message numbers aren't
+mistaken for duplicates).
 
-### 6. The stack (zero dependencies)
+## 6. The stack (zero dependencies)
 
-`key` (identity + gate) · `noise` (Noise IK, in-house, KAT-verified) · `wire` (framing +
-sliding-window ARQ + keepalive) · `transport` (STUN + ICE-lite punch) · `rendezvous`
-(mDNS + DHT + tracker) · `node` (the public API). ~4k LOC, Node built-ins only, `deps: {}`.
+`key` (identity + gate) · `noise` (Noise IK / IKpsk2, in-house, KAT-verified) · `wire` (framing +
+sliding-window ARQ + keepalive) · `transport` (STUN + ICE-lite punch · WSS relay · WebRTC) ·
+`rendezvous` (mDNS + DHT + trackers) · `invite` (one-time `K_inv`) · `group` (sender keys) ·
+`node` (the public API). Node built-ins only, `dependencies: {}`.
 
-## Install
+---
 
-```sh
-curl -fsSL https://p2p.akeyo.io/init | sh          # macOS / Linux
-irm https://p2p.akeyo.io/init.ps1 | iex            # Windows
+# Library
+
+```js
+import { identity, listen } from '@fire17/p2p'
+
+const me = await identity()                       // { S: "5J8K…26 chars", ... }  ← share me.S
+const node = await listen(me)
+node.on('message', (peer, data) => console.log(data.toString()))
+
+const peer = await node.connect('5J8K…')          // resolves only after the MITM-proof handshake
+await peer.send('hey')                            // ordered, exactly-once, encrypted
 ```
 
-Then `p2p` for the full-screen chat, or `p2p key` to see your key. Full technical walkthrough
-with diagrams: **https://p2p.akeyo.io**
+`send()` resolves on the peer's ack and **rejects** on a permanent error (e.g. a payload past the
+wire budget — `peer.maxMessage`); it never hangs. Events: `peer`, `message`, `ack`, `reconnect`,
+`disconnect`, `divergence`.
 
-```sh
-p2p                       # TUI: listen + chat
-p2p connect <KEY|SHARE>   # dial a 26-char key, or a one-time invite share string
-p2p <KEY|SHARE>           # same, straight into the TUI
-p2p invite                # mint a ONE-TIME private invite, print it, and listen for it
-p2p friends               # everyone you've connected with (reconnect by name)
-p2p key [--new]           # your stable key (--new rotates it)
-p2p doctor                # rendezvous reachability
+**Private invite (library):**
+
+```js
+import { generateInviteSecret, formatShare, INVITE_FLAG } from '@fire17/p2p/invite'
+import { encodeKey } from '@fire17/p2p/key'
+
+const secret = generateInviteSecret()                                        // 128-bit K_inv, ONE invitee
+const node = await listen(me, { invite: secret })                            // presence sealed under K_inv
+const share = formatShare(encodeKey(me.edPub, me.xPub, INVITE_FLAG), secret) // "S-XXXX…" — send out of band
+
+// the invitee:
+const peer = await node.connect(share)                                       // sealed lookup + Noise IKpsk2
 ```
 
-## Private invites (metadata privacy)
+# Security in one paragraph
 
-Your reusable key `S` is a *public* contact string: anyone holding it can look up where you
-are, and the rendezvous record it points at carries your candidate ip:ports in the clear.
-A **one-time invite** removes exactly that exposure.
+Your key = `version ‖ 110-bit commitment to (Ed25519, X25519) pubkeys ‖ checksum`, in Crockford
+base32. A contacting peer fetches your candidate keys over the rendezvous channel, gates them
+against the commitment (2¹¹⁰ second-preimage), then runs Noise `IK` — so the very first message it
+can decrypt proves it's talking to the holder of your private key, not a relay or a MITM.
+Rendezvous topics are `HKDF(key, …)`, so channel operators can't enumerate or read; with a one-time
+invite they can't even locate you, and your IP is never plaintext on public infra. Full threat model
+and honest residual risks (session-granular forward secrecy, TOFU on the initiator direction for a
+reusable key, the peer still learning your IP): `research/crypto-firstcontact.md`,
+`research/metadata-privacy.md`, `DESIGN.md §3`.
 
-```sh
-p2p invite                                   # prints  S-XXXXXXXX…  (key + a per-invite secret)
-p2p connect GK0RN…7NS-YAFPE…KJ29             # the invitee dials the whole string
-```
+# Changelog
 
-`p2p invite` mints a fresh 128-bit secret `K_inv`, hands it to you inside the share string, and
-publishes your presence under it. Everything that decides *where* you are published, *what* the
-record says, and *who* may complete the handshake is then derived from `K_inv`
-(`research/metadata-privacy.md`):
+Every release, with its honest gaps: [`CHANGELOG.md`](CHANGELOG.md). Live verification evidence —
+the actual run logs behind each claim — lives in [`docs/ACCEPTANCE-LOG.md`](docs/ACCEPTANCE-LOG.md).
 
-- **Location** — the rendezvous id is `HKDF(K_inv, …)`, not `HKDF(S, …)`. Someone holding only your
-  reusable `S` cannot even find the record.
-- **Content** — candidates are AEAD-sealed under `HKDF(K_inv,"ip")` and padded to a fixed length, so
-  a DHT/tracker operator or a passive observer sees an opaque, constant-size ciphertext. **Your IP is
-  never in the clear on any public channel.**
-- **Handshake** — Noise upgrades from `IK` to `IKpsk2` with `psk = HKDF(K_inv,"psk")`. Someone who
-  learns your IP anyway *still* cannot complete the handshake without the invite.
-
-**Honest boundaries — what this does NOT do (yet):**
-
-- **The peer you connect to still sees your IP.** Invites hide your address from the *infrastructure*
-  and from non-invitees, not from the person you're talking to. (Hiding it from the peer needs an
-  onion transport — v3, not built.)
-- **Burn/rotate is v2, not built.** The invite is single-use *by convention* — nothing yet stops a
-  second connection with the same string, and the secret is not retired after first contact.
-- **The invite lives only while the process runs.** It is never written to disk; quit and it's gone.
-  Mint a new one per person.
-- **On the LAN, mDNS still broadcasts candidates in plaintext** (under the unlinkable invite id).
-  Local observers already see your traffic; the sealing protects the *public* channels (DHT, trackers).
-- **While listening for an invite, ordinary `S` dials are refused** — the node runs `IKpsk2` only, so
-  a friend with just your reusable key can't reach you until you go back to `p2p listen`/`p2p`.
-
-The reusable-`S` path is byte-for-byte unchanged when no invite is in play.
-
-## Security in one paragraph
-
-Your key = `version ‖ 110-bit commitment to (Ed25519, X25519) pubkeys ‖ checksum`, in
-Crockford base32. A contacting peer fetches your candidate keys over the rendezvous
-channel, gates them against the commitment (2¹¹⁰ second-preimage), then runs a Noise `IK`
-handshake — so the very first message it can decrypt proves it's talking to the holder of
-your private key, not a relay or a MITM. Rendezvous topics are `HKDF(key, …)`, so channel
-operators can't enumerate or read. Full threat model + honest residual risks (session-granular
-forward secrecy, TOFU on the initiator direction with a single published key, metadata to
-relays): `research/crypto-firstcontact.md` and `DESIGN.md §3`.
-
-## License
+# License
 
 MIT.

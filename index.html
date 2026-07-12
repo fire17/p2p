@@ -144,6 +144,29 @@
     display:grid;place-items:center;font-size:.74rem;font-weight:700;color:var(--accent);
     background:color-mix(in srgb,var(--accent) 14%, transparent);border:1px solid color-mix(in srgb,var(--accent) 35%, transparent)}
   h3{font-size:.78rem;text-transform:uppercase;letter-spacing:.13em;color:var(--dim);margin:0 0 12px;font-weight:650}
+
+  /* CTA buttons (browser client / install) */
+  .ctarow{display:flex;flex-wrap:wrap;gap:12px;margin:24px 0 4px}
+  .cta{display:inline-block;text-decoration:none;font-weight:650;font-size:.94rem;padding:11px 20px;border-radius:12px;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04262b;border:1px solid transparent;
+    box-shadow:var(--shadow)}
+  .cta:hover{filter:brightness(1.08)}
+  .cta.ghost{background:transparent;color:var(--fg);border-color:var(--line);box-shadow:none}
+  .cta.ghost:hover{border-color:var(--accent);color:var(--accent);filter:none}
+
+  /* code block WITHOUT the shell "$" prefix that .cmd adds (used for JS + multi-line shell) */
+  .codeblock{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:14px 16px;overflow-x:auto}
+  .codeblock pre{margin:0;font-family:var(--mono);font-size:.84rem;color:var(--codefg);white-space:pre;line-height:1.7}
+  .codeblock .c{color:var(--faint)}
+
+  .dimtag{color:var(--faint);font-size:.76rem;border:1px solid var(--line);border-radius:999px;padding:0 7px;margin-left:6px}
+  .card.warn{border-color:color-mix(in srgb,var(--warn) 45%, var(--line))}
+  .card.warn h3{color:var(--warn)}
+  .bounds{margin:0;padding:0 0 0 18px;list-style:none}
+  .bounds li{position:relative;padding-left:6px;margin-bottom:10px;color:var(--dim);font-size:.9rem}
+  .bounds li::before{content:"—";position:absolute;left:-14px;color:var(--warn)}
+  .bounds b{color:var(--fg);font-weight:620}
+
   table{width:100%;border-collapse:collapse;font-size:.88rem;margin:18px 0 0}
   th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);color:var(--dim);vertical-align:top}
   th{color:var(--faint);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.09em}
@@ -192,12 +215,14 @@
     </a>
     <div class="navlinks">
       <a href="#what">What</a>
+      <a href="#play">Play</a>
+      <a href="#web">Browser</a>
+      <a href="#invites">Invites</a>
+      <a href="#groups">Groups</a>
       <a href="#key">The key</a>
       <a href="#discovery">Discovery</a>
       <a href="#nat">NAT</a>
       <a href="#handshake">Handshake</a>
-      <a href="#paths">Every path</a>
-      <a href="#stack">Stack</a>
       <a href="#install">Install</a>
     </div>
     <a class="gh" href="https://github.com/fire17/p2p">GitHub ↗</a>
@@ -232,14 +257,134 @@
       <li><b>MITM-proof</b> Your key <em>is</em> a fingerprint of your public keys. The first message a peer can decrypt is a cryptographic proof it reached the real you.</li>
       <li><b>Zero deps</b> Node built-ins only — X25519, Ed25519, ChaCha20-Poly1305, HKDF, UDP/TCP. ~3.1k lines. Nothing to audit but us.</li>
     </ul>
+    <div class="ctarow">
+      <a class="cta" href="https://p2p.akeyo.io/app/">Try it in your browser →</a>
+      <a class="cta ghost" href="#install">Install the terminal app</a>
+    </div>
+    <p class="note">No install, no account, no backend of ours — the browser tab runs the same protocol source
+      the terminal runs, so a tab and a terminal can chat to each other.</p>
+
     <p style="margin-top:26px">This page explains the whole thing — including the part that sounds impossible:
       <strong>how two computers behind two home routers find each other and talk, with nobody in the middle
-      to introduce them.</strong></p>
+      to introduce them.</strong> And <a href="#play">how to play with every part of it</a>.</p>
+  </section>
+
+  <!-- 1b. PLAY WITH EVERYTHING -->
+  <section id="play">
+    <p class="kicker">01 — play</p>
+    <h2>Play with <em>everything</em></h2>
+    <p>Four surfaces. Everything here is shipped and tested; the limits of each are stated where they apply,
+      not buried.</p>
+
+    <div class="card" style="margin-top:16px">
+      <h3>The terminal — every command</h3>
+      <table class="cmds">
+        <tr><td><code>p2p</code></td><td>the TUI: go online, show your key, chat <span class="dimtag">default</span></td></tr>
+        <tr><td><code>p2p key</code></td><td>print your stable key (<code>--new</code> rotates it)</td></tr>
+        <tr><td><code>p2p connect &lt;KEY|name&gt;</code></td><td>dial a 26-char key, or a saved friend by name</td></tr>
+        <tr><td><code>p2p &lt;KEY&gt;</code></td><td>same, straight into the TUI</td></tr>
+        <tr><td><code>p2p invite</code></td><td>mint a <b>one-time private invite</b> and listen for it — <a href="#invites">§ invites</a></td></tr>
+        <tr><td><code>p2p friends</code></td><td>everyone you’ve connected with — reconnect by name</td></tr>
+        <tr><td><code>p2p doctor</code></td><td>can the free infra see you? (STUN / DHT / trackers)</td></tr>
+        <tr><td><code>p2p chat [KEY]</code></td><td>line-mode chat — scriptable, pipeable, no full screen</td></tr>
+        <tr><td><code>p2p --selftest</code></td><td>two in-process nodes end-to-end — proves the plumbing</td></tr>
+      </table>
+      <p class="note" style="margin-top:12px"><b>The 60-second demo:</b> on machine A run <code>p2p</code> and copy the key
+        from the box. On machine B run <code>p2p &lt;that key&gt;</code>. B prints
+        <code>✅ secure channel established — verified, no MITM</code> — that line is a
+        <a href="#handshake">proof, not a hope</a>. Type; it arrives.</p>
+      <p class="note">Your identity is stable across restarts (<code>~/.p2p/&lt;profile&gt;.json</code>, mode <code>0600</code>).
+        <code>--ephemeral</code> gives you a throwaway one; <code>--profile &lt;name&gt;</code> keeps a separate one.</p>
+    </div>
+  </section>
+
+  <!-- 1c. THE WEB CLIENT -->
+  <section id="web">
+    <p class="kicker">02 — no install</p>
+    <h2>The same peer, <em>in a browser tab</em></h2>
+    <p>Open it, share your key, chat. It is not a demo or a re-implementation: the browser loads the
+      <em>same</em> <code>key.js</code> / <code>noise.js</code> / <code>wire.js</code> / <code>node.js</code> the terminal
+      runs, over a small <code>node:crypto</code> → WebCrypto shim. Same key format, same commitment gate, same Noise IK
+      handshake, same MITM proof — so <strong>a browser tab and a terminal can chat to each other</strong>. That pairing is
+      a gate we run, not a claim we make.</p>
+
+    <div class="ctarow">
+      <a class="cta" href="https://p2p.akeyo.io/app/">Open the web client →</a>
+    </div>
+
+    <ul class="facts" style="margin-top:18px">
+      <li><b>No backend of ours</b> Discovery rides public WebSocket trackers; the media path is a WebRTC DataChannel when it can be, and a zero-dependency <b>WSS relay</b> when it can’t. Whichever completes the verified handshake first wins.</li>
+      <li><b>Deep link</b> <code>p2p.akeyo.io/app/#&lt;KEY&gt;</code> opens the app with that peer’s key already filled in.</li>
+      <li><b>Honest limits</b> The browser UI is <b>1:1 chat</b> today — the group engine runs in the browser and is covered by tests, but there’s no group UI yet. <a href="#invites">Private invites</a> are terminal-only: the web client dials reusable keys.</li>
+    </ul>
+    <p class="note">A browser needs <code>https://</code> (or <code>localhost</code>) — WebCrypto and honest security both
+      want a secure context.</p>
+  </section>
+
+  <!-- 1d. PRIVATE INVITES -->
+  <section id="invites">
+    <p class="kicker">03 — metadata privacy</p>
+    <h2>Private <em>one-time invites</em></h2>
+    <p>Your reusable key is a <em>public</em> contact string: anyone holding it can look up <b>where</b> you are, and the
+      record it points at carries your candidate ip:ports <b>in the clear</b>. A one-time invite removes exactly that
+      exposure.</p>
+
+    <div class="card" style="margin-top:16px">
+      <div class="codeblock"><pre>p2p invite                          <span class="c">#  prints  S-XXXXXXXX…   (your key + a per-invite secret)</span>
+p2p connect GK0RN…7NS-YAFPE…KJ29    <span class="c">#  the invitee dials the whole string</span></pre></div>
+    </div>
+
+    <p style="margin-top:18px"><code>p2p invite</code> mints a fresh 128-bit secret <code>K_inv</code> and publishes your
+      presence under <em>it</em>. Where you’re published, what the record says, and who may complete the handshake are then
+      all derived from <code>K_inv</code>:</p>
+
+    <table class="cmp">
+      <tr><th></th><th>reusable key</th><th>one-time invite</th></tr>
+      <tr><td><b>Where</b> you’re published</td><td><code>HKDF(S, …)</code> — any key-holder can find it</td><td><code>HKDF(K_inv, …)</code> — non-holders <b>can’t even locate it</b></td></tr>
+      <tr><td><b>What</b> the record says</td><td>your ip:ports, plaintext</td><td>AEAD-sealed, padded to a fixed size — an opaque, constant-length ciphertext</td></tr>
+      <tr><td><b>Who</b> can handshake</td><td>anyone holding the key (Noise <code>IK</code>)</td><td>only the invitee (Noise <code>IKpsk2</code>)</td></tr>
+    </table>
+
+    <p><strong>Your IP is never in the clear on any public channel</strong> in invite mode — not to a DHT node, not to a
+      tracker operator, not to a passive observer.</p>
+
+    <div class="card warn" style="margin-top:16px">
+      <h3>Honest boundaries — what invites do <em>not</em> do (yet)</h3>
+      <ul class="bounds">
+        <li><b>The peer you connect to still sees your IP.</b> Invites hide your address from the <em>infrastructure</em> and from non-invitees — not from the person you’re talking to. Hiding it from the peer needs an onion transport (v3: researched, not built).</li>
+        <li><b>Burn/rotate is v2, not built.</b> The invite is single-use <em>by convention</em>: nothing yet stops a second connection with the same string, and the secret isn’t retired after first contact.</li>
+        <li><b>The invite lives only while the process runs.</b> It’s never written to disk — quit and it’s gone. Mint one per person.</li>
+        <li><b>On the LAN, mDNS still broadcasts candidates in plaintext</b> (under the unlinkable invite id). Anyone on your LAN can see your IP by being on your LAN; the sealing protects the <em>public</em> channels — DHT and trackers.</li>
+        <li><b>While listening for an invite, ordinary key dials are refused</b> — the node runs <code>IKpsk2</code> only. That exclusivity is <em>what makes</em> “only the invitee can complete the handshake” true.</li>
+      </ul>
+    </div>
+    <p class="note">The reusable-key path is <b>byte-for-byte unchanged</b> when no invite is in play.</p>
+  </section>
+
+  <!-- 1e. GROUPS -->
+  <section id="groups">
+    <p class="kicker">04 — more than two</p>
+    <h2>Groups</h2>
+    <p>Groups are a library feature today (no CLI verb yet). The secure group encrypts <b>once</b> per message under a
+      sender key, fans the ciphertext out, and signs it — so a member <b>cannot forge another member’s authorship</b>.
+      A member who can’t be reached directly is <b>blind-relayed</b> through another member (the relay can’t read it).
+      Removing a member is <b>cryptographic</b>: rotate, and the removed member decrypts nothing afterwards. Join order
+      doesn’t matter. Every one of those properties is a test — and the browser runs this same group code unchanged.</p>
+    <div class="card" style="margin-top:16px">
+      <div class="codeblock"><pre>node.group([keyA, keyB, keyC]).send('hi all')   <span class="c">// pairwise fan-out: one authenticated link per member</span>
+
+const g = createSecureGroup(node, me, { secret, create: true })   <span class="c">// sender-key E2E group</span>
+await g.join()
+await g.send('hi all')                          <span class="c">// ONE ciphertext, fanned to n</span></pre></div>
+    </div>
+    <p class="note"><b>Known gap (v0.2):</b> <code>node.group()</code> is reachable from the published package;
+      <code>createSecureGroup</code> is not yet exported from it (usable from a checkout and inside the browser build).
+      Adding that subpath is a one-line change and is queued.</p>
   </section>
 
   <!-- 2. THE KEY -->
   <section id="key">
-    <p class="kicker">01 — identity</p>
+    <p class="kicker">05 — identity</p>
     <h2>The key <em>is</em> the identity</h2>
     <p>Your machine generates two keypairs — Ed25519 (signing) and X25519 (Diffie–Hellman) — and keeps the
       private halves on disk (<code>~/.p2p/default.json</code>, mode <code>0600</code>). Your 26-character key is
@@ -292,7 +437,7 @@
 
   <!-- 3. DISCOVERY -->
   <section id="discovery">
-    <p class="kicker">02 — the magic</p>
+    <p class="kicker">06 — the magic</p>
     <h2>Finding each other with no server</h2>
     <p>Normally “how does computer A reach computer B?” needs a server both sides already know — a chat server,
       a signalling server, something with a fixed address. We have <strong>none</strong>. Three ideas stacked make
@@ -372,7 +517,7 @@
 
   <!-- 4. NAT -->
   <section id="nat">
-    <p class="kicker">03 — the magic, part two</p>
+    <p class="kicker">07 — the magic, part two</p>
     <h2>Punching through the routers</h2>
     <p><strong>Idea 3 — the hole punch.</strong> Both sides now know each other’s public address, but home
       routers (NAT) drop unexpected inbound packets. So each side first asks a free public <strong>STUN</strong>
@@ -444,7 +589,7 @@
 
   <!-- 5. HANDSHAKE -->
   <section id="handshake">
-    <p class="kicker">04 — the proof</p>
+    <p class="kicker">08 — the proof</p>
     <h2>Why the first ack <em>proves</em> nobody is in the middle</h2>
     <p>A path exists — but is the machine at the other end really the owner of the key? Every rendezvous channel is
       treated as <strong>hostile</strong>: anyone holding the key can announce a bogus address. Two mechanisms make
@@ -502,7 +647,7 @@
 
   <!-- 6. EVERY PATH -->
   <section id="paths">
-    <p class="kicker">05 — behavior</p>
+    <p class="kicker">09 — behavior</p>
     <h2>Every path the system takes</h2>
     <p>First contact, the same-Wi-Fi fast path, the cross-internet path, the fallback ladder, and what happens when
       a peer’s laptop closes and comes back.</p>
@@ -574,28 +719,35 @@
         derived from the key, so a peer that vanishes is simply looked up again. Reliability lives in two layers —
         <code>wire.js</code> gives ordered, exactly-once delivery <em>within</em> a session; <code>node.js</code> adds an
         app-level outbox keyed by peer identity, so messages queued while a friend was offline flush on reconnect and are
-        never delivered twice. Honest status: same-LAN is verified end-to-end; cross-internet machinery (live STUN, live
-        DHT lookups, live trackers, punch) is proven piecewise; offline store-and-forward and peer-relay are v2.</figcaption>
+        never delivered twice. Honest status: same-LAN and cross-process are verified end-to-end; a browser tab and a terminal
+        are a witnessed pairing (over both a WebRTC DataChannel and the WSS relay); invite mode is witnessed over the live
+        public rendezvous (DHT + trackers, mDNS removed). Not yet witnessed: a run across two <em>different</em> networks;
+        offline store-and-forward and peer-relay are v2.</figcaption>
     </figure>
   </section>
 
   <!-- 7. STACK -->
   <section id="stack">
-    <p class="kicker">06 — the code</p>
+    <p class="kicker">10 — the code</p>
     <h2>The whole stack fits in your head</h2>
-    <p>Node ≥ 22, plain ESM, no build step, <strong>zero npm dependencies</strong> — it is the only runtime where every
-      primitive is native: X25519, Ed25519, ChaCha20-Poly1305, HKDF, SHA-256 (<code>node:crypto</code>), UDP/TCP
-      (<code>node:dgram</code>/<code>node:net</code>), WebSocket (global).</p>
+    <p>Node ≥ 22, plain ESM, no build step, <strong>zero npm dependencies</strong> — every primitive is native: X25519,
+      Ed25519, ChaCha20-Poly1305, HKDF, SHA-256 (<code>node:crypto</code>), UDP/TCP
+      (<code>node:dgram</code>/<code>node:net</code>), WebSocket (global). The browser runs the <em>same</em> modules
+      through a small WebCrypto shim — one protocol, two runtimes.</p>
     <div class="tblwrap">
     <table>
       <thead><tr><th>module</th><th>job</th><th>lines</th></tr></thead>
       <tbody>
         <tr><td>src/key.js</td><td><b>Identity.</b> Keygen, the 26-char encode/decode, checksum, the commitment gate, rid derivation.</td><td>225</td></tr>
-        <tr><td>src/noise.js</td><td><b>Crypto.</b> Noise_IK_25519_ChaChaPoly_SHA256, in-house, byte-exact against the official noise-c vectors.</td><td>381</td></tr>
+        <tr><td>src/noise.js</td><td><b>Crypto.</b> Noise_IK (and IKpsk2 for invites), in-house, byte-exact against the official noise-c vectors.</td><td>445</td></tr>
         <tr><td>src/wire.js</td><td><b>Reliability.</b> Framing, sliding-window ARQ, cumulative ack, RTT-adaptive resend, keepalive, connId roaming.</td><td>361</td></tr>
         <tr><td>src/transport.js</td><td><b>Pipes.</b> Dual-stack UDP, in-house STUN client, ICE-lite hole punch, TCP fallback.</td><td>555</td></tr>
-        <tr><td>src/rendezvous/</td><td><b>Meeting.</b> mDNS, Mainline DHT (+ bencode), WebSocket trackers, and the publish-fanout / read-race.</td><td>1159</td></tr>
-        <tr><td>src/node.js</td><td><b>The API.</b> <code>identity()</code>, <code>listen()</code>, <code>connect()</code>, peer lifecycle, the reconnect outbox.</td><td>420</td></tr>
+        <tr><td>src/transport-wss.js</td><td><b>The floor.</b> Zero-dependency WebSocket relay — the path that always works, carrying ciphertext only.</td><td>314</td></tr>
+        <tr><td>src/rendezvous/</td><td><b>Meeting.</b> mDNS, Mainline DHT (+ bencode), WebSocket trackers, and the publish-fanout / read-race.</td><td>1325</td></tr>
+        <tr><td>src/invite.js</td><td><b>Metadata privacy.</b> One-time <code>K_inv</code>: the sealed candidate blob, the invite rid, the Noise psk.</td><td>376</td></tr>
+        <tr><td>src/group.js</td><td><b>Groups.</b> Pairwise fan-out and the sender-key E2E group (signed authorship, blind relay, rotation).</td><td>496</td></tr>
+        <tr><td>src/node.js</td><td><b>The API.</b> <code>identity()</code>, <code>listen()</code>, <code>connect()</code>, peer lifecycle, the reconnect outbox.</td><td>552</td></tr>
+        <tr><td>src/browser/</td><td><b>The tab.</b> A <code>node:crypto</code> → WebCrypto shim, WebRTC + WSS transports — and then the <em>same</em> modules above.</td><td>1502</td></tr>
       </tbody>
     </table>
     </div>
@@ -614,7 +766,7 @@ await peer.send('hey')</pre>
 
   <!-- 8. FRIENDS -->
   <section id="friends">
-    <p class="kicker">07 — people</p>
+    <p class="kicker">11 — people</p>
     <h2>Friends</h2>
     <p>Everyone you connect with is remembered — their key is saved locally (<code>~/.p2p/&lt;profile&gt;.friends.json</code>),
       so you never need the long string twice. <code>p2p friends</code> lists them; reconnect by name. Because the rid is
@@ -624,7 +776,7 @@ await peer.send('hey')</pre>
 
   <!-- 9. INSTALL -->
   <section id="install">
-    <p class="kicker">08 — get it</p>
+    <p class="kicker">12 — get it</p>
     <h2>Install</h2>
     <div class="card" style="margin-top:16px">
       <h3>One command</h3>
@@ -656,7 +808,7 @@ await peer.send('hey')</pre>
   </section>
 
   <footer>
-    <span>MIT · zero dependencies · <a href="https://github.com/fire17/p2p/blob/main/docs/HOW-IT-WORKS.md">how it works</a> · <a href="https://github.com/fire17/p2p/blob/main/DESIGN.md">design</a></span>
+    <span>MIT · zero dependencies · <a href="https://github.com/fire17/p2p/blob/main/docs/HOW-IT-WORKS.md">how it works</a> · <a href="https://github.com/fire17/p2p/blob/main/DESIGN.md">design</a> · <a href="https://github.com/fire17/p2p/blob/main/CHANGELOG.md">changelog</a></span>
     <a href="https://github.com/fire17/p2p">github.com/fire17/p2p</a>
   </footer>
 

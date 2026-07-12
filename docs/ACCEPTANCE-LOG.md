@@ -409,3 +409,37 @@ browser-build's Node log cross-matches keys (their peer.key == my browser key an
 paired witness, not two self-reports. Chunking verified in both pairings (Node↔Node pre-flight +
 Chromium↔werift). Guard for the werift-Buffer vs browser-ArrayBuffer `dc.onmessage` normalization:
 `test/browser-webrtc-chunking.test.js`; **162/162 deterministic.**
+
+### 🔒 INVITE MODE (metadata privacy v1) — LIVE over the PUBLIC INTERNET rendezvous (2026-07-12)
+
+The invite-mode gates until now were in-process or same-host, so the DHT/tracker legs were unit-tested
+and probed but never *witnessed* carrying a real invite. Closed: `scratch/invite-live-internet.mjs`
+builds the rendezvous with **mDNS REMOVED** — only the real BitTorrent Mainline DHT (encrypted BEP44)
+and the public WebSocket trackers — so there is no LAN shortcut available to it.
+
+```
+listener key (reusable, NEVER published in invite mode): 0JKF88G9VVXJ8GEAVSTRX3RPHV
+one-time share string handed to the invitee          : GJKF88G9VVXJ8GEAVSTRX3RMF2-W0GV03Q59QF9N3GT28K6T1PQTZ50
+channels: DHT + public WSS trackers  (mDNS REMOVED — no LAN shortcut)
+
+✔ VERIFIED Noise IKpsk2 first-ack over PUBLIC rendezvous in 18.3s
+  ✅ secure channel established with 0JKF88G9VVXJ8GEAVSTRX3RPHV — verified, no MITM, invitee proven
+  RECEIVED at the listener: ["hello over the public internet — sealed rendezvous, IKpsk2"]
+
+PASS — invite mode works over DHT + public trackers.
+```
+
+What this witnesses, end to end on live public infra: the listener published candidates **only** under
+`rid_inv = HKDF(K_inv,…)` (never under its reusable `S`); the blob on that infra was AEAD-sealed under
+`k_ip` and fixed-length; the dialer — holding nothing but the share string — **located** the record,
+**decrypted** it, punched, and completed **Noise IKpsk2**. The resolved `peer.key` is the listener's
+BARE `S` (invites are one-time; the durable contact is `S`).
+
+A propagation warm-up (~30 s) precedes the dial: the BEP44 put and the tracker announce are
+fire-and-forget, so a dial in the same tick can legitimately find an empty rendezvous. That is a real
+property of the system, not a test fudge — worth noting as UX (a freshly-minted invite is not instantly
+resolvable over public infra; on a LAN, mDNS makes it instant).
+
+**Still NOT witnessed:** invite mode across two *different* networks (both processes here were on one
+host — the RENDEZVOUS was public, the punch was local), and invite mode from the browser (the browser
+build has no `makeRace` seam, so `connect('S-…')` throws there — see the v0.2 known gaps).
