@@ -4,6 +4,44 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.0] — 2026-07-12
+
+The reliability + hardening release. **Breaking protocol bump from 0.2.0** — the authenticated
+wire control-plane (WIRE MAC) and signed group `init` are fail-closed-incompatible with 0.2.0
+peers, so the fleet moves together. Shipping with known gaps listed below (a reship follows);
+everything claimed is backed by a test or a gated review.
+
+### Fixed / Added
+
+- **web↔web reliability — the "50%" is gone.** Root cause was a duplicate-default-identity
+  *zombie*: two browser tabs both booted the `default` identity, both answered an incoming dial,
+  one won and the other sat **connected-but-deaf**, so half your messages landed in the wrong tab.
+  An identity is now **single-live per browser** (Web Locks, fails open — never blocks going online),
+  and a second default tab **auto-adopts a fresh identity** with a banner explaining the key change.
+- **tui↔web actually connects.** The Node/CLI peer now composes the **WSS relay** into its default
+  endpoint, so a terminal and a browser share a transport (a browser can't speak UDP). Verified live
+  over a public relay; `wss:false` opt-out keeps a UDP-only node.
+- **Group code checksum** — a mistyped group code now fails **loudly** at paste instead of silently
+  dropping you into a different, empty "ghost" group.
+- **Terminal groups** — `p2p group new / join`, sender-keys + signed membership chain, wire-compatible
+  with the browser group client (same code puts a terminal and a browser member in one group).
+- **CLI Ctrl+C always exits** — a hung or failed peer can no longer trap the process (raw-mode Ctrl+C
+  is force-handled; teardown awaits nothing). Plus **↑/↓ sent-message history** and **scrollback**.
+- **Metadata privacy** — invite-mode **mDNS TXT is now sealed** (no plaintext IP/port on the LAN;
+  tracker + DHT were already sealed), authenticated **wire control-plane** (16-byte MAC over every
+  control frame), and **burn-after-connect** (a one-time invite goes dark the instant its invitee
+  connects — no re-use, no trail).
+- **Installer integrity** — the install script pins and verifies the app source archive.
+- **Test safety** — every real-network test is gated behind `P2P_LIVE=1`; a plain `npm test` now
+  emits **zero** off-box traffic (audit closed two pre-existing live-traffic leaks).
+
+### Known gaps (shipping as-is; reship to follow)
+
+- **Group delivery to a browser member** can warn `no-sender-key` — the sender key was being sent via
+  a reverse dial a browser can't make; a fix (ride the existing channel + self-heal) is in progress.
+- **Mobile browsers** may stick on "booting…" — under investigation.
+- **tui→web dial** can take ~10s (browser→tui is fast) — a fix to punch on first candidate is queued.
+
 ## [0.2.0] — 2026-07-12
 
 The release that gives p2p **a second runtime, a private front door, and real groups**. Every

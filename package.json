@@ -1,6 +1,6 @@
 {
   "name": "@fire17/p2p",
-  "version": "0.3.0-dev",
+  "version": "0.3.0",
   "description": "Tiny zero-dependency P2P chat framework: one 26-char key, E2E-encrypted, MITM-proof first contact, NAT traversal, private one-time invites (sealed IPs), sender-key groups, and a zero-build browser client — no coordinator server.",
   "type": "module",
   "exports": {
