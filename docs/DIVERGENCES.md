@@ -20,13 +20,22 @@
 ## D-INT-3 — WSS tracker was a v1 stub — RESOLVED 2026-07-12 (matchmaker landed)
 
 > **RESOLVED** in commit 69d8976: the tracker is now D6's live matchmaker (persistent WSS,
-> candidate blob carried in the offer SDP, real `lookup()` peer discovery). Verified live —
-> tracker-only two-process discovery returns `channel: tracker` in ~0.55s over real public
-> WebTorrent trackers, and a full tracker-only two-process chat delivered end-to-end. So
-> **cross-network discovery is no longer DHT-only** — it is now mDNS (LAN) + DHT + tracker,
-> the full 3-channel race per D6. The deferral below is kept for history; it no longer holds.
-> (Cross-network real-NAT between two DISTINCT networks is still owner-gated / unobserved —
-> that's VAL-ACCEPT-XNET, separate from this rendezvous-redundancy divergence.)
+> candidate blob carried in the offer SDP, real `lookup()` peer discovery), wired into the
+> race (node.js:157). The relay MECHANISM is live-verified: over real public WebTorrent
+> trackers (openwebtorrent / webtorrent.dev / btorrent.xyz), **two SEPARATE OS processes**
+> using `createTracker().announce`/`lookup` relayed the exact published candidate 3/3 trials
+> at ~0.55-0.60s (`channel: tracker`); a full tracker-only two-process chat also delivered
+> end-to-end. So the framework now runs the full 3-channel race (mDNS LAN + DHT + tracker),
+> and **cross-network discovery has two independent internet rungs (DHT + tracker)** instead
+> of one. The deferral text below is kept for history; it no longer holds.
+>
+> Precise scope of "verified": the relay works between two separate processes on **one
+> machine**. Relay between two **DISTINCT networks** is still unobserved — that's the
+> owner-gated VAL-ACCEPT-XNET gap, and it applies to BOTH internet rungs (DHT and tracker)
+> equally. So: mechanism proven for both; real two-network run awaits the owner's 2nd network.
+>
+> (Note: `trackerRelayProbe` — the OLD v1 one-shot probe helper, still exported — does NOT
+> hold a connection and does time out; it is NOT the matchmaker. Test `createTracker`, not it.)
 
 <details><summary>Original deferral (historical)</summary>
 
