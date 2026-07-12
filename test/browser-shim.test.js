@@ -221,3 +221,21 @@ test('Buffer shim: the exact surface our protocol modules use', () => {
   view[0] = 1
   assert.equal(copy[0], 9, 'Buffer.from(view) must copy')
 })
+
+test('Buffer.isBuffer survives TWO module instances (the footgun browser-build hit)', async () => {
+  // Load a SECOND, independent instance of the shim via a cache-busting URL. Its Buffer class is a
+  // different JS object, so `instanceof` across instances would be FALSE — but src/noise.js and
+  // src/key.js gate on isBuffer, so that would throw on a valid buffer. The Symbol.for brand must
+  // make isBuffer work cross-instance.
+  const url = new URL('../src/browser/shim/buffer.js', import.meta.url)
+  const B2 = (await import(url.href + '?dup=1')).Buffer
+  assert.notEqual(B2, ShimBuffer, 'must be a genuinely separate module instance')
+
+  const fromA = ShimBuffer.from('deadbeef', 'hex')
+  const fromB = B2.from('deadbeef', 'hex')
+  // each instance must recognise the OTHER instance's buffers
+  assert.equal(B2.isBuffer(fromA), true, "instance B must accept instance A's buffer")
+  assert.equal(ShimBuffer.isBuffer(fromB), true, "instance A must accept instance B's buffer")
+  // ...and still reject a plain Uint8Array (matches Node)
+  assert.equal(ShimBuffer.isBuffer(new Uint8Array(4)), false, 'a bare Uint8Array is still not a Buffer')
+})

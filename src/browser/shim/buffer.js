@@ -19,8 +19,22 @@ const dec = new TextDecoder()
 const HEX = []
 for (let i = 0; i < 256; i++) HEX[i] = i.toString(16).padStart(2, '0')
 
+// Cross-instance brand. isBuffer() must NOT be `instanceof`: if this module is ever loaded via two
+// URLs (e.g. the import-map specifier AND a relative path), instanceof gives FALSE for a valid
+// buffer from the other instance — and src/noise.js / src/key.js gate their inputs on isBuffer, so
+// the handshake would throw ("localX {pub,priv} Buffers required") on a perfectly good buffer.
+// A Symbol.for brand lives in the GLOBAL symbol registry, so it is identical across instances —
+// isBuffer then works no matter how many copies of this module exist. (Reported by browser-build,
+// who hit it in group.js.) A plain Uint8Array has no brand, so it still returns false (matches Node).
+const BRAND = Symbol.for('p2p.shim.buffer.v1')
+
 /** Node's Buffer, minus everything we don't use. Instances are real Uint8Arrays. */
 export class Buffer extends Uint8Array {
+  /** brand read off the prototype — every instance (of any loaded copy) reports true */
+  get [BRAND]() {
+    return true
+  }
+
   // ── statics (the 5 our code calls) ──
 
   /** @param {number} n @returns {Buffer} zero-filled */
@@ -97,9 +111,12 @@ export class Buffer extends Uint8Array {
     return out
   }
 
-  /** @param {any} b — true only for OUR Buffer (matches Node: a bare Uint8Array is NOT a Buffer) */
+  /**
+   * @param {any} b — true only for OUR Buffer (matches Node: a bare Uint8Array is NOT a Buffer).
+   * Brand-based, not instanceof, so it survives multiple module instances (see BRAND above).
+   */
   static isBuffer(b) {
-    return b instanceof Buffer
+    return !!(b && b[BRAND] === true)
   }
 
   // ── instance methods (the 7 our code calls) ──

@@ -75,6 +75,22 @@ async function main() {
     // for a future group UI. Pairwise fan-out — one authenticated Noise link per member.
     window.__p2pGroupSend = (keys, text) => node.group(keys).send(text)
 
+    // Sender-keys SECURE group hooks — drive a real browser member in a >2 E2E group (fresh-witness
+    // for browser-build's P3). __secureGroupJoin returns the groupId; received messages accumulate
+    // in window.__secureRx as {from, text}; __secureGroupSend fans one ciphertext to the group.
+    let secureGroup = null
+    window.__secureRx = []
+    // create + wire message sink, but DON'T join yet — sender-keys distribution must happen AFTER
+    // the admin has propagated the membership chain, or a member distributes its key to nobody.
+    window.__secureGroupCreate = (secretB64, opts = {}) => {
+      secureGroup = node.secureGroup({ secret: secretB64, ...opts })
+      secureGroup.on('message', (from, data) => window.__secureRx.push({ from, text: Buffer.from(data).toString('utf8') }))
+      return secureGroup.groupId
+    }
+    window.__secureGroupJoin = async () => { await secureGroup.join(); return secureGroup.members() }
+    window.__secureGroupSend = (text) => secureGroup && secureGroup.send(text)
+    window.__secureGroupMembers = () => (secureGroup ? secureGroup.members() : [])
+
     // Deep link: #KEY (e.g. from a shared link) auto-fills the dial box.
     const hash = location.hash.replace('#', '').trim().toUpperCase()
     if (hash.length === 26) $('peerkey').value = hash

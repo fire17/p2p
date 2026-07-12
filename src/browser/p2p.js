@@ -19,6 +19,7 @@ import './shim/globals.js'
 
 import { identity as makeIdentity, listen as nodeListen } from '../node.js'
 import { createRacedTransport } from './transport.js'
+import { createGroup, createSecureGroup } from '../group.js'
 import * as key from '../key.js'
 import * as noise from '../noise.js'
 
@@ -138,8 +139,13 @@ export async function listen(id, opts = {}) {
     try { close() } catch { /* */ }
     t.close()
   }
+
+  // Sender-keys secure group (src/group.js, browser-build's lane) — the browser runs it UNCHANGED
+  // because the shim provides its every primitive (incl. Ed25519 sign/verify). One src/group.js,
+  // both runtimes. node.group() stays the pairwise fan-out; secureGroup() is the >2 E2E group.
+  node.secureGroup = (opts) => createSecureGroup(node, id, opts)
   return node
 }
 
-export { key, noise }
+export { key, noise, createGroup, createSecureGroup }
 export default { identity, listen }
