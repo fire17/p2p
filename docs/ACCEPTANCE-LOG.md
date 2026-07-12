@@ -151,3 +151,66 @@ is INCOMPLETE and VAL-RDV-TRACKER-001's PASS is conditional on that entry. Escal
 (docs owner) to add D-INT-3 (tracker matchmaker → P1; v1 cross-net = DHT + mDNS-LAN) + correct the
 completeness line. Mission held OPEN until logged. Also GAP-004 (Low): success-path gate check
 logged only under P2P_DEBUG=1.
+
+---
+
+## FINAL (HEAD 5907120 — all escalated items resolved)
+
+Team-lead resolved the doc gaps:
+- **D-INT-3 logged** (commit 5907120): docs/DIVERGENCES.md now records the tracker v1-stub / D6
+  deferral (v1 cross-network discovery = DHT hint + mDNS-LAN; tracker matchmaker → P1) and the
+  false "no other intentional divergences" line is corrected. → **VAL-DIVERGENCE-001 PASS**
+  (D-INT-1/2/3 all logged); **VAL-RDV-TRACKER-001 PASS** (v1 stub, deferral now honestly logged).
+- **API-SKETCH reconnect wording reconciled** (76f2106): "app-initiated connect() redial +
+  exactly-once outbox flush; auto-redial v1.1" — matches VAL-ACCEPT-RECONNECT reality.
+
+Repro B (retransmit) — forced-loss on the REAL transport needs a drop-injection hook not present
+in src (owned by build lanes; not added). Covered by composition: wire.test.js proves 1000-msg
+exactly-once under 20% loss+reorder+dup at the channel level, and that channel now runs the
+PRODUCTION tick path (node.js:343 setInterval + 2 new liveness tests that drive the real interval,
+not hand-called tick). Tick-driven-in-production independently proven by Repro A/C (retransmit +
+keepalive timers fired with zero manual tick). Direct forced-loss real-transport run: not executed
+(no hook); would duplicate the channel-level test.
+
+**FINAL STANDING: 28/29 PASS · 0 FAIL · 1 owner-gated GAP (VAL-ACCEPT-XNET).**
+Notes (non-blocking): GAP-004 (Low) success-path gate log DBG-only; and a pre-existing
+embed-cleanliness item — node.close() does not release rendezvous/transport sockets, so an
+embedding host process won't exit on close() alone (CLI force-exits, so unaffected) — routed to
+build lanes separately, relevant to the "embeddable" goal, NOT part of the v1 acceptance battery.
+
+---
+
+## OWNER ACCEPTANCE + CLOSE (2026-07-11)
+
+Three independent zenith terminal reviews confirmed core v1 works (all 6 acceptance items observed).
+Remaining items resolved by explicit OWNER (team-lead) decisions:
+- **Reduced-scope rendezvous ACCEPTED for v1:** the WSS tracker is a P1 stub (D-INT-3); v1 cross-network
+  discovery rests on the DHT single rung (+ mDNS LAN). Owner: "product is v1-correct (deliberate scope
+  cut, DHT covers cross-net single-rung)." This is the explicit owner acceptance the closure review
+  required. VAL-RDV-TRACKER-001 PASS (v1 stub, deferral logged + accepted); VAL-DIVERGENCE-001 PASS
+  (D-INT-1/2/3 logged, contradiction fixed).
+- **GAP-004 → WON'T-FIX BY DESIGN (owner):** a library that console.logs on every connection is poor
+  hygiene; the visible success surface is the CLI/TUI line "✅ secure channel established — verified,
+  no MITM" + the test assertions. Acceptance #2's "log the commitment check" intent is met at the
+  user-facing CLI layer, not the library.
+- Low notes accepted: node --test is network-coupled (live DHT gate) — intentional live-gate design;
+  bin/p2p-chat.js ephemeral-identity demo doesn't cover item-5 restart (capability present via bin/p2p.js).
+
+**FINAL VERDICT: 28/29 VAL-* PASS · 0 FAIL · 1 owner-gated GAP (VAL-ACCEPT-XNET, real 2-network run
+unobserved).** v1 is looks-done == is-done for every observable surface, with the tracker matchmaker
+and real cross-network run as explicitly-accepted, honestly-logged deferrals. Independent verification
+by zenith-manager (validator-spine, zero src writes); durability regression caught by the terminal
+review and fixed + re-validated on the real production path before this close.
+
+### CLOSED — owner (fire17) explicit decision 2026-07-11
+- **(A) v1 ACCEPTED + CLOSED** at 28/29 VAL-* PASS · 0 FAIL · 1 owner-gated GAP (VAL-ACCEPT-XNET).
+  Reduced-scope rendezvous accepted: cross-network discovery = DHT (proven) + mDNS (LAN); tracker
+  matchmaker deferred. D-INT-3 documents it. **VAL-RDV-TRACKER-001 = accepted reduced-scope (owner),
+  matchmaker → v1.1 in progress — NOT a fail.**
+- **(B) tracker matchmaker → v1.1**, routed to lane-key in parallel (live WSS offer/answer); does NOT
+  hold the v1 close. When it lands, cross-network gains its redundant rung; D-INT-3/DESIGN D6 update then.
+- Low notes (owner-acknowledged): node --test live-DHT coupling → CI backlog (hermetic/offline split),
+  intentional live-gate value, not a blocker; bin/p2p.js (stable identity) is the shipping/demo surface
+  for #5, bin/p2p-chat.js is legacy — capability present on the real surface, note only.
+- Verdict trustworthiness: earned through 4 independent terminal reviews + real-path repros, incl. a
+  caught-and-fixed durability regression and a divergence-honesty correction. v1 core is is-done.
