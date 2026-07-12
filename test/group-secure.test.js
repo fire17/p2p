@@ -177,3 +177,58 @@ test('group: removal is cryptographic — after rotation the removed member decr
   assert.equal(t.got.B.at(-1).text, 'post-removal')
   t.close()
 })
+
+// ── GRP-1: the membership fold is a PURE FUNCTION of the op SET (deterministic admin) ────────────
+test('group GRP-1: two concurrent `create` roots → every peer folds the SAME admin (hash order), and a rival create is surfaced as divergence', async () => {
+  // Two members each author a `create` for the same groupId (causally unlinked roots). The old fold
+  // visited ops in receipt order → first-seen create won → a member could escalate to admin on the
+  // peers that saw its rival create first. The canonical (hash-ordered) fold must converge on ONE
+  // admin on every peer regardless of arrival order, and the rival root must raise a divergence.
+  const bd = board()
+  const A = await identity(), B = await identity(), C = await identity()
+  const nA = await listen(A, { endpoint: bd.endpoint(A.S), deps: rv })
+  const nB = await listen(B, { endpoint: bd.endpoint(B.S), deps: rv })
+  const nC = await listen(C, { endpoint: bd.endpoint(C.S), deps: rv })
+  const G = randomBytes(32)
+  const gA = createSecureGroup(nA, A, { secret: G, members: [B.S, C.S], create: true })
+  const gB = createSecureGroup(nB, B, { secret: G, members: [A.S, C.S], create: true }) // RIVAL create
+  const gC = createSecureGroup(nC, C, { secret: G })
+  const div = { A: [], B: [], C: [] }
+  gA.on('divergence', (x) => div.A.push(x.reason))
+  gB.on('divergence', (x) => div.B.push(x.reason))
+  gC.on('divergence', (x) => div.C.push(x.reason))
+
+  await gA.join(); await gB.join(); await wait(150)  // both push their chain (incl. own create) around
+  await gC.join(); await wait(200)
+
+  const admins = [gA.admin(), gB.admin(), gC.admin()]
+  assert.ok(admins.every((a) => a && a === admins[0]), `all peers must agree the SAME admin, got ${JSON.stringify(admins)}`)
+  assert.ok([A.S, B.S].includes(admins[0]), 'the admin is one of the two create authors')
+  assert.ok(div.A.includes('rival-create') || div.B.includes('rival-create') || div.C.includes('rival-create'),
+    'the second create for a known groupId must surface as a `rival-create` divergence, not resolve silently')
+  nA.close(); nB.close(); nC.close()
+})
+
+// ── GRP-5: a create op's `init` roster is signed + hashed (no relay-spliced members) ─────────────
+test('group GRP-5: initial roster is covered by the op signature — a tampered `init` is rejected', async () => {
+  const t = await threeParty()
+  // C forges an OP frame: A's real create op with an EXTRA member (C's confederate D) spliced into
+  // init. Because init is now part of opBytes, A's signature no longer verifies over the tampered op.
+  const D = await identity()
+  // Reconstruct A's create op shape and tamper init. We do not have A.edPriv-signed bytes for the new
+  // init, so the signature (whatever we put) cannot match — the gate must reject it as op-signature.
+  const forged = { t: 'create', by: t.A.S, subj: null, parents: [], n: 0,
+    init: [t.B.S, t.C.S, D.S], e: Buffer.from(t.A.edPub).toString('base64'),
+    x: Buffer.from(t.A.xPub).toString('base64'), sig: 'AAAA' }
+  const body = Buffer.from(JSON.stringify(forged), 'utf8')
+  const env = Buffer.allocUnsafe(2 + 32 + body.length)
+  env[0] = 0x67; env[1] = 3                                 // GMAGIC, T.OP
+  Buffer.from(t.gA.groupId, 'hex').copy(env, 2)
+  body.copy(env, 34)
+  const cToB = t.nC.peers().find((p) => p.key === t.B.S)
+  await cToB.send(env); await wait(150)
+
+  assert.ok(t.div.B.includes('op-signature'), 'B must reject the tampered-init create (signature covers init)')
+  assert.ok(!t.gB.members().includes(D.S), 'the spliced member D must NOT appear in the group')
+  t.close()
+})

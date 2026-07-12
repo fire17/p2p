@@ -169,28 +169,56 @@ const aeadDec = (key, seq, aad, ct) => {
 
 // ── membership chain ─────────────────────────────────────────────────────────────────────────
 
-/** Canonical signing bytes for an op — field order is FIXED (a signature over JSON must be). */
-const opBytes = (o) => utf8(['op', o.t, o.by, o.subj || '', (o.parents || []).join(','), o.n ?? 0].join('|'))
+/**
+ * Canonical signing bytes for an op — field order is FIXED (a signature over JSON must be).
+ * `init` (a create's initial roster) MUST be covered: it decides who the group starts as, so an
+ * unsigned/​unhashed init lets any relay splice members (incl. itself) into a create op and read all
+ * traffic. Included here ⇒ it is signed AND part of opHash (GRP-5).
+ */
+const opBytes = (o) => utf8(['op', o.t, o.by, o.subj || '', (o.init || []).join(','), (o.parents || []).join(','), o.n ?? 0].join('|'))
 const opHash = (o) => sha256(opBytes(o), unb64(o.sig)).toString('hex').slice(0, 32)
 
 /**
- * Deterministic fold: every member computes the SAME membership from the SAME chain, with no server.
- * v1 policy (Briar-style): the `create` author is admin; only an admin adds/removes.
+ * Deterministic fold: every member computes the SAME membership from the SAME op SET, with no
+ * server — a PURE FUNCTION of the ops, independent of receipt order.
+ *
+ * The order is a canonical topological sort (Kahn's algorithm) that breaks every tie by opHash
+ * (lexicographically lowest first). This closes GRP-1: two causally-unlinked `create` roots (or any
+ * concurrent ops) resolve to the SAME linear order — hence the SAME admin — on every peer, instead
+ * of the old receipt-order visitation where whoever's `create` arrived first won and a member could
+ * escalate to admin on the peers that saw its rival `create` first.
+ *
+ * v1 policy (Briar-style): the lowest-hash `create` author is admin; only an admin adds/removes.
  * @param {Array} ops
  * @returns {{admin:string|null, members:Set<string>}}
  */
 function foldMembership(ops) {
   const byHash = new Map(ops.map((o) => [opHash(o), o]))
-  const seen = new Set()
-  const order = []
-  const visit = (h) => {                       // topological: parents before children
-    const o = byHash.get(h)
-    if (!o || seen.has(h)) return
-    seen.add(h)
-    for (const p of o.parents || []) visit(p)
-    order.push(o)
+  const indeg = new Map()
+  const children = new Map()
+  for (const h of byHash.keys()) { indeg.set(h, 0); children.set(h, []) }
+  for (const [h, o] of byHash) {
+    for (const p of o.parents || []) {
+      if (!byHash.has(p)) continue             // parent not yet known — an external head, not a dep
+      indeg.set(h, indeg.get(h) + 1)
+      children.get(p).push(h)
+    }
   }
-  for (const h of byHash.keys()) visit(h)
+  const ready = [...byHash.keys()].filter((h) => indeg.get(h) === 0).sort()  // roots, hash-ordered
+  const order = []
+  const done = new Set()
+  while (ready.length) {
+    const h = ready.shift()                     // lowest hash among the currently-ready ⇒ canonical
+    if (done.has(h)) continue
+    done.add(h)
+    order.push(byHash.get(h))
+    let grew = false
+    for (const c of children.get(h)) {
+      indeg.set(c, indeg.get(c) - 1)
+      if (indeg.get(c) === 0) { ready.push(c); grew = true }
+    }
+    if (grew) ready.sort()
+  }
 
   let admin = null
   const members = new Set()
@@ -271,6 +299,10 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     ops.push(o)
     for (const p of o.parents || []) opHeads.delete(p)
     opHeads.add(h)
+    // A second `create` for a KNOWN groupId is never a silent resolution (GRP-1): the fold now picks
+    // the lowest-hash create deterministically, but a rival root is a real divergence event — surface
+    // it so the app sees a member's attempted admin-escalation, not just a quietly-ignored op.
+    if (o.t === 'create' && ops.some((x) => x !== o && x.t === 'create')) emit('divergence', { reason: 'rival-create', by: o.by })
     emit('membership', [...membership().members])
     // Learning the chain can REVEAL members we didn't know existed when we joined. Without this,
     // join-order matters: a member that join()s before the admin's chain reaches it distributes its
