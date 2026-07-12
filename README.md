@@ -42,6 +42,8 @@ p2p key                   # print your stable key (--new rotates it)
 p2p connect <KEY|name>    # dial a 26-char key, or a saved friend by name
 p2p <KEY>                 # same, straight into the TUI
 p2p invite                # mint a ONE-TIME private invite + listen for it   (see §3)
+p2p group new [KEY ...]   # create an E2E group chat → prints a group CODE   (see §4)
+p2p group join <CODE>     # join a group from its code
 p2p friends               # everyone you've connected with — reconnect by name
 p2p doctor                # can the free infra see you? (STUN / DHT / trackers)
 p2p chat [KEY]            # line-mode chat (scriptable / pipeable, no full screen)
@@ -130,9 +132,27 @@ to a tracker operator, not to a passive observer.
 
 The reusable-`S` path is **byte-for-byte unchanged** when no invite is in play.
 
-## 4. Groups (>2) — the library
+## 4. Groups (>2) — terminal, browser, library
 
-Groups are a library feature (no CLI verb yet). Two flavours:
+A group is a **code** (base64 of a 32-byte secret) — share it like a key. Members are named by
+their 26-char keys, and every member must be **online** for the creator to hand them a sender key.
+
+```sh
+# Alice creates. She needs Bob's and Carol's keys (they run `p2p key`).
+p2p group new GK0RN…7NS  QF83M…2XA        # prints the GROUP CODE — send it to them
+
+# Bob and Carol join with just that code (each is already listening).
+p2p group join 9tV0…k8=
+
+# then type. in-chat:  /members   /add <KEY> (admin only)   /code   /quit
+```
+
+The **browser client speaks the same protocol** — paste the same code into the *Group* tab at
+[p2p.akeyo.io/app/](https://p2p.akeyo.io/app/) and a terminal member and a browser member are in
+one group (witnessed end-to-end by `test/browser-group-tui.mjs`). The CLI path is covered by
+`test/tui-group.test.js`.
+
+Under it, two library flavours:
 
 ```js
 node.group([keyA, keyB, keyC]).send('hi all')     // pairwise fan-out: one authenticated link per member

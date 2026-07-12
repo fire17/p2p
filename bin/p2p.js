@@ -8,6 +8,8 @@
 //   p2p chat [KEY]          line-mode chat (scriptable / no full-screen)
 //   p2p listen              line-mode: go online, print key, wait
 //   p2p connect <KEY>       line-mode: dial a key and chat
+//   p2p group new [KEY ...] create an E2E group chat (members = their keys) -> prints a group CODE
+//   p2p group join <CODE>   join a group from its code
 //   p2p key [--new]         print your stable key (create if needed; --new rotates it)
 //   p2p doctor              check rendezvous reachability (STUN / DHT / trackers)
 //   p2p --selftest          two in-process nodes end-to-end (plumbing proof)
@@ -165,6 +167,8 @@ const HELP = `${bold('p2p')} — MITM-proof, zero-dependency P2P chat
   ${bold('p2p listen')}              line-mode: go online, print your key, wait
   ${bold('p2p connect')} <KEY|SHARE|name>  line-mode: dial a key, an invite share string, or a friend
   ${bold('p2p invite')}              mint a ONE-TIME private invite (S-…) and listen for it
+  ${bold('p2p group new')} [KEY ...]  create an E2E group chat with those member keys -> prints a CODE
+  ${bold('p2p group join')} <CODE>    join a group you were given the code for
   ${bold('p2p friends')}             list everyone you've connected with (reconnect by name)
   ${bold('p2p key')} [--new]         print your stable key (--new rotates it)
   ${bold('p2p doctor')}              check rendezvous reachability
@@ -175,12 +179,13 @@ const HELP = `${bold('p2p')} — MITM-proof, zero-dependency P2P chat
 
 async function main() {
   const argv = process.argv.slice(2)
-  if (argv.includes('--help') || argv.includes('-h')) { console.log(HELP); return }
-  if (argv.includes('--selftest')) return selftest()
-
   const o = opts(argv)
   const positional = argv.filter((a, i) => !a.startsWith('-') && argv[i - 1] !== '--profile')
   const cmd = positional[0]
+  // `p2p group --help` must reach the GROUP help, not this one — so let a sub-command with its own
+  // help surface claim the flag first.
+  if ((argv.includes('--help') || argv.includes('-h')) && cmd !== 'group' && cmd !== 'g') { console.log(HELP); return }
+  if (argv.includes('--selftest')) return selftest()
 
   switch (cmd) {
     case undefined:
@@ -202,6 +207,12 @@ async function main() {
       // Mint a fresh one-time K_inv for THIS identity, print the share string, and go online in
       // invite mode: presence is published only under rid_inv, sealed under k_ip (metadata privacy).
       return lineMode({ dialKey: null, mintInviteMode: true, ...o })
+    case 'group': case 'g': {
+      // Group chat rides the same pairwise Noise links (src/group.js — sender keys + a signed
+      // membership chain). Imported lazily so the group code costs nothing on the 1:1 paths.
+      const { groupMain } = await import(join(HERE, 'p2p-group.js'))
+      return groupMain(positional.slice(1), o)
+    }
     case 'friends': case 'f': {
       const list = loadFriends(o.profile)
       if (!list.length) { console.log(dim('\n  no friends yet — connect with someone and they\'re saved here.\n')); return }
