@@ -21,11 +21,42 @@
 import { hkdfSync, randomBytes } from 'node:crypto'
 import { createChannel, encodeFrame, decodeFrame, TYPE, HEADER_LEN, MAC_LEN } from './wire.js'
 import { createGroup } from './group.js'
-import { parseShare, createInvite, hasInvite, TypoError } from './invite.js'
+import { parseShare, createInvite, hasInvite, equal, TypoError } from './invite.js'
 
 /** App-layer message kinds (inside the encrypted DATA payload). */
 const APP = Object.freeze({ MSG: 1, ACK: 2 })
 const ZERO8 = Buffer.alloc(8)
+
+/**
+ * DOS-1 — cap the peer records the ACCEPT path may mint. A reusable-S HS1 needs no secret (our
+ * static X pubkey is public inside S), so a flooder can complete handshake-shaped msg1s with a
+ * fresh static each time and mint an unbounded number of records. Inbound records are counted and
+ * capped SEPARATELY from dialed ones, so an inbound flood can never block the user's own connect().
+ */
+const MAX_INBOUND_PEERS = 256
+
+/**
+ * META-1 — the probe proof: HKDF(K_inv, salt="p2p-rvk-probe-v1", info=<token hex>, L=8).
+ *
+ * The listener's HELLO carries `edPub‖xPub` IN THE CLEAR — the full identity pubkeys that S only
+ * COMMITS to. Pre-fix, any well-formed PROBE elicited it, so anyone who reached the socket could
+ * harvest the pubkeys, recompute S, and bind IP:port ↔ identity — a confirmation oracle that
+ * undercuts invite mode's whole point. In invite mode we now require the prober to PROVE K_inv:
+ * only the invitee holds it, so only the invitee ever elicits the HELLO.
+ *
+ * It rides inside the EXISTING 21-byte PROBE — the proof IS the 8-byte nonce field, keyed to the
+ * (random, per-dial) correlation token. No wire change, no new field, no length/shape signal: the
+ * nonce was random bytes before and is pseudorandom bytes now. Binding the proof to the token also
+ * denies a replaying on-path observer any DoS amplification — a captured (token, proof) pair
+ * collapses to the ONE accept that token already owns.
+ *
+ * Residual, stated: an ON-PATH observer can copy a proof it saw. It gains nothing — the same
+ * position already reads the cleartext HELLO it would be trying to elicit. What this closes is the
+ * OFF-PATH prober (scanner / infra-collusion address holder), which is exactly META-1's adversary.
+ * Reusable-S mode installs no authenticator (S is public by definition — nothing to protect).
+ * @param {object} inv createInvite() context @param {Buffer} tok the 8-byte punch token
+ */
+const probeProof = (inv, tok) => inv.rid('probe', Buffer.from(tok).toString('hex'), 8)
 /** Bytes an app payload loses on the way to the wire: app header [1B kind][4B seq] + Noise AEAD tag. */
 const APP_HDR = 5
 const AEAD_TAG = 16
@@ -376,7 +407,10 @@ function initiatorHandshake(node, deps, S, dec, ctx = {}) {
     // Per-connect correlation token: collapses transport's 5×-per-dialer onConnection
     // (one per v4/v6 source tuple) to ONE accept. Correlation only, NOT auth (auth stays
     // gate+Noise) — reuse myConnId (already random 8 bytes) as the nonce.
-    const socket = await node._ep.punch(cands, { token: myConnId })
+    // META-1: in invite mode the PROBE's nonce field carries the K_inv proof over that token, so
+    // the responder answers US and stays dark to everyone else. Reusable-S sends a random nonce
+    // exactly as before (byte-identical wire).
+    const socket = await node._ep.punch(cands, { token: myConnId, nonce: inv ? probeProof(inv, myConnId) : undefined })
     DBG('dial: punch resolved, socket ready -> awaiting HELLO')
     return new Promise((resolve, reject) => {
       let hs = null, helloSeen = false, settled = false, peerInstance = null
@@ -420,6 +454,27 @@ function initiatorHandshake(node, deps, S, dec, ctx = {}) {
   })()
 }
 
+/**
+ * DOS-1 — admission control for the INBOUND peer table. Returns true if a new accept-side record
+ * may be minted. When full, shed a record that is provably worthless first — inbound, disconnected,
+ * and owing nothing (empty outbox, so no buffered message is lost) — and only refuse if none exists.
+ *
+ * We REFUSE rather than evict a live peer on purpose: evicting the stalest CONNECTED peer would
+ * hand a flooder the power to tear down real sessions, which is a worse capability than the
+ * newcomer-refusal it would avoid. Residual, stated honestly: a flooder that keeps 256 handshaked
+ * channels alive (it must keepalive each one — wire kills a silent channel at livenessMs) can deny
+ * NEW inbound peers. Memory stays bounded, established sessions and outbound dials keep working.
+ */
+function admitInbound(node) {
+  let n = 0
+  for (const r of node._peers.values()) if (r._inbound) n++
+  if (n < node._maxInbound) return true
+  for (const [k, r] of node._peers) {
+    if (r._inbound && !r.peer.connected && r._outbox.size === 0) { node._peers.delete(k); return true }
+  }
+  return false
+}
+
 /** Responder (accepter) side: send HELLO, run IK responder, key peer by remote static. */
 function acceptConnection(node, deps, socket) {
   const id = node._identity
@@ -457,10 +512,26 @@ function acceptConnection(node, deps, socket) {
       let payload
       try { payload = hs.readMessage(f.payload) }                     // in invite mode a msg1 without the psk fails HERE (fail-closed)
       catch (err) { node.emit('divergence', null, { reason: 'handshake', error: err }); try { socket.close() } catch { /* */ } return }
+      // DOS-1: HS1 has now authenticated as far as this handshake CAN (in invite mode that is the
+      // psk — real auth; in reusable-S it is only "knows our public static"). Either way the socket
+      // leaves the transport's pre-auth pending set, so a flood of never-handshaking PROBEs can
+      // never crowd out real peers, and the peer record below is created no earlier than this.
+      if (typeof socket.confirm === 'function') socket.confirm()
       const { edPub, xPub, instance } = decodeIntro(payload)         // Bob's pubkeys — TOFU pin + peer key; instance = restart nonce
       const pkey = 'static:' + Buffer.from(xPub).toString('hex')
       rec = node._peers.get(pkey)
-      if (!rec) { rec = makePeer(node, {}); node._peers.set(pkey, rec) }
+      if (!rec) {
+        // Bounded inbound table: a reusable-S flooder can mint a fresh static per HS1, so the
+        // record count — not the handshake — is what has to be capped. Fail CLOSED for the
+        // newcomer; never at the expense of an established peer (see admitInbound).
+        if (!admitInbound(node)) {
+          node.emit('divergence', null, { reason: 'peer-limit' })
+          try { socket.close() } catch { /* */ }
+          rec = null
+          return
+        }
+        rec = makePeer(node, {}); rec._inbound = true; node._peers.set(pkey, rec)
+      }
       setPeerIdentity(deps, rec.peer, edPub, xPub)                   // listener learns the DIALER's real 26-char key
       // Attach BEFORE sending HS2: sending HS2 may synchronously drive the dialer to
       // completion and make it reply (e.g. outbox replay) reentrantly — our channel must
@@ -486,6 +557,7 @@ function createNode(identity, opts, deps, ep) {
     _now: opts.now || (() => Date.now()),
     _keepaliveMs: opts.keepaliveMs ?? 25000,
     _mtu: opts.mtu ?? 1200,
+    _maxInbound: opts.maxInboundPeers ?? MAX_INBOUND_PEERS,   // DOS-1: bound the accept-side table
     /**
      * find + handshake (first contact or reconnect); resolves after the IK first-ack.
      * Accepts a bare 26-char S (reusable mode — unchanged) OR a one-time invite share string
@@ -536,6 +608,13 @@ function createNode(identity, opts, deps, ep) {
   if (typeof tk.unref === 'function') tk.unref()
   node._tickTimer = tk
   if (ep && typeof ep.onConnection === 'function') ep.onConnection((sock) => node._accept(sock))
+  // META-1: invite mode only — make the pubkey-bearing HELLO answer ONLY a prober that can prove
+  // K_inv. A scanner reaching this socket now gets silence (not even a PROBE_ACK). Reusable-S
+  // installs nothing: S is public, the pubkeys it commits to are not a secret worth gating.
+  if (node._invite && ep && typeof ep.probeAuth === 'function') {
+    const inv = node._invite
+    ep.probeAuth((tok, nonce) => equal(Buffer.from(nonce), probeProof(inv, tok)))
+  }
   if (ep && typeof ep.on === 'function') ep.on('netchange', () => { Promise.resolve().then(() => deps.publishAll(identity.S ?? identity.key, ep)).catch(() => {}) })
   return node
 }

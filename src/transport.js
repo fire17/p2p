@@ -125,6 +125,33 @@ const PROBE = 0x01;
 const PROBE_ACK = 0x02;
 const ZERO_TOKEN = Buffer.alloc(8); // untrusted/legacy: no session correlation -> per-4-tuple accept
 
+// ---- DOS-1 accept-path guards (wargame-findings §2 DOS-1 / §5 DOS-2) --------
+// Pre-fix, ANY remote sender who reached the UDP port could stream forged 21-byte PROBEs (fresh
+// token per packet) and each one minted a socketLike into `_peers` AND `_accepted` — neither ever
+// evicted, no cap, no rate limit — then fired onConnection (→ a node peer record). Zero-cost,
+// remotely triggerable, unbounded memory. Fix: the accept table is now BOUNDED (hard cap), SWEPT
+// (accepted-but-no-HS1 expires; a confirmed-then-silent peer expires later), and RATE-LIMITED
+// (token bucket on new accepts + per-source-IP bucket on PROBE packets). Mirrors the DOS-1-WSS
+// guards already shipped in transport-wss.js (same shape, same names) — one doctrine, two transports.
+//
+// Bounds are chosen with real headroom over honest load (normal steady state is <10 concurrent
+// peers; a legit dialer produces exactly ONE accept and its ICE-lite burst is ~50 PROBEs/s/source
+// at 3 remote candidates × ~16.7 bursts/s):
+const MAX_ACCEPTED = 256;      // inbound socketLikes tracked at once (~25× the realistic peak)
+const MAX_PENDING = 64;        // of those, how many may be UNCONFIRMED (no HS1 yet) — a flood can
+                               // never crowd out the ≥192 slots left for real, handshaked peers
+const PENDING_TTL_MS = 20_000; // accepted but no HS1 within this → evict (HELLO retransmit gives up
+                               // after 8×250ms = 2s, so 20s is 10× the honest window)
+const ACCEPT_IDLE_MS = 90_000; // confirmed-but-silent → evict. MUST exceed wire's livenessMs
+                               // (keepalive 25s × 3 = 75s): wire declares a peer dead first, so this
+                               // sweep can never kill a channel the peer still considers alive.
+const ACCEPT_RATE = 20;        // sustained NEW accepts/s (token-bucket refill) — 20× honest rate
+const ACCEPT_BURST = 40;       // burst cap on new accepts
+const PROBE_RATE = 200;        // sustained PROBEs/s per source IP (4× the ~50/s honest ICE burst)
+const PROBE_BURST = 400;       // burst cap per source IP
+const MAX_SOURCES = 4096;      // bounded rate-limiter table (LRU) — the limiter is not itself a leak
+const SWEEP_MS = 5_000;        // idle-sweep cadence
+
 function probePkt(type, tok8, nonce8) {
   const b = Buffer.alloc(21);
   b.writeUInt32BE(PUNCH_MAGIC, 0);
@@ -137,7 +164,7 @@ function probePkt(type, tok8, nonce8) {
 // ---- Endpoint ---------------------------------------------------------------
 
 class Endpoint extends EventEmitter {
-  constructor() {
+  constructor(opts = {}) {
     super();
     this.sock4 = null;
     this.sock6 = null;
@@ -148,10 +175,103 @@ class Endpoint extends EventEmitter {
     this._punch = null; // active punch session { token, onProbe(type,nonce,rinfo) }
     this._peers = new Map(); // addrKey -> onMessage cb (one shared port, many punched peers)
     this._onConnCb = null; // onConnection callback — set => this endpoint accepts inbound first-contact
-    this._accepted = new Map(); // tokenHex -> socketLike (dedup multi-path accepts of one dialer session)
+    this._accepted = new Map(); // acceptKey -> socketLike (dedup multi-path accepts of one dialer session)
     this._srflx = null; // cached reflexive candidate
     this._netTimer = null;
+    this._sweepTimer = null;
+    // DOS-1 guards (all overridable — tests drive them with tiny bounds/TTLs)
+    this._now = opts.now || (() => Date.now());
+    this._maxAccepted = opts.maxAccepted ?? MAX_ACCEPTED;
+    this._maxPending = opts.maxPending ?? MAX_PENDING;
+    this._pendingTtlMs = opts.pendingTtlMs ?? PENDING_TTL_MS;
+    this._acceptIdleMs = opts.acceptIdleMs ?? ACCEPT_IDLE_MS;
+    this._acceptRate = opts.acceptRate ?? ACCEPT_RATE;
+    this._acceptBurst = opts.acceptBurst ?? ACCEPT_BURST;
+    this._probeRate = opts.probeRate ?? PROBE_RATE;
+    this._probeBurst = opts.probeBurst ?? PROBE_BURST;
+    this._maxSources = opts.maxSources ?? MAX_SOURCES;
+    this._sweepMs = opts.sweepMs ?? SWEEP_MS;
+    this._acceptTokens = this._acceptBurst;
+    this._acceptRefill = this._now();
+    this._probeBuckets = new Map(); // srcIP -> {tokens,last} (LRU-bounded)
+    this._probeAuthCb = null; // META-1: invite-mode probe authenticator (see probeAuth())
   }
+
+  // ---- DOS-1: rate limits ----------------------------------------------------
+
+  /** Token bucket over PROBE packets from ONE source IP. The table is LRU-bounded, so the
+   * limiter itself can never be turned into the memory leak it exists to prevent. (A SPOOFING
+   * flood defeats any per-source limiter by construction — the hard caps below are what bound
+   * memory there; this bucket targets the finding's stated attack, which needs no spoofing.) */
+  _allowProbe(ip) {
+    const t = this._now();
+    let b = this._probeBuckets.get(ip);
+    if (b) {
+      this._probeBuckets.delete(ip); // re-insert => Map iteration order is LRU
+      b.tokens = Math.min(this._probeBurst, b.tokens + ((t - b.last) / 1000) * this._probeRate);
+      b.last = t;
+    } else {
+      if (this._probeBuckets.size >= this._maxSources) this._probeBuckets.delete(this._probeBuckets.keys().next().value);
+      b = { tokens: this._probeBurst, last: t };
+    }
+    this._probeBuckets.set(ip, b);
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  }
+
+  /** Token bucket over NEW accepts (global). A legit dialer costs exactly one token. */
+  _allowAccept() {
+    const t = this._now();
+    this._acceptTokens = Math.min(this._acceptBurst, this._acceptTokens + ((t - this._acceptRefill) / 1000) * this._acceptRate);
+    this._acceptRefill = t;
+    if (this._acceptTokens < 1) return false;
+    this._acceptTokens -= 1;
+    return true;
+  }
+
+  // ---- DOS-1: bounded accept table -------------------------------------------
+
+  _dropAccept(k, s) {
+    this._accepted.delete(k);
+    try { s.close(); } catch { /* close() also purges every _peers tuple pointing at it */ }
+  }
+
+  /** Evict expired accepts: unconfirmed ones that never produced an HS1, and confirmed ones the
+   * peer has stopped talking on (after wire has already declared them dead). */
+  _sweepAccepts() {
+    const t = this._now();
+    for (const [k, s] of this._accepted) {
+      const expired = s.closed
+        || (!s._confirmed && t - s._acceptedAt > this._pendingTtlMs)
+        || (s._confirmed && t - s.lastSeen > this._acceptIdleMs);
+      if (expired) this._dropAccept(k, s);
+    }
+  }
+
+  _pendingCount() { let n = 0; for (const s of this._accepted.values()) if (!s._confirmed) n++; return n; }
+
+  /** Make room for a newcomer: shed the stalest UNCONFIRMED accept first (an unauthenticated
+   * flooder is always the cheapest thing to throw away), only then the stalest confirmed one. */
+  _evictOne() {
+    let pend = null, pendAt = Infinity, conf = null, confAt = Infinity;
+    for (const [k, s] of this._accepted) {
+      if (!s._confirmed) { if (s._acceptedAt < pendAt) { pendAt = s._acceptedAt; pend = k; } }
+      else if (s.lastSeen < confAt) { confAt = s.lastSeen; conf = k; }
+    }
+    const pick = pend ?? conf;
+    if (pick == null) return false;
+    this._dropAccept(pick, this._accepted.get(pick));
+    return true;
+  }
+
+  /**
+   * META-1: install an authenticator for unsolicited PROBEs. `fn(tok, nonce, rinfo) -> boolean`;
+   * a false verdict drops the packet SILENTLY — no PROBE_ACK, no accept, and above all no HELLO
+   * (which carries our identity pubkeys in the clear). Unset (reusable-S mode) => today's
+   * behaviour, byte-identical. node.js installs one in INVITE mode only.
+   */
+  probeAuth(fn) { this._probeAuthCb = typeof fn === 'function' ? fn : null; }
 
   _attach() {
     const handler = (msg, rinfo) => this._onMessage(msg, { ...rinfo, family: norm(rinfo.family) });
@@ -168,6 +288,10 @@ class Endpoint extends EventEmitter {
       }
     }, 10000);
     this._netTimer.unref?.();
+    // DOS-1: idle sweep — expire accepted-but-never-handshaked probes and long-silent peers even
+    // when no new PROBE arrives to trigger the inline sweep.
+    this._sweepTimer = setInterval(() => { try { this._sweepAccepts(); } catch { /* never throw on a timer */ } }, this._sweepMs);
+    this._sweepTimer.unref?.();
   }
 
   _onMessage(msg, rinfo) {
@@ -266,10 +390,15 @@ class Endpoint extends EventEmitter {
    * PROBE_ACK echo, keep the best-ranked validated path (IPv6>LAN>punched). Falls back to
    * TCP simultaneous-open when no UDP path validates. -> socketLike {send,onMessage,close}
    * @param {Array} remoteCands  candidates from the rendezvous lane
-   * @param {{signal?:AbortSignal, timeout?:number, token?:Buffer|string}} opts */
-  punch(remoteCands, { signal, timeout = 6000, token } = {}) {
+   * @param {{signal?:AbortSignal, timeout?:number, token?:Buffer|string, nonce?:Buffer}} opts
+   *   `nonce` (META-1): send this FIXED 8-byte nonce on every PROBE instead of a fresh random one.
+   *   node.js sets it in invite mode to a K_inv-derived proof over `token`, so the responder can tell
+   *   the invitee from a scanner. PROBE_ACK echoes it exactly as before — nothing else changes (the
+   *   packet is the same 21 bytes, the nonce is pseudorandom either way: no new wire signal). */
+  punch(remoteCands, { signal, timeout = 6000, token, nonce } = {}) {
     const tok8 = Buffer.alloc(8);
     if (token) (Buffer.isBuffer(token) ? token : Buffer.from(token)).copy(tok8);
+    const fixedNonce = nonce ? Buffer.from(nonce) : null;
     const cands = (remoteCands || []).filter((c) => c.proto === 'udp4' || c.proto === 'udp6');
 
     return new Promise((resolve, reject) => {
@@ -325,10 +454,10 @@ class Endpoint extends EventEmitter {
         for (const c of cands) {
           const ak = akey(c.ip, c.port);
           if (validated.has(ak)) continue;
-          const nonce = randomBytes(8);
+          const n8 = fixedNonce || randomBytes(8);
           if (!sent.has(ak)) sent.set(ak, new Set());
-          sent.get(ak).add(nonce.toString('hex'));
-          this._sendRaw(probePkt(PROBE, tok8, nonce), c.ip, c.port, c.proto === 'udp6');
+          sent.get(ak).add(n8.toString('hex'));
+          this._sendRaw(probePkt(PROBE, tok8, n8), c.ip, c.port, c.proto === 'udp6');
         }
       };
 
@@ -366,13 +495,25 @@ class Endpoint extends EventEmitter {
       get onMessage() { return (cb) => { handler = typeof cb === 'function' ? cb : (() => {}); }; },
       set onMessage(fn) { handler = typeof fn === 'function' ? fn : (() => {}); },
       get closed() { return closed; },
+      // DOS-1 bookkeeping (inbound accepts only; a dialed socket just carries them inertly).
+      _ak: null,               // key in `_accepted`
+      _acceptedAt: 0,          // when the PROBE was accepted -> pending TTL
+      _confirmed: false,       // node.js calls confirm() the moment HS1 authenticates
+      lastSeen: 0,             // last inbound datagram -> idle eviction
+      /** Leave the pre-auth (pending) set: this peer has proven what the handshake can prove. */
+      confirm: () => { sock._confirmed = true; sock.lastSeen = this._now(); },
       send: (buf) => {
         if (closed) return;
         if (locked) { this._sendRaw(buf, cur.address, cur.port, cur.family === 6); return; }
         for (const t of tuples) this._sendRaw(buf, t.address, t.port, t.v6); // fan out until the path is known
       },
-      close: () => { closed = true; for (const [k, s] of this._peers) if (s === sock) this._peers.delete(k); },
+      close: () => {
+        closed = true;
+        for (const [k, s] of this._peers) if (s === sock) this._peers.delete(k);
+        if (sock._ak && this._accepted.get(sock._ak) === sock) this._accepted.delete(sock._ak);
+      },
       _emit: (msg, ri) => {
+        sock.lastSeen = this._now();
         if (ri) { cur.address = ri.address; cur.port = ri.port; cur.family = ri.family === 6 ? 6 : 4; locked = true; } // first inbound locks the path
         try { handler(msg, ri); } catch { /* consumer handler threw */ }
       },
@@ -389,26 +530,41 @@ class Endpoint extends EventEmitter {
   /** Accept an unsolicited inbound PROBE as a new peer (listener side of first-contact). */
   _acceptInbound(tok, nonce, rinfo) {
     if (!this._onConnCb) return; // not listening for inbound — drop (don't ACK)
+    if (!this._allowProbe(rinfo.address)) return; // DOS-1: per-source flood — drop before any work
+    // META-1: in invite mode an unauthenticated prober gets NOTHING back — not even the PROBE_ACK
+    // that would confirm a p2p listener lives here, and never the pubkey-bearing HELLO.
+    if (this._probeAuthCb && !this._probeAuthCb(tok, nonce, rinfo)) return;
     // ACK every inbound PROBE (retransmits too) so the dialer's punch() validates the 4-tuple.
     this._sendRaw(probePkt(PROBE_ACK, tok, nonce), rinfo.address, rinfo.port, rinfo.family === 6);
+    const now = this._now();
     const rk = akey(rinfo.address, rinfo.port);
-    if (this._peers.has(rk)) return; // this exact 4-tuple already routed
+    const routed = this._peers.get(rk);
+    if (routed) { routed.lastSeen = now; return; } // this exact 4-tuple already routed
 
     // A dialer's ICE-lite punch bursts from several source addresses (v4 + multiple v6), so one
     // logical dialer arrives as MANY distinct rinfo tuples. When the PROBE carries a non-zero
     // session token we correlate them: fire onConnection ONCE per token and route every
     // same-token tuple to that one socketLike (its reply target follows the live path). With a
-    // zero token (no correlation available) we fire per-4-tuple — ICE-correct; the responder
-    // whose HELLO reaches the dialer's chosen path wins, the rest go silent (node.js converges).
-    if (!tok.equals(ZERO_TOKEN)) {
-      const tk = tok.toString('hex');
-      const existing = this._accepted.get(tk);
-      if (existing && !existing.closed) { existing._addTuple(rinfo); this._peers.set(rk, existing); return; } // same session, extra path
-      const sock = this._udpSocketLike(rinfo);
-      this._accepted.set(tk, sock);
-      return this._onConnCb(sock);
-    }
-    this._onConnCb(this._udpSocketLike(rinfo));
+    // zero token (no correlation available) we key per-4-tuple — ICE-correct; the responder whose
+    // HELLO reaches the dialer's chosen path wins, the rest go silent (node.js converges). Both
+    // kinds now live in `_accepted`, so the legacy zero-token path is capped/swept too (DOS-2).
+    const ak = tok.equals(ZERO_TOKEN) ? 'z:' + rk : 't:' + tok.toString('hex');
+    const existing = this._accepted.get(ak);
+    if (existing && !existing.closed) { existing.lastSeen = now; existing._addTuple(rinfo); this._peers.set(rk, existing); return; } // same session, extra path
+    if (existing) this._dropAccept(ak, existing); // stale/closed entry — never resurrect it
+
+    // DOS-1 admission control: sweep the expired, then the hard caps, then the rate bucket.
+    this._sweepAccepts();
+    if (this._pendingCount() >= this._maxPending) return;                          // too many un-handshaked
+    if (this._accepted.size >= this._maxAccepted && !this._evictOne()) return;     // table full, nothing sheddable
+    if (!this._allowAccept()) return;                                              // new-accept rate
+
+    const sock = this._udpSocketLike(rinfo);
+    sock._ak = ak;
+    sock._acceptedAt = now;
+    sock.lastSeen = now;
+    this._accepted.set(ak, sock);
+    this._onConnCb(sock);
   }
 
   /** TCP simultaneous-open fallback: listen on our port AND connect out to every tcp/udp
@@ -488,6 +644,7 @@ class Endpoint extends EventEmitter {
 
   close() {
     clearInterval(this._netTimer);
+    clearInterval(this._sweepTimer);
     try { this.sock4?.close(); } catch { /* ignore */ }
     try { this.sock6?.close(); } catch { /* ignore */ }
   }
@@ -502,9 +659,11 @@ function bindSock(sock, port) {
 }
 
 /** Create a dual-stack UDP endpoint (udp6 + udp4, same port when possible; udp4-only fallback).
+ * Accept-path guards (DOS-1) are on by default and tunable: {now, maxAccepted, maxPending,
+ * pendingTtlMs, acceptIdleMs, acceptRate, acceptBurst, probeRate, probeBurst, maxSources, sweepMs}.
  * @param {{port?:number}} opts  @returns {Promise<Endpoint>} */
-export async function createEndpoint({ port = 0 } = {}) {
-  const ep = new Endpoint();
+export async function createEndpoint({ port = 0, ...opts } = {}) {
+  const ep = new Endpoint(opts);
   // udp6 first (ipv6Only so udp4 is handled by its own socket — no ambiguous dual bind).
   try {
     const s6 = dgram.createSocket({ type: 'udp6', reuseAddr: true, ipv6Only: true });
