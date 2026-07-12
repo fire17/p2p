@@ -115,3 +115,43 @@ driver, no drift — EXCEPT check-2/6 flags the code-parse GAP above (the guard 
 
 ae06ff4 clear. 20db733 clear to ship with the ghost-group GAP recorded — owner's call on whether to gate
 the cross-client checksum follow-up before or after dev.4. Resident.
+
+---
+
+## RE-GATE 2026-07-12 — 9a19b55 (group-code checksum) — GHOST-GROUP GAP CLOSED · CONFIRMED-SHIP
+
+The GAP above is fixed. `src/group.js` UNTOUCHED (0 diff lines — G/protocol unchanged); pure
+human-facing encoding in `bin/p2p-group.js` + `src/browser/app.js` + `test/tui-group.test.js`.
+New format both sides: **CODE = base64( G(32B) ‖ SHA256(G)[0..3) )** = 35 bytes / 48 chars, checksum
+computed over G (not the base64), so both clients derive it identically.
+
+**My own probes (re-run against the NEW parse):**
+- The prior gate's two silent-ghost typos now **THROW**: `middle-char typo → THROW`, `last-char w→A →
+  THROW` (were `ACCEPT, DIFFERENT G` at 20db733). RED→GREEN proven directly across the two commits.
+- Happy path: `newGroupCode()→parseGroupCode()` **10/10** round-trip; tui-group.test.js **6/6**.
+- **Independent exhaustive sweep** (my own, fixed vector `Buffer.alloc(32,7)`): 2961 single-char
+  mutations (47 non-pad chars × 63) → **2961 throw, 0 same-G, 0 GHOSTS**. Corroborates the lane's
+  in-test sweep (`assert.ok(mutations > 3000)` + `assert.deepEqual(accepted, [])`) — real, not a
+  strawman. (24-bit checksum ⇒ ~2⁻²⁴ collision/mutation; zero in this deterministic vector.)
+
+**Cross-client byte-compat (the interop keystone) — CONFIRMED:**
+- My probe: `CLI mint === independent(browser-algo) mint` for the same G = **true**; `CLI parses a
+  browser-format code → same G` = **true**.
+- The lane's `browser<->CLI` unit test mirrors app.js verbatim and asserts both mint directions agree.
+- **Source tripwire PINS app.js** (confirmed by reading): the test `readFileSync('../src/browser/app.js')`
+  then `assert.match` on the EXACT `createHash('sha256').update(G).digest().subarray(0, 3)` expression,
+  the `raw.length !== 35` check, AND `checksum failed`. If the browser copy drifts, this test fails —
+  the browser↔CLI split hiding spot is pinned.
+
+**Bonus bug (raw-G-displayed-as-code) — FIXED both sides:** `group.secret` from group.js is raw base64
+G (no checksum) — displaying it would emit an unjoinable string post-checksum. Now: CLI `/code` and
+`/add` print `code` (the minted checksummed code, comment explicit); browser `groupCode` (app.js:84
+"the SHAREABLE code (G‖checksum) — NOT group.secret", set at :101, displayed at :91).
+
+**Honest GAP (lane-flagged, I concur):** `app.js` is NOT executed (needs a DOM) — `node --check
+src/browser/app.js` passes (syntax only). Live browser proof is `test/browser-group-ui.mjs`
+(playwright+network), marked **UNVERIFIED — not run** (owner live-testing). The verbatim mirror + the
+source tripwire are the mitigation; a real browser round-trip should confirm post-bump.
+
+**Verdict: CONFIRMED-SHIP.** The ghost-group footgun is closed; interop is pinned; happy path intact.
+Clear for the dev.4 bundle.
