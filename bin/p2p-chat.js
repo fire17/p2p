@@ -18,6 +18,7 @@
 import readline from 'node:readline'
 import process from 'node:process'
 import { generateIdentity, decodeKey, verifyCommitment, TypoError } from '../src/key.js'
+import { loadOrCreateIdentity } from './lib.js'
 
 // ── tiny ANSI (skipped when not a TTY) ───────────────────────────────────────
 const TTY = process.stdout.isTTY
@@ -49,14 +50,16 @@ const asBuf = (d) => (Buffer.isBuffer(d) ? d : Buffer.from(String(d)))
 // node.connect(KEY)     -> Promise<peer>  RESOLVES ONLY AFTER the first-ack (the proof)
 // node.close()
 // peer.send(data)       -> Promise<ack>   ; peer.S / peer.shortId
-async function loadBackend() {
+async function loadBackend({ ephemeral = false, profile = 'default' } = {}) {
   try {
     const mod = await import(new URL('../src/node.js', import.meta.url))
     if (typeof mod.listen === 'function' && typeof mod.identity === 'function') {
       // ponytail: real node.js may name its message/peer event payloads differently —
       // if wiring breaks when it lands, reconcile the event shapes in THIS function
       // (single reconcile point) against INTERFACES.md §node.js.
-      return { real: true, identity: mod.identity, listen: mod.listen }
+      // STABLE identity (~/.p2p/<profile>.json) so a killed+restarted listener keeps the
+      // same key — item #5 (buffered resend across restart) needs this. --ephemeral opts out.
+      return { real: true, identity: () => loadOrCreateIdentity({ ephemeral, profile }), listen: mod.listen }
     }
   } catch {
     /* not built yet — fall through to embedded demo backend */
@@ -302,8 +305,10 @@ async function main() {
       [
         bold('p2p-chat') + ' — MITM-proof P2P demo chat',
         '',
-        '  p2p-chat                 generate a key, listen, wait for incoming',
+        '  p2p-chat                 load/create stable key, listen, wait for incoming',
         '  p2p-chat <KEY>           connect to a 26-char key, then chat',
+        '  p2p-chat --ephemeral     use a throwaway key (not saved to ~/.p2p)',
+        '  p2p-chat --profile <n>   use a separate stored identity',
         '  p2p-chat --selftest      run two in-process nodes end-to-end',
         '  p2p-chat --help          this text',
       ].join('\n')
@@ -312,8 +317,11 @@ async function main() {
   }
   if (args.includes('--selftest')) return selftest()
 
-  const be = await loadBackend()
-  const key = args.find((a) => !a.startsWith('-'))
+  const ephemeral = args.includes('--ephemeral')
+  const pIdx = args.indexOf('--profile')
+  const profile = pIdx >= 0 && args[pIdx + 1] ? args[pIdx + 1] : 'default'
+  const be = await loadBackend({ ephemeral, profile })
+  const key = args.find((a) => !a.startsWith('-') && a !== profile)
   if (key) await runConnect(be, key)
   else await runListen(be)
 }
