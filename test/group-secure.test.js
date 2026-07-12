@@ -178,6 +178,36 @@ test('group: removal is cryptographic — after rotation the removed member decr
   t.close()
 })
 
+// ── GRP-4: a late joiner (group object created after the admin keyed out) still gets re-keyed ────
+test('group GRP-4: a member whose group is created AFTER the admin keyed out is durably re-keyed and can decrypt', async () => {
+  const bd = board()
+  const A = await identity(), B = await identity(), C = await identity()
+  const nA = await listen(A, { endpoint: bd.endpoint(A.S), deps: rv })
+  const nB = await listen(B, { endpoint: bd.endpoint(B.S), deps: rv })
+  const nC = await listen(C, { endpoint: bd.endpoint(C.S), deps: rv })
+  const G = randomBytes(32)
+  const gA = createSecureGroup(nA, A, { secret: G, members: [B.S, C.S], create: true })
+  const gB = createSecureGroup(nB, B, { secret: G, members: [A.S] })
+
+  // A and B come up. A pushes its sender key to B and C — but C's GROUP OBJECT does not exist yet, so
+  // C's node drops the group frames and A optimistically marks C 'keyed'. This is the GRP-4 bug: on
+  // its own A will never re-push to C, so C would be permanently un-keyed.
+  await gA.join(); await gB.join(); await wait(150)
+
+  // C's group is created LATE (the user opened the app after the group already existed), seeded with
+  // the admin as a bootstrap contact — exactly what an invite / share string carries.
+  const gC = createSecureGroup(nC, C, { secret: G, members: [A.S] })
+  const gotC = []
+  gC.on('message', (from, d) => gotC.push({ from, text: d.toString() }))
+  await gC.join(); await wait(250)                    // C PULLS the keys it is missing (KEYREQ → A)
+
+  await gA.send('welcome, late C'); await wait(250)
+  assert.equal(gotC.at(-1)?.text, 'welcome, late C', 'the late joiner decrypts after being re-keyed (GRP-4)')
+  assert.equal(gotC.at(-1)?.from, A.S, 'and it is provably from the admin')
+  assert.ok(gC.members().includes(A.S) && gC.members().includes(C.S), 'C learned the membership via the pull')
+  nA.close(); nB.close(); nC.close()
+})
+
 // ── GRP-2: removal ejects the removed member from EVERY sender, not just the admin ───────────────
 test('group GRP-2: after a removal a NON-ADMIN survivor rotates too — the removed member cannot DECRYPT it', async () => {
   const t = await threeParty()

@@ -97,7 +97,7 @@ export function createGroup(node, keys) {
 // ── secure groups: wire ──────────────────────────────────────────────────────────────────────
 
 const GMAGIC = 0x67 // 'g' — first byte of every group envelope, inside the pairwise Noise plaintext
-const T = Object.freeze({ KEYDIST: 1, MSG: 2, OP: 3, RELAY: 4 })
+const T = Object.freeze({ KEYDIST: 1, MSG: 2, OP: 3, RELAY: 4, KEYREQ: 5 })
 const TAGLEN = 16
 const MAX_SKIP = 1000 // ratchet skip-ahead bound (a lost message must not strand the chain)
 
@@ -263,6 +263,10 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   const groupId = groupIdFor(G)
   const gidHex = groupId.toString('hex')
   const me = String(identity.S).toUpperCase()
+  // Bootstrap contacts: members I was told about out-of-band (the `members` option / an invite share).
+  // For a LATE joiner these are the only peers it can reach before it has ingested any ops — the seed
+  // for the GRP-4 pull. For the creator they are its initial roster (already in the create op).
+  const bootstrap = (initial || []).map((s) => String(s).toUpperCase()).filter((s) => s !== me)
 
   const ops = []                    // membership chain (unordered; folded on read)
   const opHeads = new Set()
@@ -274,6 +278,7 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   const pending = []                // messages whose parents we haven't seen yet
   const handlers = { message: [], membership: [], divergence: [] }
   const keyedTo = new Set()         // members who already hold my sender key (join-order independence)
+  const pulling = new Set()         // members I have an outstanding KEYREQ to (bounds pull amplification)
   let joined = false
 
   const emit = (ev, ...a) => { for (const fn of handlers[ev] || []) { try { fn(...a) } catch { /* handler threw */ } } }
@@ -328,9 +333,27 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     // Learning the chain can REVEAL members we didn't know existed when we joined. Without this,
     // join-order matters: a member that join()s before the admin's chain reaches it distributes its
     // sender key to nobody, and its messages then decrypt for no one — a silent, order-dependent
-    // dead end. Re-sync instead: anyone newly visible who lacks my sender key gets it now.
-    if (joined) syncKeys()
+    // dead end. Re-sync instead: anyone newly visible who lacks my sender key gets it now (push), AND
+    // pull any sender key I'm still missing from the members the chain just revealed (GRP-4).
+    if (joined) { syncKeys(); pullKeys() }
     return true
+  }
+
+  /**
+   * GRP-4: PULL the sender keys I'm missing. The push side (syncKeys) marks a member 'keyed' as soon
+   * as the pairwise send acks — but that ack means "the node got the bytes", NOT "the recipient's
+   * GROUP object processed them". A member whose group is created AFTER the admin pushed (a late
+   * joiner) has its keydist dropped, yet the admin marks it done and never re-pushes → it can never
+   * decrypt. The durable fix is a member-side pull: once my group exists I ask every member I know
+   * (bootstrap contacts I was seeded with, plus any I've since folded) that I still lack a receive-key
+   * from to (re)send it. Bounded by `pulling` so a burst of ingests can't amplify into a KEYREQ flood.
+   */
+  function pullKeys() {
+    for (const S of new Set([...bootstrap, ...others()])) {
+      if (S === me || recvChains.has(S) || pulling.has(S)) continue
+      pulling.add(S)
+      toMember(S, encodeEnv(T.KEYREQ, groupId, { s: me, ...myPub() })).catch(() => { pulling.delete(S) })
+    }
   }
 
   /** Give my sender key to every member who doesn't have it yet. Idempotent; safe to call often. */
@@ -398,6 +421,17 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
       for (const o of body.ops || []) ingestOp(o)             // learn the membership chain
       if (!membership().members.has(S)) { emit('divergence', { reason: 'keydist-nonmember', by: S }); return true }
       recvChains.set(S, ratchet(unb64(body.ck), body.q || 0))
+      pulling.delete(S)                                       // GRP-4: the pull for S is satisfied
+      return true
+    }
+
+    if (type === T.KEYREQ) {                                  // GRP-4: a member is (re)requesting my key
+      const R = String(body.s).toUpperCase()
+      const bound = bindIdentity(R, body.e, body.x)
+      if (!bound) return true                                 // unbindable requester — ignore, fail closed
+      if (!membership().members.has(R)) return true           // only serve CURRENT members (a removed one cannot re-pull)
+      keyedTo.add(R)
+      keydistTo(R).catch(() => { /* still unreachable — the requester will retry on its next pull */ })
       return true
     }
 
@@ -478,6 +512,7 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     async join() {
       if (!sendChain.ck) sendChain.ck = randomBytes(32)
       joined = true
+      pullKeys()                      // GRP-4: pull keys from members I know, even if I have no ops yet
       return syncKeys()
     },
 
