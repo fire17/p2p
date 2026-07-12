@@ -461,6 +461,36 @@ async function drainRest(it, cap, graceMs, pending = null) {
 }
 
 /**
+ * The record for the peer S names — whichever way it happens to be keyed.
+ *
+ * node._peers is keyed TWO ways and cannot be keyed one way: a DIALED peer by its 26-char S (that is
+ * all we know before the handshake), an ACCEPTED one by 'static:'+xPub (that is all we know after it).
+ * The two are not interconvertible at dial time — decodeKey(S) yields a 110-bit COMMITMENT, not the
+ * pubkeys (src/key.js) — so `_peers.get(S)` structurally MISSES a peer that reached us inbound. The
+ * cost was a duplicate record and a whole second dial (rendezvous + punch + a second Noise session)
+ * every time we dialed someone who had already dialed us. It is what forced GRP-6's group-layer
+ * workaround: a browser is REACHABLE but often cannot be dialed BACK, so the reverse dial never
+ * completed and its sender key never arrived.
+ *
+ * The one thing that DOES bridge the two key spaces is the commitment itself: verifyCommitment tests a
+ * KNOWN pubkey pair against it, and an accepted record has stored the peer's Noise-authenticated
+ * remoteEd/remoteStatic since its handshake. So we ask each record "are you the peer S names?" — the
+ * exact check the HELLO gate already trusts (see the D4 gate below), no new assumption, O(peers) hashes
+ * on a dial only. Version-independent too, unlike matching on peer.key (encodeKey pins version 0).
+ */
+function findPeer(node, deps, S, dec) {
+  const direct = node._peers.get(S)
+  if (direct) return direct
+  if (typeof deps.verifyCommitment !== 'function' || !dec || !dec.commitment) return null
+  for (const rec of node._peers.values()) {
+    const p = rec.peer
+    if (!p.remoteEd || !p.remoteStatic) continue          // never handshaked — nothing to match against
+    if (deps.verifyCommitment(dec.commitment, p.remoteEd, p.remoteStatic)) return rec
+  }
+  return null
+}
+
+/**
  * Initiator (dialer) side: resolve -> punch -> gate HELLO -> IK -> resolve after first-ack.
  * @param {object} [ctx] {resolve, invite} — invite mode dials an invite-scoped rendezvous (rid_inv +
  *   sealed candidates) and runs Noise_IKpsk2. Absent => today's reusable-S path, byte-identical.
@@ -468,8 +498,19 @@ async function drainRest(it, cap, graceMs, pending = null) {
 function initiatorHandshake(node, deps, S, dec, ctx = {}) {
   const inv = ctx.invite || null
   const resolveFn = ctx.resolve || deps.resolve
-  let rec = node._peers.get(S)
+  let rec = findPeer(node, deps, S, dec)
   if (!rec) { rec = makePeer(node, { S }); node._peers.set(S, rec) }
+  else if (rec._inbound) {
+    // ADOPT the accepted record instead of minting a second one for the same peer. Its key stays
+    // 'static:…' (re-keying the map would let peers() emit the same peer twice); findPeer bridges.
+    // It keeps its outbox, so anything queued while it was down replays on attach.
+    rec.peer.S = S                                        // an accepted record is minted with S = null
+    // ...and it stops counting as inbound. DOS-1 sheds exactly "inbound, disconnected, empty outbox"
+    // (see admitInbound) — which is this record, right now, mid-dial. Left flagged, a concurrent
+    // inbound flood could delete it out from under the handshake and attach() would write into an
+    // orphan that peers() no longer lists.
+    rec._inbound = false
+  }
   const myConnId = randomBytes(8)
 
   return (async () => {
@@ -700,7 +741,12 @@ function createNode(identity, opts, deps, ep) {
         if (!secret && hasInvite(dec.version)) {
           throw new TypoError('this is a one-time invite key — you need the full share string (S-…)')
         }
-        const existing = node._peers.get(S)
+        // Whichever way this peer is keyed — S (we dialed it) or 'static:'+xPub (it dialed us). A live
+        // session is a live session; dialing it again would only mint a second one. In invite mode
+        // this returns the live peer WITHOUT spending the invite, which is the same semantics the
+        // S-keyed short-circuit already had — the burn guard below is untouched and still refuses a
+        // re-dial once the session has actually ended.
+        const existing = findPeer(node, deps, S, dec)
         if (existing && existing.peer.connected) return existing.peer
         if (!secret) return initiatorHandshake(node, deps, S, dec)   // reusable-S: identical to v0.1.0
 
