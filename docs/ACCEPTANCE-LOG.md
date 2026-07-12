@@ -443,3 +443,43 @@ resolvable over public infra; on a LAN, mDNS makes it instant).
 **Still NOT witnessed:** invite mode across two *different* networks (both processes here were on one
 host — the RENDEZVOUS was public, the punch was local), and invite mode from the browser (the browser
 build has no `makeRace` seam, so `connect('S-…')` throws there — see the v0.2 known gaps).
+
+### 🌐 BROWSER GROUP UI + DEEP LINKS — WITNESSED IN REAL BROWSERS (2026-07-12, hub-wiring)
+
+The site was about to tell strangers that group chat and the `#<KEY>` link work. Neither had a
+witnessed run, so both were held at "pending" until I ran them myself against the SHIPPED artifact
+(`app/index.html`, which loads `/src/browser/app.js` — zero-fork, one copy of the source).
+
+**Group UI — `test/browser-group-ui.mjs` (browser-research's gate, run here), two real Chromium pages,
+driven through the shipped buttons (not the programmatic hooks):**
+
+```
+  alice 0KVV32AW0GG29XD2MBGTCDH8Z5
+  bob   0V7J9171JVQ99VPK2T1GGQ7R7R
+  ✔ alice created a group (with bob listed) via the UI, code = wREheGF2pOj7DxLn…
+  ✔ bob joined via the UI with the group code
+  ✔ bob reached full membership via the admin re-sync
+  ✔ bob → group message shown in alice's group log
+  ✔ alice → group message shown in bob's group log
+
+✔ BROWSER GROUP UI PASSED — create + add + join + chat, all through the shipped /app/ buttons
+```
+
+**Deep links — `scratch/deeplink-check.mjs`, real Chromium against the shipped page:**
+
+```
+#<KEY> deep link      → #peerkey = "072QMAE5VSHVE7WF2RGWF379HN"  ✔
+#<group-code> deep link → join field = "wREheGF2pOj7DxLnQ8vYt3Zk1aBcDeFgHiJkLmNoPq0="  ✔
+
+PASS — BOTH deep links prefill their fields in a real browser (#<KEY> → dial box, #<group-code> → join box).
+```
+
+Two false negatives were mine, not the app's, and are worth recording so the next person doesn't
+"fix" a working feature: (1) the group-code field is `#groupSecret`, not `#groupJoinCode`; (2) the
+deep-link rule is `frag.length > 26` → group box, so a too-short fake code silently does nothing; and
+(3) navigating the *same document* to a new `#hash` is an in-page fragment change — the module never
+re-runs, so the second link must be opened in a FRESH page or it reports empty.
+
+**Invite dialing from the browser remains NOT shipped** (`src/browser/p2p.js` injects no `makeRace`
+seam). The app detects an `S-<tail>` share string and reports it honestly instead of misrouting it to
+the group box (`src/browser/app.js`) — documented as terminal-only + fast-follow, not papered over.

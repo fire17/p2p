@@ -314,10 +314,11 @@
 
     <ul class="facts" style="margin-top:18px">
       <li><b>No backend of ours</b> Discovery rides public WebSocket trackers; the media path is a WebRTC DataChannel when it can be, and a zero-dependency <b>WSS relay</b> when it can’t. Whichever completes the verified handshake first wins.</li>
-      <!-- GATED CLAIMS — flip only on a witnessed run (team-lead GREEN per capability). See CHANGELOG "Known gaps". -->
+      <!-- Each claim below corresponds to a WITNESSED run in docs/ACCEPTANCE-LOG.md. Do not add one without a run. -->
       <li><b>Pair chat — verified</b> Paste a key and chat 1:1 with a browser <em>or</em> a terminal peer. Witnessed in real browsers: browser↔browser, and browser↔TUI over both a WebRTC DataChannel and the WSS relay.</li>
-      <li><b>Group chat — shipping, acceptance pending</b> The client has a <b>Group chat</b> tab (create from a list of keys, share the code, others join). We don’t call it verified until a real two-browser run is witnessed — until then the <a href="#groups">terminal/library group path</a> is the proven one.</li>
-      <li><b>Invites are terminal-only today</b> <a href="#invites">Private invites</a> dial from the terminal; the web client takes reusable 26-char keys. In-browser invite dialing is next up, not shipped.</li>
+      <li><b>Group chat — verified</b> Create a group from a list of keys, share the code, others join. Witnessed end to end in two real browsers, driven through the shipped buttons: create → add → join → messages both ways.</li>
+      <li><b>Deep links — verified</b> <code>/app/#&lt;KEY&gt;</code> prefills the dial box; <code>/app/#&lt;group-code&gt;</code> prefills the group Join box. Send one link and your friend is one click from talking to you.</li>
+      <li><b>Invites are terminal-only today</b> <a href="#invites">Private invites</a> dial from the terminal; the web client takes reusable 26-char keys — paste an <code>S-…</code> share string and it says so plainly rather than misrouting it. In-browser invite dialing is a fast-follow.</li>
     </ul>
     <p class="note">A browser needs <code>https://</code> (or <code>localhost</code>) — WebCrypto and honest security both
       want a secure context.</p>

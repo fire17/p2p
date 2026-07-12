@@ -71,13 +71,18 @@ gate we run, not a claim we make).
   can't. Whichever completes the verified handshake first wins.
 - **Pair chat — verified.** Paste a key and chat 1:1 with a browser peer *or* a terminal peer.
   Witnessed in real browsers: browser↔browser, and browser↔TUI over both a WebRTC DataChannel and
-  the WSS relay (`docs/ACCEPTANCE-LOG.md`).
-- **Group chat — shipping, acceptance run pending.** The client has a **Group chat** tab (create a
-  group from a list of keys, share the group code, others join). We will not call it verified here
-  until a real two-browser run is witnessed and logged; until then, treat the terminal/library group
-  path (§4) as the proven one.
-- **Private invites (§3) are terminal-only today.** The web client dials reusable 26-char keys, not
-  `S-…` share strings. In-browser invite dialing is next up, not shipped.
+  the WSS relay.
+- **Group chat — verified.** Open the **Group chat** tab: create a group from a list of keys, share
+  the group code, others join. Witnessed end to end in two real browsers, driven through the shipped
+  buttons — create → add → join → messages both ways.
+- **Deep links — verified.** `p2p.akeyo.io/app/#<KEY>` prefills the dial box;
+  `p2p.akeyo.io/app/#<group-code>` prefills the group Join box. Send a friend one link and they're
+  one click from talking to you.
+- **Private invites (§3) are terminal-only today.** The web client dials reusable 26-char keys; paste
+  an `S-…` share string and it tells you so plainly rather than misrouting it. In-browser invite
+  dialing is a fast-follow, not shipped.
+
+Every claim above is a run recorded in [`docs/ACCEPTANCE-LOG.md`](docs/ACCEPTANCE-LOG.md).
 - A browser needs `https://` (or `localhost`): WebCrypto and honest security both want a secure
   context.
 
