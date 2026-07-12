@@ -239,3 +239,29 @@ test('Buffer.isBuffer survives TWO module instances (the footgun browser-build h
   // ...and still reject a plain Uint8Array (matches Node)
   assert.equal(ShimBuffer.isBuffer(new Uint8Array(4)), false, 'a bare Uint8Array is still not a Buffer')
 })
+
+test('assertSingleInstance: throws loudly once a second instance has loaded', async () => {
+  // A fresh child process is the only clean way to assert the ONE-instance case: this test file
+  // has itself already loaded a 2nd instance above (the ?dup=1 import), so the count is >1 here.
+  const { execFileSync } = await import('node:child_process')
+  const oneInstance = execFileSync(
+    process.execPath,
+    ['-e', "import('./src/browser/shim/buffer.js').then(m => { m.assertSingleInstance(); console.log('OK-SINGLE') })"],
+    { encoding: 'utf8' },
+  )
+  assert.match(oneInstance, /OK-SINGLE/, 'a single instance must NOT throw')
+
+  // two instances (import-map path + a relative-path bypass) → assertSingleInstance throws with a
+  // clear, actionable message
+  const two = execFileSync(
+    process.execPath,
+    [
+      '-e',
+      "Promise.all([import('./src/browser/shim/buffer.js'), import('./src/browser/shim/buffer.js?dup=1')])" +
+        ".then(([a]) => { try { a.assertSingleInstance(); console.log('NO-THROW') } catch (e) { console.log('THREW:' + e.message) } })",
+    ],
+    { encoding: 'utf8' },
+  )
+  assert.match(two, /THREW:/, 'two instances must throw')
+  assert.match(two, /bypassed the import map/, 'the error message must be actionable')
+})

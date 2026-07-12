@@ -19,6 +19,34 @@ const dec = new TextDecoder()
 const HEX = []
 for (let i = 0; i < 256; i++) HEX[i] = i.toString(16).padStart(2, '0')
 
+// Instance counter in the GLOBAL symbol registry. Loading this module a second time (a relative
+// import that bypasses the import map) increments it. isBuffer (below) is brand-based so two copies
+// still INTEROPERATE — but two copies are an import-hygiene bug (wasted bytes, a sign the map was
+// bypassed), so the page bootstrap calls assertSingleInstance() to FAIL FAST with a clear message
+// rather than let a subtle duplication lurk. This module itself never throws, so tests can load as
+// many instances as they like to exercise the cross-instance brand.
+const REG = Symbol.for('p2p.shim.buffer.registry.v1')
+if (globalThis[REG]) globalThis[REG].count++
+else globalThis[REG] = { count: 1 }
+
+/**
+ * Throw if more than one instance of this module has been evaluated. Call ONCE at page bootstrap
+ * (see ../p2p.js). ESM evaluates all static imports before any body runs, so by bootstrap time
+ * every statically-imported copy is already counted — a relative import that bypassed the import
+ * map is caught here with a clear message instead of as a mysterious "Buffers required" handshake
+ * rejection later. @throws {Error} when count > 1
+ */
+export function assertSingleInstance() {
+  const n = globalThis[REG]?.count || 1
+  if (n > 1) {
+    throw new Error(
+      `p2p: ${n} instances of shim/buffer.js loaded — a relative import bypassed the import map. ` +
+        `Import Buffer only through the "node:crypto"/shim import-map path (or one consistent path), ` +
+        `or noise.js/key.js may reject valid keys. See src/browser/shim/buffer.js.`,
+    )
+  }
+}
+
 // Cross-instance brand. isBuffer() must NOT be `instanceof`: if this module is ever loaded via two
 // URLs (e.g. the import-map specifier AND a relative path), instanceof gives FALSE for a valid
 // buffer from the other instance — and src/noise.js / src/key.js gate their inputs on isBuffer, so

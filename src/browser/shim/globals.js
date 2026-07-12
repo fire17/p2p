@@ -9,7 +9,12 @@
 //
 // (`node:crypto` is handled separately, by the import map in index.html -> ./node-crypto.js.)
 
-import { Buffer } from './buffer.js'
+import { Buffer, assertSingleInstance } from './buffer.js'
+
+// Fail fast if a relative import ever bypassed the import map and loaded a 2nd copy of buffer.js:
+// the brand-based isBuffer keeps two copies INTEROPERATING, but a duplicate is a real import-hygiene
+// bug that this catches loudly at startup instead of as a mysterious later key rejection.
+assertSingleInstance()
 
 if (typeof globalThis.Buffer === 'undefined') globalThis.Buffer = Buffer
 
