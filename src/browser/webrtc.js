@@ -1,0 +1,385 @@
+// src/browser/webrtc.js — the browser's transport + rendezvous, behind the EXISTING seams.
+//
+// This is the only genuinely new protocol-adjacent module the browser needs. Everything else
+// (key.js, noise.js, wire.js, node.js, group.js) is the TUI's own source, unchanged.
+//
+// It provides the three seams src/node.js injects (docs/API-SKETCH + src/node.js resolveDeps):
+//
+//   createEndpoint()      -> ep   with ep.punch(cands,{token}) and ep.onConnection(cb)
+//   publishAll(S, ep)     -> stay reachable under rid(S)   (the LISTENER side)
+//   resolve(S)            -> candidate stream               (the DIALER side)
+//
+// ...so src/node.js drives HELLO -> commitment gate -> Noise IK -> wire framing over a WebRTC
+// DataChannel exactly as it does over UDP. node.js does not know or care which it is.
+//
+// WHY WebRTC: a browser has no raw UDP socket — no STUN of its own, no hole punch, no DHT, no
+// listening socket. RTCDataChannel is the ONLY peer-to-peer primitive it has. (research/
+// browser-client.md §5.1.)
+//
+// WHY THE TRACKERS: WebRTC needs an offer/answer exchange. We already have one — the public WSS
+// trackers in src/rendezvous/tracker.js, keyed by rid = HKDF(S, "p2p-rv-tracker-v1", epoch, 20).
+// The TUI currently posts a FAKE SDP there (an a=p2p-blob envelope for UDP candidates); the
+// browser posts a REAL one. Same trackers, same infohash derivation, same message shape — so the
+// browser reuses our rendezvous with ZERO new infrastructure and nothing of ours to run.
+//
+// SECURITY: none of this is trusted. The tracker is an untrusted matchmaker, STUN is untrusted,
+// and WebRTC's DTLS is an untrusted outer wrapper — an attacker who rewrites the SDP owns the
+// DTLS layer and still cannot pass the commitment gate or produce a decryptable Noise msg2. The
+// security boundary is the Noise layer that node.js runs ON TOP of this. See §8/§9 of the study.
+//
+// ROLES (deliberately asymmetric, so a pair converges on ONE DataChannel instead of racing two):
+//   LISTENER (publishAll): parks real WebRTC offers on the trackers under its rid, and CREATES
+//                          the DataChannel. On answer -> channel opens -> onConnection -> HELLO.
+//   DIALER   (punch):      announces under the target's rid WITHOUT offers, receives a parked
+//                          offer, answers it, and receives the DataChannel via ondatachannel.
+// This mirrors WebTorrent/trystero, and it lands the accepter on the side node.js expects to
+// send HELLO.
+
+import { deriveRid } from '../key.js'
+import { TRACKERS, infoHashFor, randId20 } from '../rendezvous/tracker.js'
+import { announceEpochs, resolveEpochs } from '../rendezvous/race.js'
+
+/** Free public STUN — the same servers src/transport.js already uses. No TURN, none of ours. */
+export const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+]
+
+const OFFERS_PER_ANNOUNCE = 4 // each parked offer is single-use; a few lets several dialers land
+const ANNOUNCE_INTERVAL_MS = 10_000 // trystero cadence; parked offers expire ~120s
+const RECONNECT_MS = 3000
+const ICE_GATHER_MS = 3000 // cap on waiting for ICE gathering (we ship what we have)
+const DIAL_TIMEOUT_MS = 30_000
+
+/** Wait for ICE gathering to finish (or the cap) — we send one complete SDP, no trickle. */
+function whenIceGathered(pc, capMs = ICE_GATHER_MS) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer)
+      pc.removeEventListener('icegatheringstatechange', check)
+      resolve()
+    }
+    const check = () => pc.iceGatheringState === 'complete' && done()
+    const timer = setTimeout(done, capMs) // partial candidates are fine — ICE keeps working
+    pc.addEventListener('icegatheringstatechange', check)
+  })
+}
+
+/**
+ * Wrap an open RTCDataChannel in the socket-like src/node.js + src/wire.js expect:
+ * `.send(frame)` / `.onMessage(buf)` / `.close()` / `.closed` / `.rinfo`.
+ * Frames are already <= node's mtu (1200 B default), far under the ~16 KiB DataChannel ceiling.
+ */
+function socketFromChannel(dc, pc) {
+  dc.binaryType = 'arraybuffer'
+  const socket = {
+    closed: false,
+    rinfo: { address: 'webrtc', port: 0 }, // wire.js roams by connId, not by rinfo — this is inert
+    onMessage: null,
+    send(frame) {
+      if (socket.closed || dc.readyState !== 'open') return
+      try {
+        dc.send(frame instanceof Uint8Array ? frame : new Uint8Array(frame))
+      } catch {
+        /* channel died mid-send; wire's ARQ/keepalive will notice */
+      }
+    },
+    close() {
+      if (socket.closed) return
+      socket.closed = true
+      try { dc.close() } catch { /* */ }
+      try { pc.close() } catch { /* */ }
+    },
+  }
+  dc.onmessage = (ev) => {
+    if (socket.onMessage) socket.onMessage(Buffer.from(new Uint8Array(ev.data)))
+  }
+  dc.onclose = () => {
+    socket.closed = true
+  }
+  return socket
+}
+
+/**
+ * The browser rendezvous+transport. One object owns the tracker sockets, the peer connections
+ * and the endpoint, so closing it tears everything down.
+ * @param {object} [opts] {trackers, iceServers, RTCPeerConnection, WebSocket, now}
+ */
+export function createBrowserTransport(opts = {}) {
+  const trackers = opts.trackers || TRACKERS
+  const iceServers = opts.iceServers || ICE_SERVERS
+  const PC = opts.RTCPeerConnection || globalThis.RTCPeerConnection
+  const WS = opts.WebSocket || globalThis.WebSocket
+  const now = opts.now || (() => Date.now())
+  const myPeerId = randId20()
+
+  if (!PC) throw new Error('this browser has no RTCPeerConnection — WebRTC is required')
+  if (!WS) throw new Error('this environment has no WebSocket')
+
+  const conns = [] // open tracker sockets
+  const live = new Set() // RTCPeerConnections we own (for close())
+  let onConnectionCb = null
+  let closed = false
+
+  const newPc = () => {
+    const pc = new PC({ iceServers })
+    live.add(pc)
+    return pc
+  }
+
+  /** Open (and keep) a tracker WebSocket, dispatching relayed offers/answers to `onMsg`. */
+  function openTracker(url, { persistent, onOpen, onMsg, signal }) {
+    let ws
+    let reconnect
+    let stopped = false
+    const start = () => {
+      if (stopped || closed) return
+      try {
+        ws = new WS(url)
+      } catch {
+        return schedule()
+      }
+      ws.onopen = () => onOpen && onOpen(ws)
+      ws.onmessage = (ev) => {
+        let m
+        try {
+          m = JSON.parse(typeof ev.data === 'string' ? ev.data : '')
+        } catch {
+          return
+        }
+        if (!m || m.peer_id === myPeerId) return // ignore our own echoes
+        onMsg(m, ws)
+      }
+      ws.onclose = () => schedule()
+      ws.onerror = () => { try { ws.close() } catch { /* */ } }
+    }
+    const schedule = () => {
+      if (stopped || closed || !persistent) return
+      reconnect = setTimeout(start, RECONNECT_MS)
+    }
+    const stop = () => {
+      stopped = true
+      clearTimeout(reconnect)
+      try { ws && ws.close() } catch { /* */ }
+    }
+    signal?.addEventListener('abort', stop, { once: true })
+    start()
+    const handle = { stop, get ws() { return ws } }
+    conns.push(handle)
+    return handle
+  }
+
+  const send = (ws, obj) => {
+    try {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj))
+    } catch {
+      /* not open */
+    }
+  }
+
+  // ── ENDPOINT ────────────────────────────────────────────────────────────────
+  const endpoint = {
+    /** src/node.js sets this; we fire it for every inbound DataChannel (the accepter path). */
+    onConnection(cb) {
+      onConnectionCb = cb
+    },
+    /** No local candidates to publish — a browser has no addressable ones. */
+    candidates() {
+      return []
+    },
+
+    /**
+     * DIALER. `cands` come from resolve(S) below and carry the contact string. We join the
+     * target's rid on the trackers, take a parked offer, answer it, and the DataChannel the
+     * listener created arrives via ondatachannel.
+     * @returns {Promise<object>} socket-like, once the channel is OPEN
+     */
+    punch(cands, _opts = {}) {
+      const s = cands.map((c) => c && c.s).find(Boolean)
+      if (!s) return Promise.reject(new Error('webrtc punch: no contact string in candidates'))
+
+      // read-epochs: yesterday/today/tomorrow (the reader checks ±1 — src/rendezvous/race.js)
+      const infoHashes = resolveEpochs(now()).map((ep) => infoHashFor(deriveRid(s, 'tracker', ep, 20)))
+      const ac = new AbortController()
+
+      return new Promise((resolve, reject) => {
+        let settled = false
+        const handles = []
+        const finish = (err, socket) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          ac.abort()
+          for (const h of handles) h.stop()
+          err ? reject(err) : resolve(socket)
+        }
+        const timer = setTimeout(
+          () => finish(new Error('webrtc punch: no peer answered within ' + DIAL_TIMEOUT_MS + 'ms')),
+          DIAL_TIMEOUT_MS,
+        )
+
+        const onOffer = async (m, ws) => {
+          if (settled) return
+          const pc = newPc()
+          // The listener created the channel; we receive it.
+          pc.ondatachannel = (ev) => {
+            const dc = ev.channel
+            const deliver = () => finish(null, socketFromChannel(dc, pc))
+            if (dc.readyState === 'open') deliver()
+            else dc.onopen = deliver
+          }
+          try {
+            await pc.setRemoteDescription({ type: 'offer', sdp: m.offer.sdp })
+            const answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            await whenIceGathered(pc)
+            send(ws, {
+              action: 'announce',
+              info_hash: m.info_hash,
+              peer_id: myPeerId,
+              to_peer_id: m.peer_id,
+              offer_id: m.offer_id,
+              answer: { type: 'answer', sdp: pc.localDescription.sdp },
+            })
+          } catch (err) {
+            try { pc.close() } catch { /* */ }
+            live.delete(pc)
+            if (!settled) console.warn('[p2p] failed to answer an offer:', err.message)
+          }
+        }
+
+        for (const url of trackers) {
+          for (const infoHash of infoHashes) {
+            handles.push(
+              openTracker(url, {
+                persistent: false,
+                signal: ac.signal,
+                // A dialer announces with NO offers — it wants to be handed a parked one.
+                onOpen: (ws) =>
+                  send(ws, {
+                    action: 'announce',
+                    info_hash: infoHash,
+                    peer_id: myPeerId,
+                    numwant: 10,
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: 0,
+                  }),
+                onMsg: (m, ws) => {
+                  if (m.offer && m.offer_id && m.peer_id) onOffer(m, ws)
+                },
+              }),
+            )
+          }
+        }
+      })
+    },
+
+    close() {
+      closed = true
+      for (const h of conns) h.stop()
+      for (const pc of live) { try { pc.close() } catch { /* */ } }
+      live.clear()
+    },
+  }
+
+  // ── LISTENER ────────────────────────────────────────────────────────────────
+  /**
+   * Stay reachable: park fresh WebRTC offers under rid(S) on every tracker, refresh on a timer,
+   * and answer-match anything that answers. When a DataChannel opens, hand it to node.js's
+   * accepter (which sends HELLO, then runs the Noise IK responder).
+   * @param {string} S our own contact string
+   */
+  function publishAll(S) {
+    const pending = new Map() // offer_id -> pc (a parked, unanswered offer)
+
+    /** Build one pc + its DataChannel + an SDP offer, ready to park on a tracker. */
+    async function makeOffer() {
+      const pc = newPc()
+      // The LISTENER creates the channel — so the dialer gets it via ondatachannel, and we end up
+      // on the side node.js expects to send HELLO.
+      const dc = pc.createDataChannel('p2p', { ordered: true }) // reliable+ordered: SCTP does the ARQ
+      const offerId = randId20()
+      dc.onopen = () => {
+        pending.delete(offerId)
+        if (onConnectionCb && !closed) onConnectionCb(socketFromChannel(dc, pc))
+      }
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      await whenIceGathered(pc)
+      pending.set(offerId, pc)
+      return { offer_id: offerId, offer: { type: 'offer', sdp: pc.localDescription.sdp } }
+    }
+
+    const announce = async (ws, infoHash) => {
+      try {
+        const offers = await Promise.all(Array.from({ length: OFFERS_PER_ANNOUNCE }, makeOffer))
+        send(ws, {
+          action: 'announce',
+          info_hash: infoHash,
+          peer_id: myPeerId,
+          numwant: 10,
+          uploaded: 0,
+          downloaded: 0,
+          left: 0,
+          offers,
+        })
+      } catch (err) {
+        console.warn('[p2p] announce failed:', err.message)
+      }
+    }
+
+    const stops = []
+    for (const url of trackers) {
+      // announce-epochs: today, plus tomorrow shortly before the UTC rollover (no blackout)
+      const infoHashes = announceEpochs(now()).map((ep) => infoHashFor(deriveRid(S, 'tracker', ep, 20)))
+      for (const infoHash of infoHashes) {
+        let timer
+        const h = openTracker(url, {
+          persistent: true,
+          onOpen: (ws) => {
+            announce(ws, infoHash)
+            clearInterval(timer)
+            timer = setInterval(() => announce(h.ws, infoHash), ANNOUNCE_INTERVAL_MS)
+          },
+          onMsg: async (m) => {
+            // Someone took one of our parked offers.
+            if (m.answer && m.offer_id && pending.has(m.offer_id)) {
+              const pc = pending.get(m.offer_id)
+              try {
+                await pc.setRemoteDescription({ type: 'answer', sdp: m.answer.sdp })
+                // -> ICE connects -> dc.onopen -> onConnectionCb (above)
+              } catch (err) {
+                console.warn('[p2p] failed to accept an answer:', err.message)
+              }
+            }
+          },
+        })
+        stops.push(() => {
+          clearInterval(timer)
+          h.stop()
+        })
+      }
+    }
+    return {
+      stop() {
+        for (const s of stops) s()
+      },
+    }
+  }
+
+  /**
+   * DIALER discovery. A browser has no candidates to gather (no UDP, no STUN of its own) — the
+   * WebRTC/ICE machinery does all of that inside punch(). So resolve() yields ONE candidate that
+   * simply carries the contact string through to punch(), which does the real work.
+   * Shape matches what src/node.js's collectCandidates() expects (an async iterable).
+   */
+  async function* resolve(S) {
+    yield { channel: 'webrtc', s: S, ts: now() }
+  }
+
+  return { endpoint, createEndpoint: async () => endpoint, publishAll, resolve, close: endpoint.close }
+}
+
+export default { createBrowserTransport, ICE_SERVERS }

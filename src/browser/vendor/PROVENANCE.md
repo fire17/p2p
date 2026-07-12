@@ -1,0 +1,48 @@
+# Vendored crypto — provenance
+
+Vendored 2026-07-12 by the browser-client build. ZERO external deps at runtime: these files are
+the transitive closure (import-graph walk) of the primitives the browser needs, copied verbatim
+from the published npm ESM builds — sourceMappingURL comments stripped, and bare `@noble/*`
+specifiers rewritten to relative paths so the tree is self-contained (no node_modules, no bundler).
+
+| Package | Version | License | Audit |
+|---|---|---|---|
+| [@noble/ciphers](https://github.com/paulmillr/noble-ciphers) | 1.3.0 | MIT | Cure53 (v1.0.0, Sept 2024, OpenSats-funded) |
+| [@noble/hashes](https://github.com/paulmillr/noble-hashes) | 1.8.0 | MIT | Cure53 (v1.0.0, Jan 2022) |
+| [@noble/curves](https://github.com/paulmillr/noble-curves) | 1.9.1 | MIT | Cure53 (v1.0.0, Jan 2023) |
+
+Verify integrity:  `cd src/browser/vendor && shasum -a 256 -c SHA256SUMS`
+
+**Why vendored, not npm-installed:** the browser client ships as a static page with no build
+step, and this project is zero-dependency (DESIGN D1). These are pinned bytes, not a moving dep.
+
+**Why these primitives:** ChaCha20-Poly1305 is in NO browser (w3c/webcrypto#223). SHA-256/HMAC/
+HKDF/X25519/Ed25519 exist in WebCrypto but ONLY as async APIs, while the shared protocol code
+(src/noise.js, src/key.js) is synchronous. Using noble for all of them lets the browser run the
+EXACT SAME protocol source as the TUI (see ../shim/node-crypto.js) — so byte-identical interop is
+a property of the code, not a hope. Tradeoff (honest): pure-JS crypto is not formally
+constant-time; a WebCrypto path could keep static keys non-extractable. See
+research/browser-client.md §3.4 / §8.3.
+
+## Files (SHA-256)
+```
+f1385ec0484522dbe7741663ca9d029b5b8483f2f05df191675591c2f32b4acb  ./ciphers/_arx.js
+a19f438acf85afca916dbbd135d78eb1ae854768f4c74bb3af975b346899bef2  ./ciphers/_poly1305.js
+951157230c1f4428110a139291aaef6dda5c66bc913e4aaadb94fdd250c3514a  ./ciphers/chacha.js
+d86c0eec356f5835e20e85057078b06479431fff545a889a3f8acd5a63b46527  ./ciphers/utils.js
+5c263e09d85795d1762131a8a94ba1d352d3b05f841ca8421a43648c1ea6b9b7  ./curves/abstract/curve.js
+5b01a639aab4f8c89fa3c83600a894046b513ad0d113103d4d514f82c8545f38  ./curves/abstract/edwards.js
+e628f9c043488b7bd1f5d0b3b9eae861dcccf0117ebbb80154b9a577814c48c9  ./curves/abstract/hash-to-curve.js
+add737df52c97071d02b2a11b43f8791a597263e19a5a7e00ceb2a2e8124e1d3  ./curves/abstract/modular.js
+319ad962030fbee8f99e97eb40ae8392e08c6eb7fc67a37b30a36e4f10f23488  ./curves/abstract/montgomery.js
+7f20c5f9d01005bcf98c34867aa2020f7ab3454fb01eb1f546fde2953900422c  ./curves/abstract/utils.js
+c67a9594440036a43325bdf1105f72d085dbe5ba77473efbcc31a109cf82a3e1  ./curves/ed25519.js
+711c87e165cdd5faa5ec1e836411bee19ab3a518545dc0c2ee53b23b84f5d780  ./hashes/_md.js
+6689ae1660e03864120a4a084010cd546a9f40b573482debf0d9e6a436703938  ./hashes/_u64.js
+87bea3ec8d754506a254c1bd8a311d68e97893ab856a435556b6508025aabdd7  ./hashes/crypto.js
+0594166562ad8e869ea3507f71c2531197d620cd08a5676202964fdeef435d4e  ./hashes/hkdf.js
+c8a6da1f83adac607fbc9afcea9c900d80f7ee763616e9c4b782dd5557d83aff  ./hashes/hmac.js
+9cb6d482b07fb063a0d2b6890b7b5bc4edc41c184ce3d2ce4653688d81f9770a  ./hashes/sha2.js
+ed844aa65e5b4d163ac866c92e94cf82ced3da8ccf500b5b4aeefaa3b53f7320  ./hashes/sha256.js
+c79100fa890e0473647baf28b8d87c1073f588868f6836019e72577e086bab43  ./hashes/utils.js
+```
