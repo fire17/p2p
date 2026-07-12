@@ -208,6 +208,32 @@ test('group GRP-2: after a removal a NON-ADMIN survivor rotates too — the remo
   t.close()
 })
 
+// ── GRP-3: KEYDIST is signed — a forged handout cannot clobber a victim's receive-ratchet ────────
+test('group GRP-3: a forged/unsigned KEYDIST claiming another sender is rejected, and that sender’s real channel survives', async () => {
+  const t = await threeParty()
+  await t.gA.send('real 1'); await wait(150)
+  assert.equal(t.got.B.at(-1)?.text, 'real 1', 'A→B works before the attack')
+
+  // C forges a KEYDIST claiming s = A with an attacker-chosen ck and a bogus signature. A's pubkeys
+  // are public (in every op A authored), so bindIdentity passes — but C cannot sign as A.
+  const forged = { s: t.A.S, ck: randomBytes(32).toString('base64'), q: 0, k: 'AAAA',
+    e: Buffer.from(t.A.edPub).toString('base64'), x: Buffer.from(t.A.xPub).toString('base64') }
+  const body = Buffer.from(JSON.stringify(forged), 'utf8')
+  const env = Buffer.allocUnsafe(2 + 32 + body.length)
+  env[0] = 0x67; env[1] = 1                                   // GMAGIC, T.KEYDIST
+  Buffer.from(t.gA.groupId, 'hex').copy(env, 2)
+  body.copy(env, 34)
+  const cToB = t.nC.peers().find((p) => p.key === t.B.S)
+  await cToB.send(env); await wait(150)
+
+  assert.ok(t.div.B.includes('keydist-signature'), 'B rejects the forged KEYDIST (signature gate)')
+
+  // The victim's real channel must be untouched: A sends again and B still decrypts it.
+  await t.gA.send('real 2'); await wait(150)
+  assert.equal(t.got.B.at(-1)?.text, 'real 2', 'A→B channel survives the forged KEYDIST (no ratchet clobber)')
+  t.close()
+})
+
 // ── GRP-1: the membership fold is a PURE FUNCTION of the op SET (deterministic admin) ────────────
 test('group GRP-1: two concurrent `create` roots → every peer folds the SAME admin (hash order), and a rival create is surfaced as divergence', async () => {
   // Two members each author a `create` for the same groupId (causally unlinked roots). The old fold

@@ -179,6 +179,16 @@ const opBytes = (o) => utf8(['op', o.t, o.by, o.subj || '', (o.init || []).join(
 const opHash = (o) => sha256(opBytes(o), unb64(o.sig)).toString('hex').slice(0, 32)
 
 /**
+ * Canonical bytes an author signs over a KEYDIST (GRP-3). A sender key handed out with no signature
+ * and no check that the delivering peer IS the claimed sender let ANY group member forge a KEYDIST
+ * claiming `s:V` with an attacker-chosen ck → clobber the victim's receive-ratchet for V → V's real
+ * messages then fail (`ratchet` divergence) until V rotates: a cheap, repeatable per-sender DoS from
+ * inside the group. Binding gidHex‖s‖ck‖q under the sender's Ed25519 key closes it — only the real V
+ * can produce a KEYDIST that mutates V's ratchet.
+ */
+const keydistBytes = (gidHex, s, ck, q) => utf8([gidHex, 'keydist', s, ck, String(q)].join('|'))
+
+/**
  * Deterministic fold: every member computes the SAME membership from the SAME op SET, with no
  * server — a PURE FUNCTION of the ops, independent of receipt order.
  *
@@ -356,7 +366,9 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   async function keydistTo(S) {
     if (!sendChain.ck) sendChain.ck = randomBytes(32)
     for (const o of ops) await toMember(S, encodeEnv(T.OP, groupId, o))
-    return toMember(S, encodeEnv(T.KEYDIST, groupId, { s: me, ck: b64(sendChain.ck), q: sendChain.seq, ...myPub() }))
+    const ck = b64(sendChain.ck), q = sendChain.seq
+    const k = b64(signEd(identity.edPriv, keydistBytes(gidHex, me, ck, q)))   // GRP-3: sign the handout
+    return toMember(S, encodeEnv(T.KEYDIST, groupId, { s: me, ck, q, k, ...myPub() }))
   }
 
   /** Rotate MY sender key and redistribute to survivors only ⇒ ejects anyone removed. */
@@ -378,6 +390,11 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
       const S = String(body.s).toUpperCase()
       const bound = bindIdentity(S, body.e, body.x)
       if (!bound) { emit('divergence', { reason: 'keydist-identity', by: S }); return true }
+      // GRP-3: the ck only mutates V's ratchet if V itself signed this handout. An insider forging a
+      // KEYDIST claiming s:V cannot produce this signature (needs V's edPriv) ⇒ no per-sender DoS.
+      if (!verifyEd(bound.edPub, keydistBytes(gidHex, S, body.ck, body.q || 0), unb64(body.k || ''))) {
+        emit('divergence', { reason: 'keydist-signature', by: S }); return true
+      }
       for (const o of body.ops || []) ingestOp(o)             // learn the membership chain
       if (!membership().members.has(S)) { emit('divergence', { reason: 'keydist-nonmember', by: S }); return true }
       recvChains.set(S, ratchet(unb64(body.ck), body.q || 0))
