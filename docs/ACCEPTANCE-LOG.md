@@ -214,3 +214,87 @@ review and fixed + re-validated on the real production path before this close.
   for #5, bin/p2p-chat.js is legacy — capability present on the real surface, note only.
 - Verdict trustworthiness: earned through 4 independent terminal reviews + real-path repros, incl. a
   caught-and-fixed durability regression and a divergence-honesty correction. v1 core is is-done.
+
+### TRACKER UPGRADE + MY CORRECTION (2026-07-12) — reduced-scope framing now MOOT
+The v1.1 tracker matchmaker landed early (69d8976) into the tree. I initially reported "live relay
+times out" — **that was MY ERROR: I ran test/gate/tracker.test.js, which exercises `trackerRelayProbe`
+(the OLD one-shot helper, tracker.js:64), NOT the shipped `createTracker()` matchmaker (tracker.js:136)
+wired into the race (node.js:157).** team-lead corrected me with primary evidence; I re-ran the CORRECT
+function and independently reproduced it:
+- Two SEPARATE OS processes, `createTracker().announce` in one + `createTracker().lookup` in the other,
+  over real public trackers (openwebtorrent / webtorrent.dev / btorrent.xyz): the looker received the
+  EXACT candidate the announcer published ({udp4 203.0.113.5:4444}) — a value only the announcer knows,
+  so genuinely relayed by the real tracker between two independent WSS connections — **3/3 trials, 546 /
+  1193 / 581 ms.**
+- → **VAL-RDV-TRACKER-001 = PASS (live-verified matchmaker)**, not "stub" and not "implemented-pending".
+- docs/DIVERGENCES.md D-INT-3 updated (ca680b0) to the honest resolved status; the reduced-scope
+  deferral is now MOOT — the full 3-channel rendezvous (mDNS LAN + DHT + tracker) ships + is verified.
+- **Cross-network now has TWO mechanism-proven internet rungs (DHT + tracker)** instead of one; real
+  two-DISTINCT-network relay remains the VAL-ACCEPT-XNET owner-gated gap (same caveat as DHT — the 3/3
+  relay trials are same-machine separate-process).
+- node --test: 105/105 green on the current tree (team-lead-confirmed).
+
+**FINAL (updated): 28/29 VAL-* PASS · 0 FAIL · 1 owner-gated GAP (VAL-ACCEPT-XNET, now 2 mechanism-proven
+rungs).** Tracker is a live-verified 3rd channel, not a deferral. Lesson (again): test the SHIPPED code
+path, not a same-named legacy helper — I measured trackerRelayProbe when createTracker is what ships.
+
+---
+
+## ⚠ RETRACTION #2 (2026-07-12) — VAL-ACCEPT-RECONNECT → FAIL (bidirectional-after-restart drop)
+
+The 6th zenith terminal review found — and I INDEPENDENTLY REPRODUCED — a HIGH correctness bug my Repro A
+missed (I tested only the survivor→restarted direction; the bug is in the REVERSE direction):
+- **Repro (deterministic):** dialer connects, sends m1, receives `echo:m1`; listener SIGKILLed; dialer
+  sends m2 (buffers); listener restarted (same identity); dialer redials. Result: **listener2 receives m2
+  and calls send('echo:m2'), the echo:m2 frame decrypts fine on the dialer's live channel, but the dialer
+  NEVER fires a message event for it** (no MSG-EVENT, no divergence) — silently dropped.
+- **Root cause:** `src/node.js` makePeer keeps a per-peer `delivered` Set keyed by the remote app-seq
+  (node.js:113), persisted across reconnect (for outbox-replay exactly-once). A peer that restarts as a
+  FRESH process resets its OUTBOUND `appSeqNext` to 0, so its post-restart messages reuse seqs 0,1,…
+  already in the survivor's stale `delivered` Set → dropped as "duplicates." Dedup is NOT scoped to a
+  session/handshake epoch. (Confirmed by the review's control: same flow with NO pre-kill message → the
+  echo IS delivered.)
+- **Impact:** any real chat that exchanged ≥1 message before the kill silently loses the restarted peer's
+  first replies after reconnect. Acceptance #5 (bidirectional chat after restart) is BROKEN one direction,
+  with no user-visible signal. → **VAL-ACCEPT-RECONNECT = FAIL.**
+- **Fix direction (owner code, lane-wire/node):** scope inbound dedup to the noise session — reset/namespace
+  the `delivered` Set on a genuinely NEW handshake (new connId/handshakeHash), so a restarted peer's fresh
+  seqs aren't deduped against the prior session; keep dedup within a session for transport-reconnect replay.
+- **Also GAP (LOW, docs):** README:26-27 + API-SKETCH show `identity()` sync returning `{key}`; shipped
+  `identity()` is async and exposes the contact string as `S` (not `key`). Verbatim quickstart copy breaks.
+
+**CORRECTED STANDING: 27/29 VAL-* PASS · 1 FAIL (VAL-ACCEPT-RECONNECT, bidirectional-after-restart) · 1
+owner-gated GAP (VAL-ACCEPT-XNET).** node --test (105/105) does not cover this — it only tests
+survivor→restarted replay (node.test.js:216) + force-close, not a fresh-process restart replying after a
+prior exchange. Fix belongs to the code lane; re-validate the bidirectional path after it lands. Same
+lesson as the durability regression: real-surface repros must exercise the FULL bidirectional production
+path, not one direction.
+
+### ✅ RESOLVED (2026-07-12) — VAL-ACCEPT-RECONNECT FAIL→PASS (dedup scoped to peer instance)
+
+Fix commit **576eb59** ("node.js: scope inbound dedup to peer INSTANCE"): the `delivered` Set is RESET on
+a new peer instance (fresh handshake / restarted process), while a SAME-instance transport-reconnect keeps
+it (preserving outbox-replay exactly-once). The instance discriminator is correct — handshakeHash/connId
+also change on same-process reconnect, so they can't distinguish restart from reconnect; a per-instance
+nonce can. TRIPLE-VERIFIED (zenith-manager + lane-wire + team-lead), independent cross-process runs:
+- My multi-message repro: pre-kill echo:m1a/m1b (delivered seqs 0,1) → SIGKILL → restart (fresh instance,
+  same id) → redial → restarted peer's echo:m2/echo:m3 (seqs RESET to 0,1) DELIVERED, not dropped;
+  FINAL=[echo:m1a,echo:m1b,echo:m2,echo:m3], exactly-once, zero dups. Previously-dropped echo:m2 now delivered.
+- All 4 checklist cases met: both directions after restart; multi-msg seq-reuse not dropped; exactly-once
+  intact (same-instance dedup preserved); regression test present (test/node.test.js:258 "peer RESTART
+  (fresh instance) reply is NOT deduped against the dead session (bidirectional)").
+- node --test 54/54 deterministic core green (no regression); team-lead's full tree-wide live suite
+  confirming in parallel.
+
+→ **VAL-ACCEPT-RECONNECT = PASS.**
+
+## ✅✅ FINAL VERDICT (2026-07-12, owner GO): 28/29 VAL-* PASS · 0 FAIL · 1 owner-gated GAP (VAL-ACCEPT-XNET)
+
+All 6 acceptance items + 21 module contracts + VAL-SEC + VAL-DIVERGENCE PASS on real surfaces. Tracker is a
+live-verified 3rd rendezvous channel (createTracker 3/3 relay); durability (keepalive/liveness) and the
+bidirectional-reconnect dedup are both fixed + re-validated on the real production path. The SOLE remaining
+item is VAL-ACCEPT-XNET — a real two-DISTINCT-network run (owner-gated; needs a 2nd network) — with TWO
+mechanism-proven internet rungs (DHT 5/5 + tracker 3/3, both same-machine separate-process). Trust earned
+through 6 independent terminal reviews + real-path repros that caught two real regressions (a unit-mocked
+durability gap, a one-direction reconnect gap) that `node --test` green alone never would have. v1 is
+is-done for every observable surface; XNET awaits the owner's second network.
