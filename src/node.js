@@ -277,21 +277,20 @@ function toInvite(v) {
 }
 
 /**
- * The Noise prologue used in invite mode, on BOTH sides.
+ * The Noise prologue used in invite mode, on BOTH sides: invite.js's canonical
+ * `handshakePrologue()` — a FIXED, invite-scoped value ("p2p-inv-v1" ‖ HKDF(K_inv,"handshake")) that
+ * both sides derive from K_inv alone.
  *
- * DOCUMENTED DEVIATION (reported to main): metadata-privacy.md §5/§10 writes the prologue as
- * "p2p-inv-v1" ‖ rid ‖ epoch — the rid the record was found at. The RESPONDER cannot know that rid:
- * it announces under several (channel × epoch) rids and the dialer never tells it which one it read
- * (the prologue is mixed BEFORE msg1 is parsed, so there is nowhere to carry a hint without a wire
- * change). We therefore bind the prologue to a fixed, invite-scoped rid — HKDF(K_inv, "handshake") —
- * which both sides derive independently. The security property that matters (only a K_inv holder can
- * complete the handshake) is carried by the psk regardless; what is given up is per-rendezvous
- * replay binding, which the psk + AEAD-sealed, rid-bound blob already cover.
+ * Why not the per-rendezvous prologue metadata-privacy.md §5/§10 sketches ("p2p-inv-v1" ‖ rid ‖ epoch):
+ * the RESPONDER cannot know which rid the dialer read — it announces under several (channel × epoch)
+ * rids, and the prologue is mixed BEFORE msg1 is parsed, so there is nowhere to carry a hint without a
+ * wire change. The security property that matters (only a K_inv holder can complete the handshake) is
+ * carried by the psk regardless; what is given up is per-rendezvous replay binding, which the psk plus
+ * the rid-bound AEAD AD on the sealed blob already cover. (Deviation raised with main and approved;
+ * the derivation now lives in invite.js beside the others.)
  * @param {object} inv
  */
-function invitePrologue(inv) {
-  return inv.prologue(inv.rid('handshake', '', 32))
-}
+const invitePrologue = (inv) => inv.handshakePrologue()
 
 const DEADLINE = Symbol('deadline')
 
