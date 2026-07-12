@@ -250,6 +250,30 @@ test('dht reusable mode is UNCHANGED (announce_peer path, no BEP44)', async () =
   dht.close()
 })
 
+test('dht invite mode: a BEP44 put goes to the 8 nodes CLOSEST to the target (live-proved regression)', async () => {
+  // A put that lands on arbitrary token-bearing nodes is unfindable: a reader's iterative get
+  // converges on the nodes CLOSEST to the target. This was a REAL bug — the first live run stored on
+  // 8 real public nodes and a second client then got nothing back. Sorting by XOR distance fixed it.
+  const { DHT } = await import('../src/rendezvous/dht.js')
+  const dht = new DHT()
+  const target = Buffer.alloc(20, 0x00)
+  // 12 token-bearing nodes, deliberately handed over in WORST-first order
+  const nodes = Array.from({ length: 12 }, (_, i) => ({
+    host: '10.0.0.' + i, port: 6881, token: Buffer.from([i]), id: Buffer.alloc(20, 12 - i),
+  }))
+  dht._traverse = async () => ({ withToken: nodes, best: null, queried: nodes.length })
+  const sentTo = []
+  dht.query = async (n) => { sentTo.push(n.id[0]); return { r: {} } }
+
+  const res = await dht.bep44Put({ target, k: Buffer.alloc(32), salt: Buffer.alloc(20), seq: 1, v: Buffer.alloc(544), sig: Buffer.alloc(64) })
+  dht.close()
+
+  assert.equal(res.stored, 8)
+  assert.equal(sentTo.length, 8)
+  // ids 1..8 are the closest to an all-zero target (XOR distance = the id itself)
+  assert.deepEqual([...sentTo].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8])
+})
+
 // ── 3. the claim, stated as an executable assertion ──────────────────────────────────────────────
 
 test('CLAIM (§10): S alone gives an adversary neither location nor content of an invite record', () => {

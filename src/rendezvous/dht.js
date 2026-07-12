@@ -211,7 +211,14 @@ export class DHT {
   /** BEP44 `put` of a signed mutable item (v MUST be under the 1000-byte soft cap). */
   async bep44Put({ target, k, salt, seq, v, sig }, opts = {}) {
     const { withToken } = await this._traverse(target, 'get', {}, opts);
-    const targets = withToken.filter((n) => n.token).slice(0, 8);
+    // Store on the 8 nodes CLOSEST to the target — not just the first 8 that handed us a token.
+    // A reader's iterative get converges on the closest nodes, so storing anywhere else is storing
+    // where nobody will look. (Live-proved: an unsorted put landed on 8 real nodes and was then
+    // unfindable by a second client; sorting by XOR distance made the round-trip succeed. Same rule
+    // getPeers already applies to announce_peer.)
+    const targets = withToken.filter((n) => n.token)
+      .sort((a, b) => cmpBuf(xor(a.id || Buffer.alloc(20, 0xff), target), xor(b.id || Buffer.alloc(20, 0xff), target)))
+      .slice(0, 8);
     let stored = 0;
     await Promise.all(targets.map(async (n) => {
       try {
