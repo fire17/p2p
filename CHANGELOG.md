@@ -35,7 +35,8 @@ gaps are listed at the bottom rather than omitted.
   and the path that lets a browser reach a terminal.
 - **WebRTC transport** for the browser, with DataChannel frames chunked to ≤16 KiB and reassembled.
 - **CLI:** `p2p invite`, share-string dialing (`p2p connect <S-…>`, `p2p <S-…>`, and in the TUI).
-- **Package exports:** `@fire17/p2p/invite` and `@fire17/p2p/key` subpaths.
+- **Package exports:** `@fire17/p2p/invite`, `@fire17/p2p/key` and `@fire17/p2p/group` subpaths —
+  `createSecureGroup` is now reachable from an npm install.
 - **`CHANGELOG.md`** (this file).
 
 ### Fixed
@@ -67,8 +68,6 @@ gaps are listed at the bottom rather than omitted.
   throws there; the web client dials reusable keys (and its key input is capped at 26 chars).
 - **No deep-link into the web client yet** — you paste the key into the app rather than following a
   `…/app/#<KEY>` URL.
-- **`createSecureGroup` is not exported from the package** (`.`, `./invite`, `./key` only) — usable
-  from a checkout and inside the browser build.
 - **Invite burn/rotate is v2.** Single-use is a convention today: nothing stops a second connection
   with the same string, and `K_inv` is not retired after first contact.
 - **The peer you connect to still learns your IP.** Invites hide it from infrastructure and

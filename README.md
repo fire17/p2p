@@ -132,7 +132,7 @@ node.group([keyA, keyB, keyC]).send('hi all')     // pairwise fan-out: one authe
 ```
 
 ```js
-import { createSecureGroup } from './src/group.js'               // see the note below
+import { createSecureGroup } from '@fire17/p2p/group'
 const g = createSecureGroup(node, me, { secret, create: true })  // sender-key E2E group
 await g.join()
 g.on('message', (from, data) => console.log(from, data.toString()))
@@ -146,10 +146,6 @@ a member is **cryptographic**: rotate, and the removed member decrypts nothing a
 order doesn't matter. Every one of those properties is a test in `test/group-secure.test.js`,
 and the browser runs this same `group.js` unchanged.
 
-> **Known gap (v0.2):** `node.group()` is reachable from the published package, but
-> `createSecureGroup` is **not** — the package export map exposes `.`, `./invite` and `./key`, so
-> the sender-key group is usable from a checkout (and inside the browser build) but not yet via a
-> `@fire17/p2p/group` import. Adding that subpath is a one-line change and is queued.
 
 ---
 
