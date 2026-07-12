@@ -79,14 +79,21 @@ try {
   gA.on('message', (from, d) => rx.A.push({ from, text: Buffer.from(d).toString('utf8') }))
   gB.on('message', (from, d) => rx.B.push({ from, text: Buffer.from(d).toString('utf8') }))
 
-  // Sender-keys mesh ordering (mirrors group-secure.test.js): everyone CREATES first (so they can
-  // receive ops), the ADMIN joins first to propagate the membership chain + its key, THEN the
-  // others join — now they know the members and distribute their own sender keys to them.
-  console.log('\n  → all three join the sender-keys group over the relay…')
+  // BROWSER JOINS FIRST — the hostile, order-dependent case that used to fail SILENTLY (a member
+  // that join()s before the admin's membership chain reaches it hands its sender key to nobody).
+  // Witnesses browser-build's fix e7da8e0: group.js now re-syncs sender keys when ingestOp reveals
+  // members it didn't know, so join() is order-independent. If the fix regresses, the browser's
+  // message below decrypts for no one — with no error — and the assertions fail.
+  console.log('\n  → BROWSER joins FIRST (knows no members yet), THEN the nodes — the case that used to fail silently…')
   await page.evaluate((g) => window.__secureGroupCreate(g), G) // browser creates (message sink wired)
-  await gA.join(); await wait(1500) // admin first: propagate the chain + admin's sender key
-  await Promise.all([page.evaluate(() => window.__secureGroupJoin()), gB.join()])
-  await wait(2000) // let the browser's + B's sender keys reach everyone
+  const browserMembersAtJoin = await page.evaluate(() => window.__secureGroupJoin()) // join with EMPTY membership
+  // prove this really is the hostile case: the browser knew of nobody (besides maybe itself) at join
+  const knewOthers = browserMembersAtJoin.filter((m) => m !== C)
+  if (knewOthers.length !== 0) fail(`expected the browser to know NO other members at join, knew: ${knewOthers}`)
+  else console.log('  ✔ browser joined with an empty membership (the hostile case is real)')
+  await wait(500)
+  await gA.join(); await wait(1200) // admin propagates the chain AFTER the browser already joined
+  await gB.join(); await wait(2500) // re-sync must now push the browser's key to everyone
 
   // ── browser → group: both nodes must receive it AND attribute it to the browser ──
   await page.evaluate(() => window.__secureGroupSend('hello group, from the browser'))
