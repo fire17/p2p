@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>p2p — chat with no server</title>
-<meta name="description" content="Zero-dependency, MITM-proof, serverless P2P chat. One 26-character key is your whole contact surface.">
+<meta name="description" content="Zero-dependency, MITM-proof, serverless P2P chat. One 26-character key is your whole contact surface. How it works: rendezvous with no server, NAT hole-punching, and a handshake whose first ack is a proof.">
 <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#f7f9fb" media="(prefers-color-scheme: light)">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
@@ -14,100 +14,170 @@
 <meta property="og:url" content="https://p2p.akeyo.io/">
 <style>
   :root{
-    --bg:#0b1220; --bg2:#0e1729; --panel:#111c31; --line:#22304a;
-    --fg:#e6edf6; --dim:#93a4bd; --accent:#2dd4bf; --accent2:#7dd3fc;
-    --code:#0a1120; --shadow:0 10px 40px rgba(0,0,0,.45);
+    --bg:#0b1220; --bg2:#0e1729; --panel:#111c31; --panel2:#0d1728; --line:#22304a;
+    --fg:#e6edf6; --dim:#93a4bd; --faint:#64748b;
+    --accent:#2dd4bf; --accent2:#7dd3fc; --warn:#fbbf24; --bad:#fb7185;
+    --code:#0a1120; --codefg:#d7f5ee; --shadow:0 10px 40px rgba(0,0,0,.45);
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
   }
   @media (prefers-color-scheme: light){
     :root{
-      --bg:#f7f9fb; --bg2:#eef2f7; --panel:#ffffff; --line:#dfe6ef;
-      --fg:#0f1b2d; --dim:#5b6b83; --accent:#0d9488; --accent2:#0369a1;
-      --code:#0f1b2d; --shadow:0 8px 30px rgba(15,27,45,.08);
+      --bg:#f7f9fb; --bg2:#eef2f7; --panel:#ffffff; --panel2:#f2f6fa; --line:#dbe3ec;
+      --fg:#0f1b2d; --dim:#54637a; --faint:#8595aa;
+      --accent:#0d9488; --accent2:#0369a1; --warn:#b45309; --bad:#be123c;
+      --code:#0f1b2d; --codefg:#d7f5ee; --shadow:0 8px 30px rgba(15,27,45,.07);
     }
   }
   *{box-sizing:border-box}
-  html,body{margin:0;padding:0}
-  body{
+  html{scroll-behavior:smooth;scroll-padding-top:70px}
+  @media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+  body{margin:0;color:var(--fg);font-family:var(--sans);line-height:1.62;-webkit-font-smoothing:antialiased;
     background:
-      radial-gradient(900px 500px at 80% -10%, color-mix(in srgb,var(--accent) 12%, transparent), transparent 70%),
-      radial-gradient(700px 400px at 0% 0%, color-mix(in srgb,var(--accent2) 10%, transparent), transparent 65%),
+      radial-gradient(900px 520px at 82% -8%, color-mix(in srgb,var(--accent) 13%, transparent), transparent 70%),
+      radial-gradient(760px 420px at -5% 2%, color-mix(in srgb,var(--accent2) 11%, transparent), transparent 66%),
       linear-gradient(var(--bg),var(--bg2));
-    background-attachment:fixed;
-    color:var(--fg); font-family:var(--sans); line-height:1.6;
-    -webkit-font-smoothing:antialiased;
-    min-height:100vh;
-  }
-  .wrap{max-width:820px;margin:0 auto;padding:24px 20px 64px}
-  header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0 28px}
-  .brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.01em}
-  .brand svg{width:30px;height:30px;flex:none}
-  .ghost{color:var(--dim);text-decoration:none;font-size:.92rem;border:1px solid var(--line);
-    padding:7px 12px;border-radius:999px;background:color-mix(in srgb,var(--panel) 60%, transparent);white-space:nowrap}
-  .ghost:hover{color:var(--fg);border-color:var(--accent)}
-  h1{font-size:clamp(1.9rem,6vw,3rem);line-height:1.12;letter-spacing:-.03em;margin:.2em 0 .35em;font-weight:700}
+    background-attachment:fixed;}
+  .wrap{max-width:900px;margin:0 auto;padding:0 20px 72px}
+
+  /* nav */
+  nav{position:sticky;top:0;z-index:9;backdrop-filter:blur(10px);
+    background:color-mix(in srgb,var(--bg) 82%, transparent);border-bottom:1px solid var(--line)}
+  .navin{max-width:900px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:14px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:680;letter-spacing:-.01em;text-decoration:none;color:var(--fg)}
+  .brand svg{width:26px;height:26px;flex:none}
+  .navlinks{display:flex;gap:14px;margin-left:auto;overflow-x:auto;scrollbar-width:none}
+  .navlinks::-webkit-scrollbar{display:none}
+  .navlinks a{color:var(--dim);text-decoration:none;font-size:.86rem;white-space:nowrap}
+  .navlinks a:hover{color:var(--accent)}
+  .gh{color:var(--dim);text-decoration:none;font-size:.86rem;border:1px solid var(--line);padding:5px 11px;
+    border-radius:999px;white-space:nowrap}
+  .gh:hover{color:var(--fg);border-color:var(--accent)}
+  @media(max-width:760px){.navlinks{display:none}}
+
+  h1{font-size:clamp(2rem,6.4vw,3.15rem);line-height:1.1;letter-spacing:-.035em;margin:.35em 0 .3em;font-weight:730}
   h1 em{font-style:normal;color:var(--accent)}
-  .lede{color:var(--dim);font-size:clamp(1rem,3.4vw,1.15rem);max-width:60ch;margin:0 0 26px}
-  .facts{display:grid;grid-template-columns:1fr;gap:10px;margin:0 0 34px;padding:0;list-style:none}
-  @media(min-width:640px){.facts{grid-template-columns:repeat(3,1fr)}}
+  h2{font-size:clamp(1.35rem,3.6vw,1.7rem);letter-spacing:-.025em;margin:0 0 .15em;font-weight:680}
+  .kicker{font-size:.76rem;text-transform:uppercase;letter-spacing:.15em;color:var(--accent);font-weight:650;margin:0}
+  .lede{color:var(--dim);font-size:clamp(1.02rem,3.2vw,1.16rem);max-width:62ch;margin:0 0 26px}
+  section{padding:52px 0 8px;scroll-margin-top:64px}
+  section > p{max-width:68ch;color:var(--dim)}
+  section > p strong, li strong{color:var(--fg);font-weight:620}
+  code, .k{font-family:var(--mono);font-size:.88em;color:var(--fg);
+    background:color-mix(in srgb,var(--panel) 75%, transparent);border:1px solid var(--line);
+    border-radius:6px;padding:1px 5px}
+  a{color:var(--accent)}
+
+  .facts{display:grid;grid-template-columns:1fr;gap:10px;margin:0 0 8px;padding:0;list-style:none}
+  @media(min-width:660px){.facts{grid-template-columns:repeat(3,1fr)}}
   .facts li{background:color-mix(in srgb,var(--panel) 70%, transparent);border:1px solid var(--line);
-    border-radius:12px;padding:12px 14px;font-size:.92rem;color:var(--dim)}
-  .facts b{display:block;color:var(--fg);font-weight:600;font-size:.95rem;margin-bottom:2px}
+    border-radius:12px;padding:13px 15px;font-size:.9rem;color:var(--dim)}
+  .facts b{display:block;color:var(--fg);font-weight:640;font-size:.95rem;margin-bottom:2px}
+
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:var(--shadow)}
-  .invite{margin:0 0 26px;border-color:color-mix(in srgb,var(--accent) 45%, var(--line))}
+  .invite{margin:26px 0 0;border-color:color-mix(in srgb,var(--accent) 45%, var(--line))}
   .invite .who{display:flex;align-items:center;gap:12px;margin-bottom:10px}
-  .avatar{width:44px;height:44px;border-radius:12px;flex:none;display:grid;place-items:center;
-    background:linear-gradient(135deg,var(--accent),var(--accent2));color:#06202a;font-family:var(--mono);
-    font-weight:700;font-size:.78rem;letter-spacing:.02em}
-  .who h2{margin:0;font-size:1.05rem;letter-spacing:-.01em}
+  .avatar{width:46px;height:46px;border-radius:13px;flex:none;display:grid;place-items:center;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));color:#062a2a;font-family:var(--mono);
+    font-weight:700;font-size:.78rem}
+  .who h2{margin:0;font-size:1.06rem}
   .who p{margin:2px 0 0;color:var(--dim);font-size:.9rem}
-  .keyline{font-family:var(--mono);font-size:.86rem;color:var(--dim);word-break:break-all;
-    border-top:1px dashed var(--line);padding-top:10px;margin-top:4px}
+  .keyline{font-family:var(--mono);font-size:.84rem;color:var(--dim);word-break:break-all;
+    border-top:1px dashed var(--line);padding-top:10px;margin:6px 0 0}
   .keyline b{color:var(--fg);font-weight:600}
+
+  /* figures */
+  figure{margin:22px 0 8px;background:var(--panel2);border:1px solid var(--line);border-radius:16px;padding:16px 16px 10px}
+  .svgbox{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  figure svg{display:block;width:100%;min-width:520px;height:auto}
+  figcaption{color:var(--faint);font-size:.82rem;margin-top:10px;line-height:1.5;border-top:1px solid var(--line);padding-top:9px}
+  figcaption b{color:var(--dim);font-weight:600}
+  /* svg theming */
+  .s-box{fill:var(--panel);stroke:var(--line);stroke-width:1.5}
+  .s-box2{fill:color-mix(in srgb,var(--accent) 12%, transparent);stroke:color-mix(in srgb,var(--accent) 55%, transparent);stroke-width:1.5}
+  .s-box3{fill:color-mix(in srgb,var(--accent2) 12%, transparent);stroke:color-mix(in srgb,var(--accent2) 50%, transparent);stroke-width:1.5}
+  .s-danger{fill:color-mix(in srgb,var(--bad) 12%, transparent);stroke:color-mix(in srgb,var(--bad) 55%, transparent);stroke-width:1.5}
+  .s-t{fill:var(--fg);font-family:var(--sans);font-size:12px}
+  .s-t.sm{font-size:10.5px;fill:var(--dim)}
+  .s-t.mono{font-family:var(--mono);font-size:10.5px}
+  .s-t.b{font-weight:650}
+  .s-t.acc{fill:var(--accent)}
+  .s-t.faint{fill:var(--faint);font-size:10px}
+  .s-l{stroke:var(--line);stroke-width:1.5;fill:none}
+  .s-a{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#ah)}
+  .s-a2{stroke:var(--accent2);stroke-width:2;fill:none;marker-end:url(#ah2)}
+  .s-dash{stroke:var(--faint);stroke-width:1.4;stroke-dasharray:4 4;fill:none}
+  .s-node{fill:var(--accent)}
+  .s-node2{fill:var(--accent2)}
+
+  /* bit layout */
+  .bits{display:flex;border-radius:10px;overflow:hidden;border:1px solid var(--line);font-family:var(--mono);
+    font-size:.72rem;text-align:center;margin:6px 0 10px}
+  .bits div{padding:9px 4px;color:var(--fg)}
+  .bits .b1{flex:5;background:color-mix(in srgb,var(--accent2) 22%, transparent)}
+  .bits .b2{flex:110;background:color-mix(in srgb,var(--accent) 22%, transparent)}
+  .bits .b3{flex:15;background:color-mix(in srgb,var(--warn) 22%, transparent)}
+
   .tabs{display:flex;gap:6px;margin-bottom:12px}
   .tabs button{font:inherit;font-size:.85rem;color:var(--dim);background:transparent;border:1px solid var(--line);
     padding:6px 12px;border-radius:999px;cursor:pointer}
-  .tabs button.on{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+  .tabs button.on{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:640}
   .tabs button:hover:not(.on){color:var(--fg)}
   .cmd{position:relative;background:var(--code);border:1px solid var(--line);border-radius:12px;
     padding:14px 92px 14px 14px;overflow-x:auto}
-  .cmd pre{margin:0;font-family:var(--mono);font-size:.85rem;color:#d7f5ee;white-space:pre;line-height:1.7}
-  @media (prefers-color-scheme: light){ .cmd pre{color:#d7f5ee} }
-  .cmd pre::before{content:"$ ";color:var(--accent);opacity:.8}
-  .copy{position:absolute;top:10px;right:10px;font:inherit;font-size:.78rem;font-weight:600;
-    color:var(--fg);background:color-mix(in srgb,var(--panel) 85%, transparent);border:1px solid var(--line);
-    border-radius:8px;padding:6px 10px;cursor:pointer;transition:.15s}
+  .cmd pre{margin:0;font-family:var(--mono);font-size:.84rem;color:var(--codefg);white-space:pre;line-height:1.7}
+  .cmd pre::before{content:"$ ";color:var(--accent);opacity:.85}
+  .copy{position:absolute;top:10px;right:10px;font:inherit;font-size:.78rem;font-weight:640;color:var(--fg);
+    background:color-mix(in srgb,var(--panel) 85%, transparent);border:1px solid var(--line);border-radius:8px;
+    padding:6px 10px;cursor:pointer;transition:.15s}
   .copy:hover{border-color:var(--accent);color:var(--accent)}
   .copy.copied{background:var(--accent);border-color:var(--accent);color:#052e2b}
-  .copy.failed{border-color:#f87171;color:#f87171}
+  .copy.failed{border-color:var(--bad);color:var(--bad)}
   .alt{color:var(--dim);font-size:.87rem;margin:14px 0 0}
-  .alt code{font-family:var(--mono);background:color-mix(in srgb,var(--code) 60%, transparent);
-    border:1px solid var(--line);border-radius:6px;padding:2px 6px;color:var(--fg)}
-  .note{margin:0 0 22px;padding:10px 14px;border-radius:10px;font-size:.88rem;
-    color:var(--dim);border:1px solid var(--line);background:color-mix(in srgb,var(--panel) 60%, transparent)}
-  .steps{margin:34px 0 0;padding:0;list-style:none;counter-reset:s}
-  .steps li{counter-increment:s;position:relative;padding-left:34px;margin-bottom:12px;color:var(--dim);font-size:.93rem}
-  .steps li::before{content:counter(s);position:absolute;left:0;top:1px;width:22px;height:22px;border-radius:7px;
-    display:grid;place-items:center;font-size:.75rem;font-weight:700;color:var(--accent);
+  .note{margin:22px 0 0;padding:10px 14px;border-radius:10px;font-size:.88rem;color:var(--dim);
+    border:1px solid var(--line);background:color-mix(in srgb,var(--panel) 60%, transparent)}
+  .warnnote{border-color:color-mix(in srgb,var(--warn) 45%, var(--line))}
+
+  .steps{margin:22px 0 0;padding:0;list-style:none;counter-reset:s}
+  .steps li{counter-increment:s;position:relative;padding-left:34px;margin-bottom:11px;color:var(--dim);font-size:.93rem}
+  .steps li::before{content:counter(s);position:absolute;left:0;top:2px;width:22px;height:22px;border-radius:7px;
+    display:grid;place-items:center;font-size:.74rem;font-weight:700;color:var(--accent);
     background:color-mix(in srgb,var(--accent) 14%, transparent);border:1px solid color-mix(in srgb,var(--accent) 35%, transparent)}
-  .steps b{color:var(--fg);font-weight:600}
-  .steps code{font-family:var(--mono);font-size:.85em;color:var(--fg)}
-  h3{font-size:.8rem;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin:0 0 12px;font-weight:600}
-  footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);color:var(--dim);font-size:.85rem;
+  h3{font-size:.78rem;text-transform:uppercase;letter-spacing:.13em;color:var(--dim);margin:0 0 12px;font-weight:650}
+  table{width:100%;border-collapse:collapse;font-size:.88rem;margin:18px 0 0}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);color:var(--dim);vertical-align:top}
+  th{color:var(--faint);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.09em}
+  td:first-child{color:var(--fg);font-family:var(--mono);font-size:.82rem;white-space:nowrap}
+  td b{color:var(--fg)}
+  .tblwrap{overflow-x:auto}
+  footer{margin-top:56px;padding-top:18px;border-top:1px solid var(--line);color:var(--faint);font-size:.85rem;
     display:flex;flex-wrap:wrap;gap:14px;justify-content:space-between}
-  footer a{color:var(--dim)}
+  footer a{color:var(--dim);text-decoration:none}
   footer a:hover{color:var(--accent)}
-  .pulse{animation:pulse 2.6s ease-in-out infinite}
-  @keyframes pulse{0%,100%{opacity:.55}50%{opacity:1}}
-  @media (prefers-reduced-motion: reduce){.pulse{animation:none}}
+  .pulse{animation:pulse 2.8s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
+  .flow{stroke-dasharray:5 7;animation:flow 1.6s linear infinite}
+  @keyframes flow{to{stroke-dashoffset:-24}}
+  @media (prefers-reduced-motion: reduce){.pulse,.flow{animation:none}}
 </style>
 </head>
 <body>
-<div class="wrap">
 
-  <header>
-    <div class="brand">
+<!-- shared arrowheads: SVG id references resolve document-wide, so every diagram below reuses these -->
+<svg width="0" height="0" aria-hidden="true" style="position:absolute">
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="var(--accent)"/>
+    </marker>
+    <marker id="ah2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="var(--accent2)"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav>
+  <div class="navin">
+    <a class="brand" href="/">
       <svg viewBox="0 0 64 64" aria-hidden="true">
         <g fill="none" stroke-linecap="round">
           <path d="M12 52 L52 12" stroke="#2dd4bf" stroke-width="7" class="pulse"/>
@@ -119,14 +189,27 @@
         </g>
       </svg>
       <span>p2p</span>
+    </a>
+    <div class="navlinks">
+      <a href="#what">What</a>
+      <a href="#key">The key</a>
+      <a href="#discovery">Discovery</a>
+      <a href="#nat">NAT</a>
+      <a href="#handshake">Handshake</a>
+      <a href="#paths">Every path</a>
+      <a href="#stack">Stack</a>
+      <a href="#install">Install</a>
     </div>
-    <a class="ghost" href="https://github.com/fire17/p2p">View on GitHub ↗</a>
-  </header>
+    <a class="gh" href="https://github.com/fire17/p2p">GitHub ↗</a>
+  </div>
+</nav>
 
-  <p class="note" id="badkey" hidden>That didn’t look like a valid p2p key — a key is 26 characters. Here’s the normal install instead.</p>
+<div class="wrap">
+
+  <p class="note warnnote" id="badkey" hidden>That didn’t look like a valid p2p key — a key is 26 Crockford-base32 characters. Here’s the normal install instead.</p>
 
   <!-- deep link: /init/KEY -->
-  <section class="card invite" id="invite" hidden>
+  <section class="card invite" id="invite" hidden style="padding:18px">
     <div class="who">
       <div class="avatar" id="shortid">------</div>
       <div>
@@ -134,51 +217,446 @@
         <p>Install p2p and start chatting with them — you’ll become friends and can reconnect anytime.</p>
       </div>
     </div>
-    <p class="keyline">their key <b id="fullkey"></b></p>
+    <p class="keyline">their key <b id="fullkey"></b> — <a href="#install">install below</a>, the key is already baked into the command.</p>
   </section>
 
-  <!-- landing pitch -->
-  <section id="pitch">
+  <!-- 1. WHAT IT IS -->
+  <section id="what" style="padding-top:34px">
     <h1>Chat that needs <em>no server</em>.</h1>
-    <p class="lede">p2p is a tiny, zero-dependency chat framework. One 26-character key is your whole
-      contact surface — send it to a friend, they find you and message you: direct, end-to-end
-      encrypted, <strong>provably MITM-proof on first contact</strong>, through NAT, with no coordinator
-      server of ours.</p>
+    <p class="lede">p2p is a tiny chat framework with <strong>zero dependencies</strong> and <strong>no
+      coordinator server of ours</strong>. One 26-character key is your whole contact surface: send it to a
+      friend, they find you anywhere on the internet and message you — direct, end-to-end encrypted, and
+      <strong>provably free of a man-in-the-middle from the very first message</strong>.</p>
     <ul class="facts">
-      <li><b>No server</b> Rendezvous rides free public infrastructure — mDNS, the BitTorrent DHT, public trackers.</li>
-      <li><b>MITM-proof</b> Your key commits to your identity keys. The first message that decrypts is the proof.</li>
-      <li><b>Zero deps</b> Node built-ins only. Nothing to audit but us.</li>
+      <li><b>No server</b> Peers meet on infrastructure that already exists and that we don’t run: your LAN’s multicast, the BitTorrent DHT, public WebSocket trackers.</li>
+      <li><b>MITM-proof</b> Your key <em>is</em> a fingerprint of your public keys. The first message a peer can decrypt is a cryptographic proof it reached the real you.</li>
+      <li><b>Zero deps</b> Node built-ins only — X25519, Ed25519, ChaCha20-Poly1305, HKDF, UDP/TCP. ~3.1k lines. Nothing to audit but us.</li>
     </ul>
+    <p style="margin-top:26px">This page explains the whole thing — including the part that sounds impossible:
+      <strong>how two computers behind two home routers find each other and talk, with nobody in the middle
+      to introduce them.</strong></p>
   </section>
 
-  <!-- install -->
-  <section class="card">
-    <h3>Install</h3>
-    <div class="tabs" role="tablist" aria-label="Operating system">
-      <button data-os="unix" role="tab" aria-selected="false">macOS / Linux</button>
-      <button data-os="win" role="tab" aria-selected="false">Windows</button>
-    </div>
+  <!-- 2. THE KEY -->
+  <section id="key">
+    <p class="kicker">01 — identity</p>
+    <h2>The key <em>is</em> the identity</h2>
+    <p>Your machine generates two keypairs — Ed25519 (signing) and X25519 (Diffie–Hellman) — and keeps the
+      private halves on disk (<code>~/.p2p/default.json</code>, mode <code>0600</code>). Your 26-character key is
+      not random: it is a <strong>fingerprint of your public keys</strong>, in Crockford base32 (uppercase,
+      no <code>I L O U</code>, so it survives being read aloud or typed).</p>
 
-    <div class="cmd" data-osblock="unix" hidden>
-      <pre id="cmd-unix">curl -fsSL https://p2p.akeyo.io/init | sh</pre>
-      <button class="copy" data-copy="cmd-unix">copy</button>
-    </div>
-    <div class="cmd" data-osblock="win" hidden>
-      <pre id="cmd-win">irm https://p2p.akeyo.io/init.ps1 | iex</pre>
-      <button class="copy" data-copy="cmd-win">copy</button>
-    </div>
+    <figure>
+      <div class="bits" aria-hidden="true">
+        <div class="b1">5</div>
+        <div class="b2">110 bits — commitment</div>
+        <div class="b3">15</div>
+      </div>
+      <div class="svgbox">
+      <svg viewBox="0 0 700 200" role="img" aria-label="Key bit layout: 5 bits version, 110 bits commitment, 15 bits checksum, encoded as 26 Crockford base32 characters">
+        <text class="s-t b" x="4" y="14">your public keys</text>
+        <rect class="s-box3" x="0" y="24" width="150" height="30" rx="7"/>
+        <text class="s-t mono" x="12" y="43">edPub (32B)</text>
+        <rect class="s-box3" x="0" y="60" width="150" height="30" rx="7"/>
+        <text class="s-t mono" x="12" y="79">xPub  (32B)</text>
 
-    <p class="alt" id="alt-already" hidden>Already have p2p? Just run <code id="cmd-already">p2p</code></p>
+        <path class="s-a2" d="M155 57 L245 57"/>
+        <rect class="s-box" x="250" y="34" width="230" height="46" rx="9"/>
+        <text class="s-t mono" x="262" y="52">SHA256("p2p-id-v1"</text>
+        <text class="s-t mono" x="262" y="70">  ‖ edPub ‖ xPub)</text>
+        <path class="s-a" d="M485 57 L560 57"/>
+        <text class="s-t b acc" x="565" y="53">first 110</text>
+        <text class="s-t b acc" x="565" y="68">bits</text>
 
-    <ol class="steps">
-      <li><b>Run the installer.</b> It puts the <code>p2p</code> command on your machine — no account, no signup.</li>
-      <li><b>Get your key.</b> <code>p2p key</code> prints your 26 characters. That string <em>is</em> you.</li>
-      <li><b>Chat.</b> Send the key to a friend; they run <code>p2p &lt;key&gt;</code> and you’re talking — directly.</li>
-    </ol>
+        <path class="s-dash" d="M600 78 L600 108"/>
+        <rect class="s-box2" x="0" y="112" width="700" height="42" rx="9"/>
+        <line class="s-l" x1="27" y1="112" x2="27" y2="154"/>
+        <line class="s-l" x1="620" y1="112" x2="620" y2="154"/>
+        <text class="s-t sm" x="6" y="138">v/flags</text>
+        <text class="s-t b" x="245" y="138">110-bit commitment to (edPub, xPub)</text>
+        <text class="s-t sm" x="628" y="138">checksum</text>
+        <text class="s-t faint" x="6" y="170">5 bits</text>
+        <text class="s-t faint" x="300" y="170">130 bits total = 26 × 5</text>
+        <text class="s-t faint" x="628" y="170">15 bits</text>
+        <text class="s-t mono acc b" x="180" y="194">7ZQ4T8K2M9XJRV0BCDN5FH3PWA</text>
+        <text class="s-t faint" x="6" y="194">Crockford base32 →</text>
+      </svg>
+      </div>
+      <figcaption><b>The 26-char key, bit by bit.</b> 5 bits version/flags · 110 bits of
+        <code>SHA256("p2p-id-v1" ‖ edPub ‖ xPub)</code> · 15-bit checksum (a typo is caught locally, before any
+        packet leaves). Nobody can hand out a string that points at your identity but is secretly theirs: they
+        would have to find a second preimage of a 110-bit hash — 2<sup>110</sup> work. The checksum makes the key
+        safe to dictate over the phone.</figcaption>
+    </figure>
+  </section>
+
+  <!-- 3. DISCOVERY -->
+  <section id="discovery">
+    <p class="kicker">02 — the magic</p>
+    <h2>Finding each other with no server</h2>
+    <p>Normally “how does computer A reach computer B?” needs a server both sides already know — a chat server,
+      a signalling server, something with a fixed address. We have <strong>none</strong>. Three ideas stacked make
+      it work anyway.</p>
+
+    <p><strong>Idea 1 — the key doubles as a secret meeting point.</strong> Both sides hash the key into a
+      <em>rendezvous id</em>: <code>rid = HKDF(S, "p2p-rv-&lt;channel&gt;-v1", epoch)</code>. Anyone holding the key
+      computes the identical rid; anyone who doesn’t, can’t — it’s one-way. The epoch is the UTC day, so the rid
+      rotates daily (readers check ±1 day; listeners pre-announce the next epoch, so there’s no blackout at
+      midnight). No server told the peers where to meet. The math did.</p>
+
+    <p><strong>Idea 2 — leave the note on bulletin boards that already exist.</strong> We don’t run a server, but
+      the internet is full of free, public, shared notice boards built for other reasons. We ride three, publish
+      to all of them, and race the reads.</p>
+
+    <figure>
+      <div class="svgbox">
+      <svg viewBox="0 0 700 330" role="img" aria-label="Discovery diagram: both peers derive the same rendezvous id from the key, the listener announces it on mDNS, the BitTorrent DHT and public WebSocket trackers, and the dialer looks it up on all three in parallel">
+        <!-- peers -->
+        <rect class="s-box2" x="0" y="120" width="140" height="72" rx="11"/>
+        <circle class="s-node" cx="22" cy="146" r="7"/>
+        <text class="s-t b" x="36" y="150">Ada (listener)</text>
+        <text class="s-t sm" x="10" y="170">holds the private keys</text>
+        <text class="s-t mono acc" x="10" y="186">rid=HKDF(S,epoch)</text>
+
+        <rect class="s-box3" x="560" y="120" width="140" height="72" rx="11"/>
+        <circle class="s-node2" cx="582" cy="146" r="7"/>
+        <text class="s-t b" x="596" y="150">Bo (dialer)</text>
+        <text class="s-t sm" x="570" y="170">holds only Ada’s key</text>
+        <text class="s-t mono" x="570" y="186" style="fill:var(--accent2)">rid=HKDF(S,epoch)</text>
+        <text class="s-t faint" x="243" y="16">same key ⇒ same secret rid ⇒ same meeting point</text>
+        <text class="s-t faint" x="152" y="272">publish to all three</text>
+        <text class="s-t faint" x="552" y="272" text-anchor="end">read all three, race</text>
+        <path class="s-dash" d="M70 118 C 70 30, 630 30, 630 118"/>
+
+        <!-- channels -->
+        <rect class="s-box" x="240" y="42" width="220" height="58" rx="10"/>
+        <text class="s-t b" x="254" y="63">① mDNS — your LAN</text>
+        <text class="s-t sm" x="254" y="82">multicast shout, same Wi-Fi, ~1.5s</text>
+
+        <rect class="s-box" x="240" y="128" width="220" height="58" rx="10"/>
+        <text class="s-t b" x="254" y="149">② BitTorrent Mainline DHT</text>
+        <text class="s-t sm" x="254" y="168">announce_peer / get_peers on rid</text>
+
+        <rect class="s-box" x="240" y="214" width="220" height="58" rx="10"/>
+        <text class="s-t b" x="254" y="235">③ Public WebSocket trackers</text>
+        <text class="s-t sm" x="254" y="254">live matchmaker: offer → answer</text>
+
+        <!-- announce arrows -->
+        <path class="s-a" d="M144 142 C 190 90, 200 71, 236 71"/>
+        <path class="s-a" d="M144 156 L236 157"/>
+        <path class="s-a" d="M144 172 C 190 220, 200 243, 236 243"/>
+        <text class="s-t sm acc b" x="152" y="150">announce</text>
+
+        <!-- lookup arrows -->
+        <path class="s-a2" d="M556 142 C 510 90, 500 71, 464 71"/>
+        <path class="s-a2" d="M556 156 L464 157"/>
+        <path class="s-a2" d="M556 172 C 510 220, 500 243, 464 243"/>
+        <text class="s-t sm b" x="552" y="150" text-anchor="end" style="fill:#38bdf8">lookup — raced</text>
+
+        <!-- what they see -->
+        <rect class="s-danger" x="150" y="288" width="400" height="34" rx="9"/>
+        <text class="s-t" x="164" y="310">all three channels ever see: an opaque hash + an IP. Never who. Never what.</text>
+        <text class="s-t faint" x="0" y="310">we run</text>
+        <text class="s-t faint" x="0" y="322">none of them</text>
+        <path class="s-dash" d="M58 300 L146 300"/>
+      </svg>
+      </div>
+      <figcaption><b>Discovery, end to end.</b> Ada announces her rendezvous id on all three channels; Bo derives
+        the <em>same</em> rid from her key and looks it up on all three in parallel (publish-to-N, race-reads) — if one
+        channel is blocked or slow, the others still land. mDNS covers same-network; the DHT and the trackers are two
+        independent internet paths. The DHT gives a public <code>ip:port</code> hint; the tracker is a live matchmaker
+        that carries the full candidate list (IPv6 / LAN / STUN) in the offer blob. <b>Zero trust in all of them:</b>
+        anyone can announce a lie — the commitment gate and the handshake below make lies useless.</figcaption>
+    </figure>
+  </section>
+
+  <!-- 4. NAT -->
+  <section id="nat">
+    <p class="kicker">03 — the magic, part two</p>
+    <h2>Punching through the routers</h2>
+    <p><strong>Idea 3 — the hole punch.</strong> Both sides now know each other’s public address, but home
+      routers (NAT) drop unexpected inbound packets. So each side first asks a free public <strong>STUN</strong>
+      server “what does my address look like from outside?”, then both fire a UDP packet at the other
+      <em>at the same moment</em>. Your outbound packet teaches your own router “I’m expecting a reply from that
+      address” — which props the pinhole open just long enough for the other side’s packet to arrive. Both
+      firewalls open at once, and a direct path exists.</p>
+
+    <figure>
+      <div class="svgbox">
+      <svg viewBox="0 0 700 300" role="img" aria-label="NAT hole-punch diagram: each peer learns its public address from a STUN server, then both send UDP packets simultaneously, opening pinholes in both routers and forming a direct path">
+        <!-- STUN -->
+        <rect class="s-box" x="270" y="0" width="160" height="42" rx="10"/>
+        <text class="s-t b" x="284" y="20">public STUN server</text>
+        <text class="s-t sm" x="284" y="35">“your address looks like…”</text>
+        <path class="s-dash" d="M120 96 C 150 40, 220 20, 266 20"/>
+        <path class="s-dash" d="M580 96 C 550 40, 480 20, 434 20"/>
+        <text class="s-t faint" x="128" y="52">① what’s my</text>
+        <text class="s-t faint" x="128" y="64">public ip:port?</text>
+        <text class="s-t faint" x="512" y="52">① same</text>
+        <text class="s-t faint" x="512" y="64">question</text>
+
+        <!-- peers + routers -->
+        <rect class="s-box2" x="0" y="96" width="118" height="60" rx="11"/>
+        <circle class="s-node" cx="22" cy="120" r="7"/>
+        <text class="s-t b" x="36" y="124">Ada</text>
+        <text class="s-t mono sm" x="12" y="145">192.168.1.20</text>
+
+        <rect class="s-box" x="150" y="86" width="60" height="80" rx="9"/>
+        <text class="s-t sm b" x="160" y="112">router</text>
+        <text class="s-t sm" x="160" y="128">NAT</text>
+        <text class="s-t faint" x="156" y="152">pinhole</text>
+
+        <rect class="s-box3" x="582" y="96" width="118" height="60" rx="11"/>
+        <circle class="s-node2" cx="604" cy="120" r="7"/>
+        <text class="s-t b" x="618" y="124">Bo</text>
+        <text class="s-t mono sm" x="594" y="145">10.0.0.7</text>
+
+        <rect class="s-box" x="490" y="86" width="60" height="80" rx="9"/>
+        <text class="s-t sm b" x="500" y="112">router</text>
+        <text class="s-t sm" x="500" y="128">NAT</text>
+        <text class="s-t faint" x="496" y="152">pinhole</text>
+
+        <!-- simultaneous packets -->
+        <path class="s-a" d="M214 116 L486 116"/>
+        <path class="s-a2" d="M486 146 L214 146"/>
+        <text class="s-t sm acc" x="250" y="108">② UDP →  (opens Ada’s pinhole)</text>
+        <text class="s-t sm" x="290" y="166" style="fill:var(--accent2)">← ② UDP  (opens Bo’s pinhole)</text>
+        <text class="s-t faint" x="286" y="184">both fired at the same moment</text>
+
+        <!-- result -->
+        <path class="s-a flow" d="M118 216 L582 216" style="stroke-width:2.5"/>
+        <text class="s-t b acc" x="270" y="208">③ direct encrypted path</text>
+        <text class="s-t sm" x="212" y="236">ChaCha20-Poly1305 · ordered · keepalive 25s · no server in the middle</text>
+
+        <!-- ladder -->
+        <rect class="s-box" x="0" y="256" width="700" height="42" rx="9"/>
+        <text class="s-t sm b" x="14" y="273">the ladder, raced ICE-style, best path kept:</text>
+        <text class="s-t mono sm acc" x="14" y="290">IPv6 direct → LAN → UDP hole punch → TCP simultaneous-open → peer-relay via a mutual friend (v2)</text>
+      </svg>
+      </div>
+      <figcaption><b>The hole punch.</b> STUN (another borrowed, free service) reveals each side’s public
+        <code>ip:port</code>; the simultaneous send makes each NAT believe the inbound packet is a reply it already
+        expected. Direct connectivity succeeds for roughly <b>70–90%</b> of real-world pairs. When both peers sit behind
+        <em>symmetric</em> NAT, no direct path can form — the design falls back down the ladder to a relay through a
+        mutual online peer (still end-to-end encrypted, so the relay is blind; v2).</figcaption>
+    </figure>
+  </section>
+
+  <!-- 5. HANDSHAKE -->
+  <section id="handshake">
+    <p class="kicker">04 — the proof</p>
+    <h2>Why the first ack <em>proves</em> nobody is in the middle</h2>
+    <p>A path exists — but is the machine at the other end really the owner of the key? Every rendezvous channel is
+      treated as <strong>hostile</strong>: anyone holding the key can announce a bogus address. Two mechanisms make
+      that harmless.</p>
+
+    <figure>
+      <div class="svgbox">
+      <svg viewBox="0 0 700 330" role="img" aria-label="Handshake sequence: dialer receives HELLO with the listener's public keys, gates them against the 110-bit commitment in the key, then runs a Noise IK handshake; decrypting message 2 proves there is no man-in-the-middle">
+        <!-- lifelines -->
+        <rect class="s-box3" x="20" y="0" width="150" height="30" rx="8"/>
+        <text class="s-t b" x="34" y="20">Bo — dialer</text>
+        <rect class="s-box2" x="530" y="0" width="150" height="30" rx="8"/>
+        <text class="s-t b" x="544" y="20">Ada — listener</text>
+        <line class="s-dash" x1="95" y1="34" x2="95" y2="300"/>
+        <line class="s-dash" x1="605" y1="34" x2="605" y2="300"/>
+
+        <!-- hello -->
+        <path class="s-a" d="M600 58 L100 58"/>
+        <text class="s-t mono" x="200" y="50">HELLO { edPub, xPub }   — plaintext, replayable, proves NOTHING</text>
+
+        <!-- gate -->
+        <rect class="s-danger" x="20" y="72" width="360" height="54" rx="9"/>
+        <text class="s-t b" x="34" y="92">COMMITMENT GATE</text>
+        <text class="s-t mono sm" x="34" y="110">SHA256("p2p-id-v1"‖edPub‖xPub)[0..110) == key’s commitment?</text>
+        <text class="s-t sm" x="34" y="122" style="fill:var(--bad)">mismatch → drop. Forging a match = 2¹¹⁰ work.</text>
+
+        <!-- IK msg1 -->
+        <path class="s-a2" d="M100 158 L600 158"/>
+        <text class="s-t mono" x="150" y="150">Noise IK msg1:  e, es, s, ss     (Bo encrypts to Ada’s static key)</text>
+        <text class="s-t faint" x="150" y="172">only the holder of Ada’s X25519 private key can decrypt this</text>
+
+        <!-- IK msg2 -->
+        <path class="s-a" d="M600 208 L100 208"/>
+        <text class="s-t mono" x="150" y="200">Noise IK msg2:  e, ee, se        ← THE ACK</text>
+
+        <rect class="s-box2" x="20" y="222" width="660" height="46" rx="9"/>
+        <text class="s-t b acc" x="34" y="242">msg2 decrypts ⇒ proof: the other end holds Ada’s private key.</text>
+        <text class="s-t sm" x="34" y="259">A man-in-the-middle who relayed everything still cannot produce it — it is keyed to a secret only Ada has.</text>
+
+        <!-- session -->
+        <path class="s-a flow" d="M100 292 L600 292" style="stroke-width:2.5"/>
+        <text class="s-t sm b" x="200" y="284">session: ChaCha20-Poly1305, ordered, exactly-once</text>
+      </svg>
+      </div>
+      <figcaption><b>Fetch → gate → Noise IK.</b> The <code>HELLO</code> is public and replayable, so it authenticates
+        nothing on its own — it only supplies candidate public keys, which are <em>gated</em> against the 110-bit
+        commitment baked into the key you were given. Then a standard <b>Noise IK</b> handshake (validated byte-exact
+        against the official noise-c test vectors) runs on top. <code>connect()</code> resolves <em>only</em> after msg2
+        decrypts — that success <em>is</em> the MITM proof. When the CLI prints <code>✅ secure channel established —
+        verified, no MITM</code>, that line is a mathematical statement, not a hopeful label. Honest limits: forward
+        secrecy is session-granular (no in-session ratchet), and metadata (an IP, an opaque rid) is visible to the
+        rendezvous channels.</figcaption>
+    </figure>
+  </section>
+
+  <!-- 6. EVERY PATH -->
+  <section id="paths">
+    <p class="kicker">05 — behavior</p>
+    <h2>Every path the system takes</h2>
+    <p>First contact, the same-Wi-Fi fast path, the cross-internet path, the fallback ladder, and what happens when
+      a peer’s laptop closes and comes back.</p>
+
+    <figure>
+      <div class="svgbox">
+      <svg viewBox="0 0 700 400" role="img" aria-label="Flow diagram of every connection path: resolve on three channels, take the LAN fast path or the internet path, climb the fallback ladder, gate and handshake, run the session, and on a drop redial and re-attach the buffered outbox exactly once">
+        <!-- start -->
+        <rect class="s-box3" x="0" y="0" width="150" height="38" rx="9"/>
+        <text class="s-t b" x="14" y="18">p2p &lt;KEY&gt;</text>
+        <text class="s-t sm" x="14" y="32">checksum checked locally</text>
+        <path class="s-a2" d="M154 19 L206 19"/>
+
+        <rect class="s-box" x="210" y="0" width="160" height="38" rx="9"/>
+        <text class="s-t b" x="224" y="18">resolve rid</text>
+        <text class="s-t sm" x="224" y="32">mDNS · DHT · trackers (raced)</text>
+        <path class="s-a" d="M374 19 L426 19"/>
+
+        <rect class="s-box" x="430" y="0" width="270" height="38" rx="9"/>
+        <text class="s-t b" x="444" y="18">candidate list</text>
+        <text class="s-t sm" x="444" y="32">IPv6 · LAN · STUN-reflexive addresses</text>
+
+        <path class="s-a" d="M565 42 L565 62"/>
+
+        <!-- ladder -->
+        <rect class="s-box" x="0" y="66" width="700" height="96" rx="10"/>
+        <text class="s-t b" x="14" y="86">the ladder — raced, first working rung wins</text>
+        <rect class="s-box2" x="14" y="96" width="120" height="30" rx="7"/>
+        <text class="s-t sm b" x="26" y="115">IPv6 direct</text>
+        <path class="s-a" d="M138 111 L156 111"/>
+        <rect class="s-box2" x="160" y="96" width="110" height="30" rx="7"/>
+        <text class="s-t sm b" x="172" y="115">same-LAN</text>
+        <path class="s-a" d="M274 111 L292 111"/>
+        <rect class="s-box2" x="296" y="96" width="140" height="30" rx="7"/>
+        <text class="s-t sm b" x="308" y="115">UDP hole punch</text>
+        <path class="s-a" d="M440 111 L458 111"/>
+        <rect class="s-box" x="462" y="96" width="100" height="30" rx="7"/>
+        <text class="s-t sm b" x="474" y="115">TCP open</text>
+        <path class="s-dash" d="M566 111 L584 111"/>
+        <rect class="s-danger" x="588" y="96" width="100" height="30" rx="7"/>
+        <text class="s-t sm b" x="600" y="115">relay (v2)</text>
+        <text class="s-t faint" x="14" y="146">~1.5s on the same Wi-Fi · 70–90% of internet pairs punch through · both sides symmetric-NAT ⇒ relay</text>
+        <text class="s-t faint" x="14" y="158">no rung is trusted: every one of them ends at the same gate</text>
+
+        <path class="s-a" d="M350 166 L350 186"/>
+
+        <!-- gate + handshake -->
+        <rect class="s-box2" x="120" y="190" width="460" height="38" rx="9"/>
+        <text class="s-t b acc" x="134" y="208">commitment gate → Noise IK → first ack decrypts</text>
+        <text class="s-t sm" x="134" y="222">connect() resolves here, and only here — verified, no MITM</text>
+
+        <path class="s-a" d="M350 232 L350 252"/>
+        <rect class="s-box2" x="180" y="256" width="340" height="38" rx="9"/>
+        <text class="s-t b" x="194" y="274">session — direct, encrypted, ordered</text>
+        <text class="s-t sm" x="194" y="288">exactly-once (seq dedup) · keepalive 25s · connId survives roaming</text>
+
+        <!-- reconnect loop -->
+        <path class="s-a" d="M520 275 C 640 275, 660 330, 560 336"/>
+        <rect class="s-box" x="180" y="318" width="380" height="38" rx="9"/>
+        <text class="s-t b" x="194" y="336">peer drops (laptop closes, Wi-Fi flips)</text>
+        <text class="s-t sm" x="194" y="350">liveness times out → sends buffer in the app-level outbox</text>
+        <path class="s-a" d="M176 337 C 60 337, 40 300, 40 170"/>
+        <text class="s-t sm acc" x="4" y="378">redial the same rid</text>
+        <text class="s-t faint" x="0" y="392">new socket re-attaches to the SAME peer</text>
+        <text class="s-t faint" x="230" y="378">→ buffered messages flush, still exactly-once, still verified</text>
+      </svg>
+      </div>
+      <figcaption><b>Every path, one flow.</b> Fresh first contact and reconnect share the same machinery: the rid is
+        derived from the key, so a peer that vanishes is simply looked up again. Reliability lives in two layers —
+        <code>wire.js</code> gives ordered, exactly-once delivery <em>within</em> a session; <code>node.js</code> adds an
+        app-level outbox keyed by peer identity, so messages queued while a friend was offline flush on reconnect and are
+        never delivered twice. Honest status: same-LAN is verified end-to-end; cross-internet machinery (live STUN, live
+        DHT lookups, live trackers, punch) is proven piecewise; offline store-and-forward and peer-relay are v2.</figcaption>
+    </figure>
+  </section>
+
+  <!-- 7. STACK -->
+  <section id="stack">
+    <p class="kicker">06 — the code</p>
+    <h2>The whole stack fits in your head</h2>
+    <p>Node ≥ 22, plain ESM, no build step, <strong>zero npm dependencies</strong> — it is the only runtime where every
+      primitive is native: X25519, Ed25519, ChaCha20-Poly1305, HKDF, SHA-256 (<code>node:crypto</code>), UDP/TCP
+      (<code>node:dgram</code>/<code>node:net</code>), WebSocket (global).</p>
+    <div class="tblwrap">
+    <table>
+      <thead><tr><th>module</th><th>job</th><th>lines</th></tr></thead>
+      <tbody>
+        <tr><td>src/key.js</td><td><b>Identity.</b> Keygen, the 26-char encode/decode, checksum, the commitment gate, rid derivation.</td><td>225</td></tr>
+        <tr><td>src/noise.js</td><td><b>Crypto.</b> Noise_IK_25519_ChaChaPoly_SHA256, in-house, byte-exact against the official noise-c vectors.</td><td>381</td></tr>
+        <tr><td>src/wire.js</td><td><b>Reliability.</b> Framing, sliding-window ARQ, cumulative ack, RTT-adaptive resend, keepalive, connId roaming.</td><td>361</td></tr>
+        <tr><td>src/transport.js</td><td><b>Pipes.</b> Dual-stack UDP, in-house STUN client, ICE-lite hole punch, TCP fallback.</td><td>555</td></tr>
+        <tr><td>src/rendezvous/</td><td><b>Meeting.</b> mDNS, Mainline DHT (+ bencode), WebSocket trackers, and the publish-fanout / read-race.</td><td>1159</td></tr>
+        <tr><td>src/node.js</td><td><b>The API.</b> <code>identity()</code>, <code>listen()</code>, <code>connect()</code>, peer lifecycle, the reconnect outbox.</td><td>420</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p style="margin-top:18px">Use it as a library — it is designed to be the messaging backbone of any project:</p>
+    <div class="cmd" style="padding-right:14px">
+      <pre style="white-space:pre-wrap">import { identity, listen } from '@fire17/p2p'
+
+const me = await identity()            // me.S = your 26-char key — share it
+const node = await listen(me)
+node.on('message', (peer, data) =&gt; console.log(data.toString()))
+
+const peer = await node.connect(theirKey)   // resolves only after the MITM-proof handshake
+await peer.send('hey')</pre>
+    </div>
+  </section>
+
+  <!-- 8. FRIENDS -->
+  <section id="friends">
+    <p class="kicker">07 — people</p>
+    <h2>Friends</h2>
+    <p>Everyone you connect with is remembered — their key is saved locally (<code>~/.p2p/&lt;profile&gt;.friends.json</code>),
+      so you never need the long string twice. <code>p2p friends</code> lists them; reconnect by name. Because the rid is
+      derived from the key, a friend is findable again from anywhere, on any network, whenever you’re both online. No
+      account, no directory, no server that could ever be asked who your friends are.</p>
+  </section>
+
+  <!-- 9. INSTALL -->
+  <section id="install">
+    <p class="kicker">08 — get it</p>
+    <h2>Install</h2>
+    <div class="card" style="margin-top:16px">
+      <h3>One command</h3>
+      <div class="tabs" role="tablist" aria-label="Operating system">
+        <button data-os="unix" role="tab" aria-selected="false">macOS / Linux</button>
+        <button data-os="win" role="tab" aria-selected="false">Windows</button>
+      </div>
+      <div class="cmd" data-osblock="unix" hidden>
+        <pre id="cmd-unix">curl -fsSL https://p2p.akeyo.io/init | sh</pre>
+        <button class="copy" data-copy="cmd-unix">copy</button>
+      </div>
+      <div class="cmd" data-osblock="win" hidden>
+        <pre id="cmd-win">irm https://p2p.akeyo.io/init.ps1 | iex</pre>
+        <button class="copy" data-copy="cmd-win">copy</button>
+      </div>
+      <p class="alt" id="alt-already" hidden>Already have p2p? Just run <code id="cmd-already">p2p</code></p>
+
+      <ol class="steps">
+        <li><b>Run the installer.</b> It puts the <code>p2p</code> command on your machine — no account, no signup.</li>
+        <li><b>Get your key.</b> <code>p2p key</code> prints your 26 characters. That string <em>is</em> you.</li>
+        <li><b>Share it.</b> Send the key — or the link <code>p2p.akeyo.io/init/&lt;your-key&gt;</code>, which installs p2p and
+          dials you in one step.</li>
+        <li><b>Chat.</b> They run <code>p2p &lt;key&gt;</code>; you both see <code>✅ verified, no MITM</code> and you’re talking — directly.</li>
+      </ol>
+    </div>
+    <p class="note">The installer is a plain shell script you can read before you run it:
+      <a href="https://github.com/fire17/p2p/blob/main/init">init</a> ·
+      <a href="https://github.com/fire17/p2p/blob/main/init.ps1">init.ps1</a>.</p>
   </section>
 
   <footer>
-    <span>MIT · zero dependencies · <a href="https://github.com/fire17/p2p/blob/main/docs/HOW-IT-WORKS.md">how it works</a></span>
+    <span>MIT · zero dependencies · <a href="https://github.com/fire17/p2p/blob/main/docs/HOW-IT-WORKS.md">how it works</a> · <a href="https://github.com/fire17/p2p/blob/main/DESIGN.md">design</a></span>
     <a href="https://github.com/fire17/p2p">github.com/fire17/p2p</a>
   </footer>
 

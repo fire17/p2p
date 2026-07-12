@@ -88,7 +88,6 @@
 
     if (r.key) {
       $('invite').hidden = false
-      $('pitch').hidden = true
       $('shortid').textContent = r.key.slice(0, 6)
       $('fullkey').textContent = r.key
       $('cmd-already').textContent = cmds.already
