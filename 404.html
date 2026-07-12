@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>p2p</title>
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<meta name="robots" content="noindex">
+<script>
+  /* GitHub Pages SPA shim (rafgraph/spa-github-pages technique).
+     GH Pages has no server-side routing, so /init/KEY 404s. Bounce it to / with the
+     intended path preserved in ?p=, which index.html (app.js) reads and routes on.
+     app.js then restores the pretty URL with history.replaceState. */
+  (function () {
+    var l = window.location
+    var path = l.pathname + l.search + l.hash
+    l.replace(l.origin + '/?p=' + encodeURIComponent(path))
+  })()
+</script>
+<style>
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1220;color:#93a4bd;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: light){body{background:#f7f9fb;color:#5b6b83}}
+  a{color:#2dd4bf}
+</style>
+</head>
+<body>
+  <p>Redirecting… <a href="/">go to p2p.akeyo.io</a></p>
+</body>
+</html>
