@@ -18,7 +18,7 @@
 import './shim/globals.js'
 
 import { identity as makeIdentity, listen as nodeListen } from '../node.js'
-import { createBrowserTransport } from './webrtc.js'
+import { createRacedTransport } from './transport.js'
 import * as key from '../key.js'
 import * as noise from '../noise.js'
 
@@ -94,10 +94,13 @@ export async function identity(opts = {}) {
 }
 
 /**
- * Go online: reachable under rid(S) on the public WSS trackers, accepting inbound WebRTC
- * DataChannels and running HELLO -> commitment gate -> Noise IK on each.
+ * Go online: reachable under rid(S), accepting inbound connections on BOTH transports and running
+ * HELLO -> commitment gate -> Noise IK on each. The transports RACE (research/browser-client.md §6):
+ *   • WebRTC DataChannel over the WSS trackers — direct P2P, browser↔browser.
+ *   • WSS-relay (src/transport-wss.js) — the zero-dep floor that also reaches a TUI peer.
+ * Whichever completes the verified handshake first wins; node.js is unchanged.
  * @param {object} id from identity()
- * @param {object} [opts] {trackers, iceServers} — both default to the public/free ones
+ * @param {object} [opts] {trackers, iceServers, relays, wss?:bool, webrtc?:bool} — all default on
  * @returns {Promise<object>} the same node object src/node.js returns (on/connect/group/peers/close)
  */
 export async function listen(id, opts = {}) {
@@ -105,12 +108,18 @@ export async function listen(id, opts = {}) {
     // WebCrypto's getRandomValues and IndexedDB need a secure context; so does honest security.
     throw new Error('p2p requires a secure context (https:// or localhost)')
   }
-  const t = createBrowserTransport(opts)
+  const t = await createRacedTransport(opts)
+  // Pre-build the endpoint WITH our S (the WSS leg subscribes its own inbox at creation). Provide
+  // it via BOTH opts.endpoint and a createEndpoint in deps: node.js's resolveDeps only skips the
+  // Node-only (dgram) sibling imports when EVERY dep function is present, so createEndpoint must be
+  // in deps — it just returns the endpoint we already built (node.js uses opts.endpoint anyway).
+  const endpoint = await t.createEndpoint(id.S)
 
   // Inject the browser's seams. Everything else — the gate, Noise IK, framing, the outbox, the
   // peer lifecycle — is src/node.js's own code, byte-identical to what the TUI runs.
   const node = await nodeListen(id, {
     ...opts,
+    endpoint,
     deps: {
       generateIdentity: key.generateIdentity,
       decodeKey: key.decodeKey,
@@ -118,7 +127,7 @@ export async function listen(id, opts = {}) {
       encodeKey: key.encodeKey,
       initiator: noise.initiator,
       responder: noise.responder,
-      createEndpoint: t.createEndpoint,
+      createEndpoint: async () => endpoint,
       resolve: t.resolve,
       publishAll: (S) => t.publishAll(S),
     },

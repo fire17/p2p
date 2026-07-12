@@ -150,6 +150,78 @@ export class DHT {
     return { peers: [...peers], announced, queried: [...seen.values()].filter((n) => n.queried).length, tokenNodes: withToken.length };
   }
 
+  // ── BEP44 mutable items (invite mode only) ───────────────────────────────────────────────────
+  // WHY: announce_peer is unfixable for privacy — it PUBLISHES your source ip:port and get_peers
+  // hands it to anyone (BEP5). There is no payload to encrypt; the leaked datum IS the transport
+  // address. BEP44 stores an ARBITRARY value under target = SHA1(pubkey ‖ salt), signed with
+  // Ed25519 — so we store a sealed, fixed-length ciphertext instead of an IP.
+  // (research/metadata-privacy.md §4.2 — this is the decision that revives DESIGN D7's rejected
+  // BEP44 path: D7's blocker was that a commitment-only S cannot yield the 32-byte signing pubkey a
+  // reader needs. With a per-invite K_inv BOTH parties derive the SAME keypair from it, so both
+  // compute the same target — and "the write key is public to holders" now means "public to the ONE
+  // invitee", who has no incentive to squat their own invite. Reusable-S mode keeps announce_peer.)
+
+  /** Iterative traversal toward `target`, calling `method` on each node. @returns {{withToken:object[], best:object|null}} */
+  async _traverse(target, method, extraArgs, { rounds = 6, alpha = 8, signal } = {}) {
+    await this.ready();
+    const seen = new Map();
+    const withToken = [];
+    let best = null; // highest-seq valid-shaped mutable item seen
+
+    await Promise.all(BOOTSTRAP.map(async (b) => {
+      try {
+        const { address } = await dns.lookup(b.host, { family: 4 });
+        const k = `${address}:${b.port}`;
+        if (!seen.has(k)) seen.set(k, { host: address, port: b.port, queried: false });
+      } catch { /* skip unresolvable bootstrap */ }
+    }));
+
+    const dist = (n) => (n.id ? xor(n.id, target) : Buffer.alloc(20, 0xff));
+
+    for (let round = 0; round < rounds; round++) {
+      if (signal?.aborted) break;
+      const cand = [...seen.values()].filter((n) => !n.queried)
+        .sort((a, b) => cmpBuf(dist(a), dist(b))).slice(0, alpha);
+      if (cand.length === 0) break;
+      await Promise.all(cand.map(async (n) => {
+        n.queried = true;
+        try {
+          const { r } = await this.query(n, method, { target, ...extraArgs });
+          if (Buffer.isBuffer(r.token)) { n.token = r.token; if (r.id) n.id = r.id; withToken.push(n); }
+          if (Buffer.isBuffer(r.v) && Buffer.isBuffer(r.sig) && Buffer.isBuffer(r.k)) {
+            const seq = typeof r.seq === 'number' ? r.seq : 0;
+            if (!best || seq > best.seq) best = { v: r.v, sig: r.sig, k: r.k, seq };
+          }
+          for (const nn of parseNodes(r.nodes)) {
+            const k = `${nn.host}:${nn.port}`;
+            if (!seen.has(k)) seen.set(k, { ...nn, queried: false });
+          }
+        } catch { /* dead node — expected on the public DHT */ }
+      }));
+    }
+    return { withToken, best, queried: [...seen.values()].filter((n) => n.queried).length };
+  }
+
+  /** BEP44 `get` — fetch the newest mutable item at `target`. @returns {Promise<{item:object|null}>} */
+  async bep44Get(target, opts = {}) {
+    const { best } = await this._traverse(target, 'get', {}, opts);
+    return { item: best };
+  }
+
+  /** BEP44 `put` of a signed mutable item (v MUST be under the 1000-byte soft cap). */
+  async bep44Put({ target, k, salt, seq, v, sig }, opts = {}) {
+    const { withToken } = await this._traverse(target, 'get', {}, opts);
+    const targets = withToken.filter((n) => n.token).slice(0, 8);
+    let stored = 0;
+    await Promise.all(targets.map(async (n) => {
+      try {
+        await this.query(n, 'put', { k, salt, seq, v, sig, token: n.token });
+        stored++;
+      } catch { /* node refused (unsupported/full) — fine, others take it */ }
+    }));
+    return { stored };
+  }
+
   close() { try { this.socket.close(); } catch { /* already closed */ } }
 }
 
@@ -163,15 +235,46 @@ export class DHT {
  * @param {() => number} [opts.now] clock (ms)
  * @param {number} [opts.port] default announce port when info.port is absent
  * @param {number} [opts.rounds] iterative get_peers rounds
+ * @param {object} [opts.invite] an src/invite.js createInvite() context → INVITE MODE: the channel
+ *   switches from plaintext announce_peer to ENCRYPTED BEP44 (sealed candidates, never an IP on the
+ *   DHT). Absent → today's reusable-S behaviour, byte-identical.
  * @returns {{name:'dht', ridLen:20, announce:Function, lookup:Function, close:Function}}
  */
 export function createDht(opts = {}) {
   const now = opts.now || (() => Date.now());
   const rounds = opts.rounds ?? 6;
   const dht = opts.dht || new DHT();
+  const inv = opts.invite || null;
+
+  /** INVITE MODE: put a sealed, signed, fixed-length blob at the K_inv-derived BEP44 target. */
+  function announceBep44(rid, info) {
+    const candidates = (info && info.candidates) || (info && info.port ? [{ proto: 'udp4', port: info.port, kind: 'host' }] : []);
+    const blob = { v: 1, ts: now(), candidates };
+    const v = inv.codec.seal(blob, rid);                  // fixed-length ciphertext (288 B « BEP44's 1000 B cap)
+    const seq = Math.floor(now() / 1000);                 // monotonic per BEP44
+    const sig = inv.bep44Sign(rid, seq, v);
+    const target = inv.bep44Target(rid);
+    Promise.resolve(dht.bep44Put({ target, k: inv.bepPub, salt: inv.bep44Salt(rid), seq, v, sig }, { rounds }))
+      .catch(() => {});                                    // fire-and-forget, same contract as announce_peer
+    return { stop() {} };
+  }
+
+  /** INVITE MODE: fetch the item, verify the K_inv-derived signature, AEAD-open the candidates. */
+  async function* lookupBep44(rid, lopts) {
+    const target = inv.bep44Target(rid);
+    let item;
+    try { ({ item } = await dht.bep44Get(target, { rounds, signal: lopts.signal })); } catch { return; }
+    if (!item || !Buffer.isBuffer(item.v)) return;
+    if (Buffer.isBuffer(item.k) && !item.k.equals(inv.bepPub)) return;      // someone else's item at this target
+    if (!inv.bep44Verify(rid, item.seq, item.v, item.sig)) return;          // BEP44 signature (belt)
+    const blob = inv.codec.open(item.v, rid);                               // AEAD tag (braces) — null if not ours
+    if (!blob || !Array.isArray(blob.candidates) || !blob.candidates.length) return;
+    yield { candidates: blob.candidates, channel: 'dht', ts: blob.ts || now() };
+  }
 
   function announce(rid, info = {}) {
     if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
+    if (inv) return announceBep44(rid, info);
     const port = info.port ?? opts.port ?? 0;
     // fire-and-forget: race drives re-announce on epoch/netchange; a failed announce is non-fatal
     Promise.resolve(dht.getPeers(rid, { announce: true, port, rounds })).catch(() => {});
@@ -180,6 +283,7 @@ export function createDht(opts = {}) {
 
   async function* lookup(rid, lopts = {}) {
     if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
+    if (inv) { yield* lookupBep44(rid, lopts); return; }
     let res;
     try {
       res = await dht.getPeers(rid, { announce: false, rounds, signal: lopts.signal, stopOnFirstPeers: true });

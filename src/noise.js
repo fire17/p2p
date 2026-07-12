@@ -34,6 +34,11 @@ import {
 } from 'node:crypto'
 
 const PROTOCOL_NAME = 'Noise_IK_25519_ChaChaPoly_SHA256'
+// Invite mode (research/metadata-privacy.md §5): the SAME IK pattern with a psk token appended to
+// the end of msg2 (Noise §9.4: "The modifiers psk1, psk2 … place a 'psk' token at the end of the
+// first, second, etc., handshake message"). Strictly ADDITIVE — selected only when opts.psk is
+// given; with no psk every byte on the wire is the plain-IK v0.1.0 wire, unchanged.
+const PROTOCOL_NAME_PSK2 = 'Noise_IKpsk2_25519_ChaChaPoly_SHA256'
 const DHLEN = 32
 const TAGLEN = 16
 const HASHLEN = 32
@@ -76,6 +81,19 @@ function hkdf2(ck, ikm) {
   const o1 = hmac(tk, Buffer.from([1]))
   const o2 = hmac(tk, Buffer.concat([o1, Buffer.from([2])]))
   return [o1, o2]
+}
+
+/**
+ * Noise HKDF with three outputs (Noise §4.3) — used ONLY by MixKeyAndHash for the psk token.
+ * out3 = HMAC(tk, out2 || 0x03).
+ * @param {Buffer} ck @param {Buffer} ikm @returns {[Buffer, Buffer, Buffer]}
+ */
+function hkdf3(ck, ikm) {
+  const tk = hmac(ck, ikm)
+  const o1 = hmac(tk, Buffer.from([1]))
+  const o2 = hmac(tk, Buffer.concat([o1, Buffer.from([2])]))
+  const o3 = hmac(tk, Buffer.concat([o2, Buffer.from([3])]))
+  return [o1, o2, o3]
 }
 
 function xPubFromRaw(raw) {
@@ -205,6 +223,15 @@ const PATTERNS = [
   ['e', 'es', 's', 'ss'], // msg1: initiator
   ['e', 'ee', 'se'], // msg2: responder (THE ACK)
 ]
+// IKpsk2 = IK with a psk token at the END of msg2 (Noise §9.4). §9.3's rule ("a party may not send
+// encrypted data after processing a psk token unless it has previously sent an ephemeral") holds:
+// both ephemerals precede the psk. §9.4 also states any psk modifier "can be safely applied to any
+// previously named pattern" — so IK's es/ss/se authentication and forward secrecy are preserved and
+// the psk only ADDS a gate.
+const PATTERNS_PSK2 = [
+  ['e', 'es', 's', 'ss'],
+  ['e', 'ee', 'se', 'psk'],
+]
 
 class HandshakeState {
   constructor(role, opts) {
@@ -228,11 +255,24 @@ class HandshakeState {
     }
     this._ephemeral = opts._ephemeral || null // raw priv, KAT/test injection only
 
-    // InitializeSymmetric: protocol name is exactly HASHLEN bytes → h = name (no pad, no hash).
-    const name = Buffer.from(PROTOCOL_NAME, 'ascii')
-    if (name.length !== HASHLEN) throw new HandshakeError('protocol name length assumption broken')
-    this.h = Buffer.from(name)
-    this.ck = Buffer.from(name)
+    // psk (invite mode) is OPTIONAL and additive: absent => plain IK, byte-for-byte as v0.1.0.
+    if (opts.psk != null) {
+      if (!Buffer.isBuffer(opts.psk) || opts.psk.length !== HASHLEN) {
+        throw new HandshakeError('psk must be a 32-byte Buffer')
+      }
+      this.psk = Buffer.from(opts.psk)
+    } else {
+      this.psk = null
+    }
+    this.patterns = this.psk ? PATTERNS_PSK2 : PATTERNS
+
+    // InitializeSymmetric (Noise §5.2): h = name if |name| <= HASHLEN (zero-padded), else SHA256(name).
+    // Plain IK's name is exactly 32 bytes (h = name, unchanged). IKpsk2's is 36 → hashed.
+    const name = Buffer.from(this.psk ? PROTOCOL_NAME_PSK2 : PROTOCOL_NAME, 'ascii')
+    if (name.length === HASHLEN) this.h = Buffer.from(name)
+    else if (name.length < HASHLEN) { this.h = Buffer.alloc(HASHLEN); name.copy(this.h, 0) }
+    else this.h = sha256(name)
+    this.ck = Buffer.from(this.h)
     this.cs = new CipherState(null)
 
     // MixHash(prologue) then the pre-message (<- s: responder static, in initiator's key order).
@@ -251,6 +291,17 @@ class HandshakeState {
   }
   _mixHash(data) {
     this.h = sha256(this.h, data)
+  }
+  /**
+   * MixKeyAndHash(psk) — Noise §5.2/§9.1: the psk is folded into BOTH the chaining key (so every
+   * transport key depends on it) AND the transcript hash h (so any mismatch is detected). A wrong or
+   * missing psk ⇒ different ck/h ⇒ the very next AEAD tag fails ⇒ the handshake aborts, fail-closed.
+   */
+  _mixKeyAndHash(psk) {
+    const [ck, tempH, tempK] = hkdf3(this.ck, psk)
+    this.ck = ck
+    this._mixHash(tempH)
+    this.cs = new CipherState(tempK) // InitializeKey → n=0
   }
   _encryptAndHash(plaintext) {
     const ct = this.cs.encryptWithAd(this.h, plaintext)
@@ -292,13 +343,15 @@ class HandshakeState {
     if (this.complete) throw new HandshakeError('handshake already complete')
     if (!this._isWriteTurn()) throw new HandshakeError('not this party’s turn to write')
     const out = []
-    for (const token of PATTERNS[this.msgIndex]) {
+    for (const token of this.patterns[this.msgIndex]) {
       if (token === 'e') {
         this.e = genEphemeral(this._ephemeral)
         out.push(this.e.pub)
         this._mixHash(this.e.pub)
       } else if (token === 's') {
         out.push(this._encryptAndHash(this.s.pub))
+      } else if (token === 'psk') {
+        this._mixKeyAndHash(this.psk)
       } else {
         this._mixKey(this._dhToken(token))
       }
@@ -323,13 +376,15 @@ class HandshakeState {
       off += n
       return slice
     }
-    for (const token of PATTERNS[this.msgIndex]) {
+    for (const token of this.patterns[this.msgIndex]) {
       if (token === 'e') {
         this.re = Buffer.from(take(DHLEN))
         this._mixHash(this.re)
       } else if (token === 's') {
         const n = this.cs.hasKey ? DHLEN + TAGLEN : DHLEN
         this.rs = this._decryptAndHash(Buffer.from(take(n)))
+      } else if (token === 'psk') {
+        this._mixKeyAndHash(this.psk)
       } else {
         this._mixKey(this._dhToken(token))
       }
@@ -341,7 +396,7 @@ class HandshakeState {
 
   _advance() {
     this.msgIndex++
-    if (this.msgIndex >= PATTERNS.length) this.complete = true
+    if (this.msgIndex >= this.patterns.length) this.complete = true
   }
 
   /**
@@ -362,7 +417,11 @@ class HandshakeState {
 
 /**
  * Create an IK initiator handshake. The initiator knows (pins) the responder's static X25519 key.
- * @param {{localX:{pub:Buffer,priv:Buffer}, remoteXPub:Buffer, prologue?:Buffer, _ephemeral?:Buffer}} opts
+ * Pass `psk` (32 bytes, = HKDF(K_inv,"p2p-psk-v1"), src/invite.js) to run Noise_IKpsk2 instead —
+ * invite mode: the handshake then fails for anyone without K_inv, and success additionally PROVES
+ * the initiator is the one invitee (initiator direction upgrades from TOFU to cryptographic auth).
+ * Omit it and the wire bytes are plain IK, unchanged.
+ * @param {{localX:{pub:Buffer,priv:Buffer}, remoteXPub:Buffer, prologue?:Buffer, psk?:Buffer, _ephemeral?:Buffer}} opts
  * @returns {HandshakeState}
  */
 export function initiator(opts) {
@@ -371,7 +430,8 @@ export function initiator(opts) {
 
 /**
  * Create an IK responder handshake. Learns the initiator's static key during msg1 (TOFU pin).
- * @param {{localX:{pub:Buffer,priv:Buffer}, prologue?:Buffer, _ephemeral?:Buffer}} opts
+ * `psk` (optional) selects Noise_IKpsk2 — see initiator().
+ * @param {{localX:{pub:Buffer,priv:Buffer}, prologue?:Buffer, psk?:Buffer, _ephemeral?:Buffer}} opts
  * @returns {HandshakeState}
  */
 export function responder(opts) {

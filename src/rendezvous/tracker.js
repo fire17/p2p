@@ -99,16 +99,43 @@ const DEFAULT_INTERVAL_MS = 10000; // trystero cadence; offers expire ~120s so w
 const RECONNECT_MS = 3000;
 const SDP_HEAD = 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n';
 
-/** Wrap a candidate blob in a minimal SDP so it relays cleanly through the tracker. */
-function packSdp(blob) {
-  const b64 = Buffer.from(JSON.stringify(blob), 'utf8').toString('base64');
-  return SDP_HEAD + 'a=p2p-blob:' + b64 + '\r\n';
+// ── blob codec seam (metadata-privacy §4.1/§4.3) ────────────────────────────────────────────────
+// The tracker carries OPAQUE BYTES. The default codec is plaintext JSON — byte-identical to v0.1.0
+// (reusable-S mode, documented as the less-private option). Invite mode passes src/invite.js's
+// `inv.codec`, which AEAD-seals the candidate blob under k_ip=HKDF(K_inv,"ip") before it ever
+// touches a tracker: the operator and every passive observer see only fixed-length ciphertext.
+const JSON_CODEC = {
+  sealed: false,
+  seal: (blob) => Buffer.from(JSON.stringify(blob), 'utf8'),
+  open: (bytes) => { try { return JSON.parse(bytes.toString('utf8')); } catch { return null; } },
+};
+
+// Fingerprint fix (§6): the literal `a=p2p-blob:` attribute name IS a tell — it identifies a p2p
+// user on sight, even when the payload tells the observer nothing. In INVITE mode the attribute name
+// is instead derived pseudorandomly from the rid (public to both peers by construction — they must
+// share it to meet at the same infohash — so no secret is needed and no constant string appears on
+// the wire); it rotates with the rid, i.e. per epoch and per invite.
+// REUSABLE mode keeps the legacy `p2p-blob` name: its payload is plaintext anyway (nothing to
+// fingerprint-protect), and keeping it byte-identical preserves interop with shipped v0.1.0 peers.
+const LEGACY_ATTR = 'p2p-blob';
+/** @param {Buffer} rid @returns {string} a lowercase-letter attribute name, e.g. "xkqmfbtd" */
+function attrNameFor(rid) {
+  const h = crypto.createHash('sha256').update('p2p-sdp-attr-v1').update(rid).digest();
+  let s = '';
+  for (let i = 0; i < 8; i++) s += String.fromCharCode(0x61 + (h[i] % 26)); // a..z
+  return s;
 }
-/** Extract a candidate blob from an SDP produced by packSdp (null if absent/corrupt). */
-function unpackSdp(sdp) {
-  const m = typeof sdp === 'string' && /a=p2p-blob:([A-Za-z0-9+/=]+)/.exec(sdp);
+
+/** Wrap an already-encoded blob (bytes) in a minimal SDP so it relays cleanly through the tracker. */
+function packSdp(bytes, attr) {
+  return SDP_HEAD + 'a=' + attr + ':' + bytes.toString('base64') + '\r\n';
+}
+/** Extract the blob bytes from an SDP produced by packSdp (null if absent/corrupt). */
+function unpackSdp(sdp, attr) {
+  if (typeof sdp !== 'string') return null;
+  const m = new RegExp('a=' + attr + ':([A-Za-z0-9+/=]+)').exec(sdp);
   if (!m) return null;
-  try { return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')); } catch { return null; }
+  try { return Buffer.from(m[1], 'base64'); } catch { return null; }
 }
 /**
  * Deterministic 20-char printable-ASCII infohash from a 20-byte rid. Both peers derive the same
@@ -131,6 +158,10 @@ export function infoHashFor(rid) {
  * @param {*} [opts.WebSocket] WebSocket constructor (defaults to global; injectable for tests)
  * @param {() => number} [opts.now] clock (ms)
  * @param {number} [opts.announceIntervalMs] re-announce cadence for persistent connections
+ * @param {{sealed:boolean, seal:Function, open:Function}} [opts.codec] blob codec. Default = plaintext
+ *   JSON (v0.1.0 wire, reusable-S mode). Pass an src/invite.js `inv.codec` for INVITE MODE: the
+ *   candidate blob is AEAD-sealed under k_ip and the SDP attribute name goes neutral/rotating, so the
+ *   tracker operator sees only fixed-length ciphertext under an opaque infohash.
  * @returns {{name:'tracker', ridLen:20, announce:Function, lookup:Function, close:Function}}
  */
 export function createTracker(opts = {}) {
@@ -138,19 +169,33 @@ export function createTracker(opts = {}) {
   const WS = opts.WebSocket || (typeof WebSocket !== 'undefined' ? WebSocket : null);
   const now = opts.now || (() => Date.now());
   const intervalMs = opts.announceIntervalMs || DEFAULT_INTERVAL_MS;
+  const codec = opts.codec || JSON_CODEC;   // invite mode passes src/invite.js's inv.codec (sealed)
   const myId = randId20();
 
   const active = new Map(); // infoHash -> { blob, conns:[], stop }
 
-  function offersFor(blob) {
-    const sdp = packSdp(blob);
+  /** Per-rid packing context: the SDP attribute name and the codec, bound to this rendezvous. */
+  function sdpCtx(rid) {
+    const attr = codec.sealed ? attrNameFor(rid) : LEGACY_ATTR;
+    return {
+      pack: (blob) => packSdp(codec.seal(blob, rid), attr),
+      unpack: (sdp) => {
+        const bytes = unpackSdp(sdp, attr);
+        if (!bytes) return null;
+        return codec.open(bytes, rid);   // null on wrong key / tamper / corrupt — record simply ignored
+      },
+    };
+  }
+
+  function offersFor(ctx, blob) {
+    const sdp = ctx.pack(blob);
     return Array.from({ length: OFFERS_PER_ANNOUNCE }, () => ({ offer_id: randId20(), offer: { type: 'offer', sdp } }));
   }
-  function announceMsg(infoHash, blob) {
-    return { action: 'announce', info_hash: infoHash, peer_id: myId, numwant: NUMWANT, uploaded: 0, downloaded: 0, left: 0, offers: offersFor(blob) };
+  function announceMsg(ctx, infoHash, blob) {
+    return { action: 'announce', info_hash: infoHash, peer_id: myId, numwant: NUMWANT, uploaded: 0, downloaded: 0, left: 0, offers: offersFor(ctx, blob) };
   }
-  function answerMsg(infoHash, toPeerId, offerId, blob) {
-    return { action: 'announce', info_hash: infoHash, peer_id: myId, to_peer_id: toPeerId, offer_id: offerId, answer: { type: 'answer', sdp: packSdp(blob) } };
+  function answerMsg(ctx, infoHash, toPeerId, offerId, blob) {
+    return { action: 'announce', info_hash: infoHash, peer_id: myId, to_peer_id: toPeerId, offer_id: offerId, answer: { type: 'answer', sdp: ctx.pack(blob) } };
   }
   const send = (ws, obj) => { try { ws.send(JSON.stringify(obj)); } catch { /* not open */ } };
 
@@ -159,7 +204,7 @@ export function createTracker(opts = {}) {
    * offer, surfaces the peer's blob AND answers back so they learn us; on an incoming answer,
    * surfaces the peer's blob. `persistent` connections re-announce + reconnect.
    */
-  function openConn(url, infoHash, getBlob, onPeerBlob, { persistent = false, signal } = {}) {
+  function openConn(url, ctx, infoHash, getBlob, onPeerBlob, { persistent = false, signal } = {}) {
     if (!WS) return { close() {} };
     let ws, interval, reconnect, closed = false;
     const clearTimers = () => { if (interval) clearInterval(interval); if (reconnect) clearTimeout(reconnect); };
@@ -172,9 +217,9 @@ export function createTracker(opts = {}) {
       if (closed) return;
       try { ws = new WS(url); } catch { scheduleReconnect(); return; }
       ws.onopen = () => {
-        send(ws, announceMsg(infoHash, getBlob()));
+        send(ws, announceMsg(ctx, infoHash, getBlob()));
         if (persistent) {
-          interval = setInterval(() => send(ws, announceMsg(infoHash, getBlob())), intervalMs);
+          interval = setInterval(() => send(ws, announceMsg(ctx, infoHash, getBlob())), intervalMs);
           if (interval && interval.unref) interval.unref();
         }
       };
@@ -183,11 +228,11 @@ export function createTracker(opts = {}) {
         try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data?.toString?.() || ''); } catch { return; }
         if (!m || m.peer_id === myId) return; // ignore our own echoes
         if (m.offer && m.offer_id && m.peer_id) {
-          const blob = unpackSdp(m.offer.sdp);
+          const blob = ctx.unpack(m.offer.sdp);
           if (blob) onPeerBlob(blob);
-          send(ws, answerMsg(infoHash, m.peer_id, m.offer_id, getBlob())); // let them learn us too
+          send(ws, answerMsg(ctx, infoHash, m.peer_id, m.offer_id, getBlob())); // let them learn us too
         } else if (m.answer && m.peer_id) {
-          const blob = unpackSdp(m.answer.sdp);
+          const blob = ctx.unpack(m.answer.sdp);
           if (blob) onPeerBlob(blob);
         }
       };
@@ -208,11 +253,12 @@ export function createTracker(opts = {}) {
   function announce(rid, info) {
     if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
     const infoHash = infoHashFor(rid);
+    const ctx = sdpCtx(rid);
     const blob = { v: 1, ts: now(), candidates: (info && info.candidates) || [] };
     const existing = active.get(infoHash);
     if (existing) { existing.blob = blob; return { stop: existing.stop }; } // refresh, reuse conns
     const state = { blob };
-    const conns = trackers.map((url) => openConn(url, infoHash, () => state.blob, () => {}, { persistent: true }));
+    const conns = trackers.map((url) => openConn(url, ctx, infoHash, () => state.blob, () => {}, { persistent: true }));
     const stop = () => { for (const c of conns) c.close(); active.delete(infoHash); };
     state.conns = conns;
     state.stop = stop;
@@ -230,6 +276,7 @@ export function createTracker(opts = {}) {
   async function* lookup(rid, lopts = {}) {
     if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
     const infoHash = infoHashFor(rid);
+    const ctx = sdpCtx(rid);
     const timeout = lopts.timeout ?? 8000;
     const myBlob = { v: 1, ts: now(), candidates: [] }; // a dialer seeks; it shares no candidates here
     const queue = [];
@@ -243,7 +290,7 @@ export function createTracker(opts = {}) {
       queue.push({ candidates: blob.candidates || [], channel: 'tracker', ts: blob.ts || now() });
       bump();
     };
-    const conns = trackers.map((url) => openConn(url, infoHash, () => myBlob, onPeerBlob, { persistent: false, signal: lopts.signal }));
+    const conns = trackers.map((url) => openConn(url, ctx, infoHash, () => myBlob, onPeerBlob, { persistent: false, signal: lopts.signal }));
     let done = false;
     // NOT unref'd: this timer terminates the stream (same rule as mdns.lookup)
     const timer = setTimeout(() => { done = true; bump(); }, timeout);
