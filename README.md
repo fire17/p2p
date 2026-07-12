@@ -18,21 +18,24 @@ premortem, interfaces, and API. This README fills in as modules land + verify.
   ack a peer decrypts is a cryptographic proof no man-in-the-middle is present.
 - **Small** — the whole thing targets ~2.5–3.5k LOC.
 
-## Quickstart (target API)
+## Quickstart
 
 ```js
 import { identity, listen } from '@fire17/p2p'
 
 // Machine A
-const me = identity()          // { key: "5J8K…26 chars" }  ← share this string
+const me = await identity()          // { S: "5J8K…26 chars", ... }  ← share me.S
 const node = await listen(me)
-node.on('message', (from, data) => console.log(from, data.toString()))
+node.on('message', (peer, data) => console.log(data.toString()))   // (peer, data)
 
-// Machine B (holds A's key)
-const node = await listen(identity())
-const peer = await node.connect('5J8K…')   // resolves only after MITM-proof handshake
-await peer.send('hey')                       // realtime, ordered, encrypted
+// Machine B (holds A's key string)
+const node = await listen(await identity())
+const peer = await node.connect('5J8K…')   // resolves only after the MITM-proof handshake
+await peer.send('hey')                        // realtime, ordered, encrypted
 ```
+
+`identity()` is async and returns `{ S, edPub, edPriv, xPub, xPriv }` — `S` is the 26-char
+key string you share. The `message` event is `(peer, data)`. (Or just use the CLI: `p2p`.)
 
 CLI demo: `npx p2p-chat` (generates a key on one machine, `p2p-chat <key>` connects from another).
 

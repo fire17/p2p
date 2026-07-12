@@ -4,7 +4,7 @@
 > accounts, history: forever out of scope — host app's job.
 
 ```
-p2p.identity()                 -> { key: "26-char string", ... }   // create/load my identity
+await p2p.identity()           -> { S: "26-char string", edPub, edPriv, xPub, xPriv }  // async; S = the key you share
 p2p.listen(identity, opts)     -> node                             // go online, publish presence
 node.connect(theirKey)         -> peer                             // find + handshake (first contact or reconnect)
 peer.send(bytes|string)        -> ack promise                      // realtime, ordered, encrypted
