@@ -226,13 +226,25 @@ const T_KEYDIST = 1
 const T_KEYREQ = 5
 const isType = (b, t) => Buffer.isBuffer(b) && b.length > 1 && b[0] === GMAGIC && b[1] === t
 
-/** Wrap every peer this node sends through — to silently DROP frames, or merely count them. */
+/**
+ * Wrap every peer this node sends through. The callback decides each frame's fate:
+ *   true     → send it for real
+ *   false    → silently swallow it (the send "succeeds", the frame never lands)
+ *   'reject' → the send FAILS (an unreachable peer — the send promise rejects)
+ * The distinction matters: only a REJECT clears group.js's `pulling` guard, which is what lets a
+ * KEYREQ re-fire. A swallowed KEYREQ looks successful and is never retried.
+ */
 function interceptSends(node, fn) {
   const realPeers = node.peers.bind(node)
   const realConnect = node.connect.bind(node)
   const wrap = (p) => new Proxy(p, {
     get(t, k) {
-      if (k === 'send') return (buf) => (fn(buf) === false ? Promise.resolve(0) : t.send(buf)) // false ⇒ swallow
+      if (k === 'send') return (buf) => {
+        const verdict = fn(buf)
+        if (verdict === false) return Promise.resolve(0)
+        if (verdict === 'reject') return Promise.reject(new Error('unreachable'))
+        return t.send(buf)
+      }
       const v = t[k]
       return typeof v === 'function' ? v.bind(t) : v
     },
@@ -250,8 +262,18 @@ test('bounded self-heal: a flood from an un-keyed member cannot grow the heap or
   // its messages arrive, its key never does, and (because the send "succeeds") it never re-sends.
   let dropKeys = true
   interceptSends(D.node, (buf) => !(dropKeys && isType(buf, T_KEYDIST)))
-  let keyreqs = 0                                            // every KEYREQ the admin puts on the wire
-  interceptSends(A.node, (buf) => { if (isType(buf, T_KEYREQ)) keyreqs++; return true })
+
+  // A's KEYREQs must genuinely FAIL to reach D — D is the cannot-dial-back member, so A's pull is a
+  // send into a hole. This is what makes the storm REAL: a rejected send clears group.js's `pulling`
+  // guard, so the very next undecryptable message pulls again. (An earlier version of this test let
+  // the KEYREQ succeed, which left `pulling` set — one request, no storm, and the assertion below
+  // passed whether or not the cap existed. It proved nothing. Caught by redteam.)
+  let keyreqs = 0                                            // every KEYREQ the admin ATTEMPTS
+  interceptSends(A.node, (buf) => {
+    if (!isType(buf, T_KEYREQ)) return true
+    keyreqs++
+    return 'reject'                                          // D is unreachable — the pull fails
+  })
 
   const G = randomBytes(32)
   const a = member(A, G, { create: true, members: [D.id.S] })
@@ -268,12 +290,14 @@ test('bounded self-heal: a flood from an un-keyed member cannot grow the heap or
   // identity — the gap surfaces as msg-unknown-identity rather than no-sender-key. Either way it is
   // the same hole (we cannot read D), and both branches hold the message and pull the key.
   const gap = a.warnings.filter((w) => w === 'no-sender-key' || w === 'msg-unknown-identity').length
-  assert.ok(gap > 0, `the gap really was observed — warnings: ${[...new Set(a.warnings)].join(', ') || '(none)'}`)
+  assert.ok(gap >= FLOOD, `every flooded message must have observed the gap — saw ${gap} of ${FLOOD}`)
 
-  // BOUND 1 — no KEYREQ storm: one missing key costs a bounded number of requests, NOT one per
-  // dropped message (each failed pull clears `pulling`, so without the cap every message re-asks).
-  assert.ok(keyreqs > 0 && keyreqs <= 8,
-    `a missing key must cost ≤8 KEYREQs, not one per message — sent ${keyreqs} for ${FLOOD} messages`)
+  // BOUND 1 — no KEYREQ storm. Each failed pull clears `pulling`, so WITHOUT MAX_KEYREQ every one of
+  // the 60 messages re-asks: 60 KEYREQs for one missing key, aimed at a peer that cannot answer.
+  // With the cap it stops at 8. Verified by removing the cap: this asserts 60, i.e. it genuinely bites.
+  assert.ok(keyreqs > 0, 'the pull must actually be attempted (else this test proves nothing)')
+  assert.ok(keyreqs <= 8,
+    `a missing key must cost ≤8 KEYREQs, not one per message — attempted ${keyreqs} for ${FLOOD} messages`)
 
   // BOUND 2 — the heap is capped. Let D's key through and rotate: the admin replays what it HELD.
   // Those messages are from D's OLD chain, so each replay fails to decrypt — which makes the number

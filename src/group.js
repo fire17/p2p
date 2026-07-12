@@ -367,14 +367,14 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
    * joiner) has its keydist dropped, yet the admin marks it done and never re-pushes → it can never
    * decrypt. The durable fix is a member-side pull: once my group exists I ask every member I know
    * (bootstrap contacts I was seeded with, plus any I've since folded) that I still lack a receive-key
-   * from to (re)send it. Bounded by `pulling` so a burst of ingests can't amplify into a KEYREQ flood.
+   * from to (re)send it.
+   *
+   * Every pull — this one and the on-demand one from a message we cannot read — goes through
+   * requestKey(), so they share ONE budget per sender. Two separately-bounded pull paths would each
+   * be "bounded" while their SUM was not.
    */
   function pullKeys() {
-    for (const S of new Set([...bootstrap, ...others()])) {
-      if (S === me || recvChains.has(S) || pulling.has(S)) continue
-      pulling.add(S)
-      toMember(S, encodeEnv(T.KEYREQ, groupId, { s: me, ...myPub() })).catch(() => { pulling.delete(S) })
-    }
+    for (const S of new Set([...bootstrap, ...others()])) requestKey(S)
   }
 
   /** Give my sender key to every member who doesn't have it yet. Idempotent; safe to call often. */
@@ -616,6 +616,21 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   }
 
   node.on('message', (peer, buf) => { onEnvelope(peer, buf) })
+
+  // A member whose pull budget is SPENT earns a fresh one when it (re)connects. The budget exists to
+  // bound a storm, not to abandon a peer forever: without this, MAX_KEYREQ could be burnt while it was
+  // unreachable and we would never ask again, even once it came back.
+  // Only an EXHAUSTED budget is refreshed — our own connect() fires 'peer' mid-episode, so resetting
+  // unconditionally would hand out a second budget while we were still spending the first.
+  const refreshBudget = (peer) => {
+    const S = String((peer && (peer.key || peer.S)) || '').toUpperCase()
+    if (!S || recvChains.has(S)) return
+    if ((keyReqs.get(S) || 0) < MAX_KEYREQ) return           // still mid-budget — not a new chance
+    keyReqs.delete(S)
+    pulling.delete(S)
+  }
+  node.on('peer', refreshBudget)
+  node.on('reconnect', refreshBudget)
 
   return {
     groupId: gidHex,
