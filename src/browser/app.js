@@ -182,7 +182,8 @@ $('connect').onclick = async () => {
 }
 const send = async () => {
   const text = $('msg').value
-  if (!text || !current) return
+  if (!text) return
+  if (!current) { say('Not connected yet — paste a peer\'s 26-char key above and hit Connect, then send.', 'sys err'); return }
   $('msg').value = ''
   chatLine($('log'), 'you', text, { mine: true })
   try { await current.send(text) } catch (err) { say(`send failed: ${err.message}`, 'sys err') }
@@ -224,7 +225,8 @@ $('groupAddBtn').onclick = async () => {
 }
 const groupSend = async () => {
   const text = $('groupMsg').value
-  if (!text || !group) return
+  if (!text) return
+  if (!group) { gsay('No group yet — create one (paste members\' keys → Create) or Join with a code above, then send.', 'sys err'); return }
   $('groupMsg').value = ''
   chatLine($('grouplog'), 'you', text, { mine: true })
   try { await group.send(text) } catch (err) { gsay(`send failed: ${err.message}`, 'sys err') }

@@ -68,7 +68,9 @@ try {
   await bob.click('#tabGroup')
   await bob.fill('#groupSecret', groupCode)
   await bob.click('#groupJoin')
-  await bob.waitForFunction(() => !document.getElementById('groupMsg').disabled, { timeout: 20_000 })
+  // the real signal bob's join completed is #groupCopy becoming enabled (enableGroupChat ran).
+  // (the message box is always typeable now — send is gated on the group existing, not the input.)
+  await bob.waitForFunction(() => !document.getElementById('groupCopy').disabled, { timeout: 20_000 })
   console.log('  ✔ bob joined via the UI with the group code')
   // wait for the admin's periodic re-sync to pull bob in (he joined after the admin) — poll until
   // bob's group shows 2 members, then a beat for the sender keys to settle both ways.
