@@ -475,10 +475,47 @@ function admitInbound(node) {
   return false
 }
 
+/**
+ * v2 BURN — retire a one-time invite the instant its invitee connects (metadata-privacy §7 / §9-v2):
+ * the owner's "single connection then the route is gone, no re-use, no trail," at the achievable
+ * (operational) layer. Three effects, all in-memory — no persisted state (honest scope: a process
+ * restart that re-`listen`s the SAME K_inv re-arms the invite; documented, not hidden):
+ *
+ *   1. STOP-REPUBLISH. Halt the epoch/netchange re-announce loop (`_publishHandle.stop()`) AND close
+ *      the rendezvous channels. Both are needed: `stop()` clears the race's epoch timer + its own
+ *      netchange listener, but each tracker connection re-announces on its OWN interval that the
+ *      publish handle does not own (tracker.js openConn) — only channel.close() stops those. With
+ *      both halted, the sealed record is never refreshed and ages off every surface via native TTL
+ *      (trackers/mDNS ~120s; DHT BEP44 ~2h storing-node item TTL — the longest-lived residual, and
+ *      network-set, not ours to shorten). See createNode for the third, node-level netchange path.
+ *   2. K_inv RETIRE / GO DARK. `_inviteBurned` makes acceptConnection refuse every NEW inbound socket
+ *      and the META-1 probe gate stay silent — so a captured/leaked SHARE (which carries K_inv) can no
+ *      longer re-open the route, even against a candidate still cached on a not-yet-expired surface.
+ *   3. COMPOSE WITH EPOCH ROTATION. Stopping the publish loop also stops the pre-announce/rollover
+ *      timer, so a burned invite never rolls its rid to the next epoch.
+ *
+ * The already-established peer rides its TRANSPORT socket (bound in the accept that burned us), which
+ * is untouched by any of the above — burn kills the ROUTE, not the live connection. Fires once, and
+ * only in invite mode; reusable-S never burns (its `_inviteBurned` stays false forever).
+ */
+function burnInvite(node) {
+  if (node._inviteBurned) return
+  node._inviteBurned = true
+  const h = node._publishHandle
+  if (h && typeof h.stop === 'function') { try { h.stop() } catch { /* */ } }
+  for (const c of node._channels) { if (c && typeof c.close === 'function') { try { c.close() } catch { /* */ } } }
+  node._channels = []
+}
+
 /** Responder (accepter) side: send HELLO, run IK responder, key peer by remote static. */
 function acceptConnection(node, deps, socket) {
   const id = node._identity
   const inv = node._invite || null
+  // v2 BURN: once the invitee has connected this listener is DARK — the one-time invite is retired, so
+  // a NEW inbound socket (a captured/leaked share re-dialing a still-cached candidate) gets no HELLO
+  // and no handshake. The already-established peer rides the transport socket bound in the accept that
+  // burned us and is untouched. Reusable-S never burns, so this is a permanent no-op there.
+  if (node._inviteBurned) { try { socket.close() } catch { /* */ } return }
   // Invite mode is EXCLUSIVE while it lasts: the responder runs Noise_IKpsk2 only, so a holder of the
   // reusable S who never got K_inv cannot complete the handshake even if it somehow learns our IP
   // (metadata-privacy §10: "success == MITM ruled out AND initiator proven to be the invitee"). The
@@ -541,6 +578,11 @@ function acceptConnection(node, deps, socket) {
       const { tx, rx, handshakeHash } = hs.split()
       rec.attach({ socket, tx, rx, connId, instance, mac: wireMacKeys(handshakeHash, 'responder') })
       socket.send(encodeFrame(TYPE.HS2, connId, 0, 0, hs2))
+      // v2 BURN: a valid invite-mode msg1 (the correct K_inv-derived prologue made hs.readMessage
+      // succeed) just completed and we answered — the one-time invite has done its single job. Retire
+      // it now: stop-republish on every surface + go dark to any further dial of this K_inv. Fires
+      // exactly once; the peer attached above stays live. No invite (reusable-S) => never fires.
+      if (inv && !node._inviteBurned) burnInvite(node)
     } else if (rec && rec.channel()) {
       rec.channel().onDatagram(buf, socket.rinfo)
     }
@@ -553,6 +595,8 @@ function createNode(identity, opts, deps, ep) {
     on: em.on, off: em.off, emit: em.emit,
     _identity: identity, _ep: ep, _peers: new Map(),
     _invite: opts._invite || null,                // live one-time invite (listen({invite})) -> IKpsk2 + rid_inv
+    _inviteBurned: false,                         // v2 burn: set once the invitee connects -> listener dark, K_inv retired, stop-republish
+    _burnedInvites: new Set(),                    // v2 burn (dialer): K_inv fingerprints already spent -> a re-dial of that share is refused
     _instance: opts.instance || randomBytes(8),   // per-process nonce -> peer-restart discriminator
     _now: opts.now || (() => Date.now()),
     _keepaliveMs: opts.keepaliveMs ?? 25000,
@@ -578,10 +622,20 @@ function createNode(identity, opts, deps, ep) {
         // Invite mode: build a rendezvous scoped to THIS invite (its own rids + sealed codec). It is
         // separate from the node's own listen-side rendezvous, so dialing an invite never disturbs it.
         const inv = createInvite(secret)
+        // v2 BURN (dialer single-use): a one-time invite is spent by its first successful connect. A
+        // later re-dial of the SAME share string — the captured/leaked-share case — is refused before
+        // any network work, so the route cannot be re-opened from this side either. Keyed by the K_inv
+        // fingerprint (never by S: two invites Alice mints share her S, so S-keying would cross-burn).
+        // A still-CONNECTED peer short-circuits above (returns the live peer), so this only bites a
+        // genuine re-dial after the session ended.
+        const fp = inv.fp.toString('hex')
+        if (node._burnedInvites.has(fp)) throw new TypoError('this one-time invite is already used (burned) — mint a fresh invite')
         if (typeof deps.makeRace !== 'function') throw new Error('p2p: invite-mode dialing needs the real rendezvous stack (no makeRace seam)')
         const r = deps.makeRace(inv)
         for (const c of r.channels || []) node._channels.push(c)     // closed with the node
-        return initiatorHandshake(node, deps, S, dec, { resolve: r.resolve, invite: inv })
+        const peer = await initiatorHandshake(node, deps, S, dec, { resolve: r.resolve, invite: inv })
+        node._burnedInvites.add(fp)                                  // spent — a later connect(share) is now refused
+        return peer
       })()
     },
     /** @param {string[]} keys */
@@ -613,9 +667,24 @@ function createNode(identity, opts, deps, ep) {
   // installs nothing: S is public, the pubkeys it commits to are not a secret worth gating.
   if (node._invite && ep && typeof ep.probeAuth === 'function') {
     const inv = node._invite
-    ep.probeAuth((tok, nonce) => equal(Buffer.from(nonce), probeProof(inv, tok)))
+    // v2 BURN: after the invitee connects, the probe gate falls silent — a captured share can no
+    // longer even elicit the pubkey-bearing HELLO (META-1) from a retired invite.
+    ep.probeAuth((tok, nonce) => !node._inviteBurned && equal(Buffer.from(nonce), probeProof(inv, tok)))
   }
-  if (ep && typeof ep.on === 'function') ep.on('netchange', () => { Promise.resolve().then(() => deps.publishAll(identity.S ?? identity.key, ep)).catch(() => {}) })
+  // Node-level netchange republish. Gated on the burn flag (else a post-burn netchange would
+  // re-announce the retired invite and re-open the route — reusable-S never burns, so it re-announces
+  // as before). It REPLACES _publishHandle (stops the previous, stores the new) rather than spawning
+  // an orphan each time: every race publish handle registers its OWN netchange listener, so discarding
+  // handles would leak listeners that keep re-announcing forever — and would survive burn's stop(),
+  // defeating stop-republish. One tracked handle means burn's stop() always reaches the live one.
+  if (ep && typeof ep.on === 'function') ep.on('netchange', () => {
+    if (node._inviteBurned) return
+    Promise.resolve().then(() => {
+      const prev = node._publishHandle
+      if (prev && typeof prev.stop === 'function') { try { prev.stop() } catch { /* */ } }
+      node._publishHandle = deps.publishAll(identity.S ?? identity.key, ep)
+    }).catch(() => {})
+  })
   return node
 }
 

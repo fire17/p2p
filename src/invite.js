@@ -317,11 +317,17 @@ export function createInvite(secret) {
   const psk = hk(secret, 'p2p-psk-v1', '', 32)
   const bepSeed = hk(secret, 'p2p-bep44-v1', '', 32)
   const bepKeys = ed25519FromSeed(bepSeed)
+  // v2 BURN (metadata-privacy §9-v2): a stable, one-way id for this invite, used by the DIALER to
+  // mark a one-time invite spent so a second connect(share) of the same string is refused. Keyed by
+  // K_inv (NOT S) — two invites Alice mints to two people share her S, so an S-key would cross-burn
+  // them. Domain-separated from every other derivation; not reversible to K_inv.
+  const fp = hk(secret, 'p2p-burn-fp-v1', '', 16)
 
   return {
     secret,
     kIp,
     psk,
+    fp,
     bepPub: bepKeys.pub,
     bepPriv: bepKeys.priv,
     /** rid_inv for a channel+epoch (§4.4) — only a K_inv holder can compute WHERE we published. */
