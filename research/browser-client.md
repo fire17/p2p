@@ -1,13 +1,20 @@
 # Browser-Only Client — Decision-Grade Design Study
 
-> **BUILD STATUS (2026-07-12): P1 built and VERIFIED IN A REAL BROWSER.** The design below is no
-> longer only sourced — the browser↔browser client exists (`src/browser/`), runs the TUI's own
-> protocol source unchanged via shims + vendored crypto, and was observed connecting two real
-> Chromium contexts over the live public WSS trackers with a verified Noise IK handshake in ~3.5 s,
-> plus a 3-peer group. Interop assurance is CI-gated: the real `src/noise.js` on the browser stack
-> reproduces both official Noise KAT vectors byte-exact (`test/browser-noise-parity.test.js`), and
-> the security claim is adversarially tested (`test/browser-mitm.test.js`). What is NOT yet done:
-> browser↔TUI (P2 — the `werift`-vs-WSS-relay decision below), and a two-real-networks run. See §10.
+> **BUILD STATUS (2026-07-12): P1 + P2 built and VERIFIED IN A REAL BROWSER.** The design below is
+> no longer only sourced — the client exists (`src/browser/`), runs the TUI's own protocol source
+> unchanged via shims + vendored crypto, and was OBSERVED:
+> - **browser↔browser** — two real Chromium contexts over the live public WSS trackers, verified
+>   Noise IK over WebRTC in ~0.6 s (`test/browser-e2e.mjs`); a 3-peer group (`test/browser-group.mjs`).
+> - **browser↔TUI** — a Node "TUI" and a browser completed a verified Noise IK handshake **over the
+>   zero-dep public WSS relay** and chatted both ways in ~0.7 s, **no backend, no dependency on
+>   either side** (`test/browser-tui-e2e.mjs`). This closes the interop gap that was open below.
+> - The browser now **races two transports** (WebRTC direct + WSS-relay floor) behind the one seam.
+>
+> Interop assurance is CI-gated: the real `src/noise.js` on the browser stack reproduces both
+> official Noise KAT vectors byte-exact (`test/browser-noise-parity.test.js`); the security claim is
+> adversarially tested (`test/browser-mitm.test.js`). Still open: the *optional werift* direct
+> browser↔TUI path (browser-build's lane — the WSS relay already delivers browser↔TUI without it),
+> P3 sender-keys groups (browser-build), and a two-real-networks run. See §10.
 
 **Project:** `p2p` — tiny, embeddable, zero-dependency P2P chat/data framework.
 **Problem this file solves:** ship a client that runs **entirely in a browser tab, with no backend

@@ -348,3 +348,26 @@ kind of gap `node --test` green never shows.
 two-real-networks browser↔browser run (same XNET gate the TUI has). Sender-keys groups are the P3 scale
 upgrade (pairwise fan-out is correct for small groups). Code-delivery trust (§8.4) documented, not
 eliminated.
+
+### 🌐 BROWSER CLIENT P2 — browser↔TUI over the zero-dep WSS relay, VERIFIED IN A REAL BROWSER (2026-07-12)
+
+The owner chose BOTH interop paths. The zero-dep floor is DONE and observed: the browser client now
+**races two transports** behind the one endpoint seam (`src/browser/transport.js`, node.js unchanged) —
+WebRTC DataChannel (direct browser↔browser) + the WSS relay (`src/transport-wss.js`, browser-build's
+lane, dynamic-imported defensively). p2p.js pre-builds the endpoint with S and passes it as
+node.js's opts.endpoint (+ a createEndpoint dep, so resolveDeps skips the Node-only dgram sibling
+imports that would throw in a browser).
+
+**Observed (not claimed):**
+- **BC-INTEROP — browser↔TUI:** a Node "TUI" (`node.listen` on `transport-wss`) and a real Chromium
+  browser (raced transport) completed a verified Noise IK handshake **over the public MQTT-over-WSS
+  relay** and chatted BOTH ways in ~0.7 s — **no backend of ours, no dependency on either side**, the
+  relay blind (opaque topic + Noise ciphertext) — `test/browser-tui-e2e.mjs`. Owner req #2/#3 met for
+  the zero-dep path.
+- **Regression after the metadata-privacy commit (04536cc) landed:** browser↔browser (~0.6 s),
+  browser↔TUI (~0.7 s), groups >2 all re-verified green; **136/136 deterministic tests pass.**
+
+**Still open:** the OPTIONAL `werift` direct browser↔TUI P2P (browser-build's lane — the relay already
+delivers browser↔TUI without it, at the cost of relayed latency); P3 sender-keys groups
+(browser-build); the two-real-networks run (the WSS relay traverses NAT by construction, so this path
+is inherently network-independent — unlike the UDP path's XNET gate).
