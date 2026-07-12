@@ -69,12 +69,15 @@ gate we run, not a claim we make).
 - **No install, no backend of ours.** Discovery goes over public WebSocket trackers; the media
   path is a WebRTC DataChannel when it can be, and a zero-dependency **WSS relay** when it
   can't. Whichever completes the verified handshake first wins.
-- **Pair *and* group chat.** Paste a key to chat 1:1 (with a browser peer *or* a terminal peer),
-  or open the **Group chat** tab: create a group from a list of keys, share the group code, and
-  everyone joins. Two real browsers driving those buttons — creating, joining, and exchanging
-  E2E group messages over public infra — is an acceptance test we run, not a claim.
-- **Honest limit (today):** **private invites (§3) are terminal-only.** The web client dials
-  reusable 26-char keys; it does not take `S-…` share strings.
+- **Pair chat — verified.** Paste a key and chat 1:1 with a browser peer *or* a terminal peer.
+  Witnessed in real browsers: browser↔browser, and browser↔TUI over both a WebRTC DataChannel and
+  the WSS relay (`docs/ACCEPTANCE-LOG.md`).
+- **Group chat — shipping, acceptance run pending.** The client has a **Group chat** tab (create a
+  group from a list of keys, share the group code, others join). We will not call it verified here
+  until a real two-browser run is witnessed and logged; until then, treat the terminal/library group
+  path (§4) as the proven one.
+- **Private invites (§3) are terminal-only today.** The web client dials reusable 26-char keys, not
+  `S-…` share strings. In-browser invite dialing is next up, not shipped.
 - A browser needs `https://` (or `localhost`): WebCrypto and honest security both want a secure
   context.
 
