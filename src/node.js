@@ -275,8 +275,11 @@ async function resolveDeps(inj = {}, opts = {}, invite = null) {
     }
     return inj
   }
-  const [key, noise, transport, race, mdns, dht, tracker] = await Promise.all([
-    import('./key.js'), import('./noise.js'), import('./transport.js'),
+  // transport-node.js, NOT transport.js: the default endpoint composes UDP + the WSS relay (so a
+  // browser peer can reach us at all — see its header). It degrades to the plain UDP endpoint when
+  // the relay is disabled (opts.wss === false / invite mode) or unavailable.
+  const [key, noise, nodeTransport, race, mdns, dht, tracker] = await Promise.all([
+    import('./key.js'), import('./noise.js'), import('./transport-node.js'),
     import('./rendezvous/race.js'), import('./rendezvous/mdns.js'),
     import('./rendezvous/dht.js'), import('./rendezvous/tracker.js'),
   ])
@@ -309,7 +312,7 @@ async function resolveDeps(inj = {}, opts = {}, invite = null) {
   return {
     generateIdentity: key.generateIdentity, decodeKey: key.decodeKey, verifyCommitment: key.verifyCommitment,
     encodeKey: key.encodeKey,                       // derive a peer's shareable 26-char key from its pubkeys
-    createEndpoint: transport.createEndpoint, initiator: noise.initiator, responder: noise.responder,
+    createEndpoint: nodeTransport.createEndpoint, initiator: noise.initiator, responder: noise.responder,
     makeRace,                                       // per-invite rendezvous factory (dialing an invite builds its own)
     resolve, publishAll, _channels: channels, ...inj,
   }
@@ -410,7 +413,15 @@ function initiatorHandshake(node, deps, S, dec, ctx = {}) {
     // META-1: in invite mode the PROBE's nonce field carries the K_inv proof over that token, so
     // the responder answers US and stays dark to everyone else. Reusable-S sends a random nonce
     // exactly as before (byte-identical wire).
-    const socket = await node._ep.punch(cands, { token: myConnId, nonce: inv ? probeProof(inv, myConnId) : undefined })
+    // `S` rides along so a composed endpoint (src/transport-node.js) can derive the peer's RELAY
+    // topic — HKDF(S,…) — without any rendezvous publishing it. That is what makes a peer with ZERO
+    // UDP candidates (a browser) dialable from the TUI. Invite mode passes no S: its relay leg is
+    // disabled on purpose (see listen()), so there is nothing to derive and nothing to leak.
+    const socket = await node._ep.punch(cands, {
+      token: myConnId,
+      nonce: inv ? probeProof(inv, myConnId) : undefined,
+      S: inv ? undefined : S,
+    })
     DBG('dial: punch resolved, socket ready -> awaiting HELLO')
     return new Promise((resolve, reject) => {
       let hs = null, helloSeen = false, settled = false, peerInstance = null
@@ -714,7 +725,21 @@ export async function identity(opts = {}) {
 export async function listen(id, opts = {}) {
   const invite = toInvite(opts.invite)
   const deps = await resolveDeps(opts.deps || {}, opts, invite)
-  const ep = opts.endpoint || await deps.createEndpoint({ port: opts.port })
+  // DEFAULT endpoint = UDP + the WSS relay composed (src/transport-node.js) — the TUI path. That
+  // relay leg is the ONLY transport a browser peer can also speak, so without it tui↔web cannot
+  // connect at all. It needs our own S (its inbox topic is HKDF(S,…)).
+  //   • opts.endpoint supplied (the browser passes its own raced transport) ⇒ untouched, no double-WSS.
+  //   • opts.wss === false ⇒ plain UDP, byte-identical to v0.1.0 (tests, tui↔tui-only).
+  //   • INVITE mode ⇒ no relay leg: the topic derives from the reusable S, so subscribing it would
+  //     answer any S holder and re-open the META-1 oracle the invite exists to close (see
+  //     transport-node.js header). Invite-scoped relay topics are a rendezvous-lane change.
+  const ep = opts.endpoint || await deps.createEndpoint({
+    port: opts.port,
+    S: id.S ?? id.key,
+    wss: opts.wss !== false && !invite,
+    relays: opts.relays,
+    now: opts.now,
+  })
   const node = createNode(id, { ...opts, _invite: invite }, deps, ep)
   node._channels = deps._channels || []
   try {                                          // instant-on: publishAll returns fast (schedules in bg)

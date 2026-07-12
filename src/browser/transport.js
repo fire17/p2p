@@ -17,67 +17,11 @@
 // hard-breaks on a churn in that file. If WSS loads, both race; if not, WebRTC alone still works.
 
 import { createBrowserTransport } from './webrtc.js'
-import { decodeFrame } from '../wire.js'
-
-/**
- * Compose several transport punches into ONE socket that races to first PEER CONTACT, not first
- * socket. Each attempt is a Promise resolving to a sub-socket (or rejecting). The returned composite
- * forwards inbound frames from EVERY sub-socket to node.js and LOCKS its outbound to whichever
- * transport delivered the first inbound frame (the peer's HELLO). Exported for direct testing.
- * @param {Array<Promise<object>>} attempts  punch promises (sub-socket or reject)
- * @returns {Promise<object>} the composite socket (resolves once ≥1 leg is up; rejects if all fail)
- */
-export function composePunch(attempts) {
-  if (!attempts.length) return Promise.reject(new Error('raced transport: no usable candidate'))
-  const wrapped = attempts.map((a) => a.then((s) => ({ s })).catch((e) => ({ e })))
-  const subs = []
-  let nodeHandler = null
-  let outbound = null
-  const composite = {
-    closed: false,
-    rinfo: { address: 'raced', port: 0 },
-    set onMessage(fn) { nodeHandler = typeof fn === 'function' ? fn : null },
-    get onMessage() { return nodeHandler },
-    send(frame) {
-      const targets = outbound ? [outbound] : subs
-      for (const s of targets) { try { s.send(frame) } catch { /* dead leg */ } }
-    },
-    close() {
-      composite.closed = true
-      for (const s of subs) { try { s.close() } catch { /* */ } }
-    },
-  }
-  const wire = (s) => {
-    if (subs.includes(s)) return
-    subs.push(s)
-    s.onMessage = (buf, ri) => {
-      // BRW-1: lock outbound only on a WELL-FORMED wire frame. The peer's real first contact is a full
-      // HELLO frame (≥ HEADER_LEN); a hostile relay injecting a runt/garbage byte no longer wins the
-      // lock and misroutes the handshake outbound. Inbound is ALWAYS forwarded up — node.js's own
-      // decodeFrame drops the junk, and only a validated frame flips the lock.
-      if (!outbound && decodeFrame(buf)) outbound = s // first REAL peer contact wins the outbound lock
-      if (nodeHandler) nodeHandler(buf, ri)
-    }
-  }
-  return new Promise((resolve, reject) => {
-    let pending = wrapped.length
-    let resolved = false
-    const errs = []
-    for (const a of wrapped) {
-      a.then(({ s, e }) => {
-        if (s) {
-          wire(s)
-          if (!resolved) { resolved = true; resolve(composite) }
-        } else if (e) {
-          errs.push(e)
-        }
-        if (--pending === 0 && !resolved) {
-          reject(new Error('raced transport: all paths failed (' + errs.map((x) => x && x.message).join('; ') + ')'))
-        }
-      })
-    }
-  })
-}
+// The composite lives in src/compose.js — ONE implementation, shared with the node-side composite
+// (src/transport-node.js), so the glare rule ("commit to the winner, close every loser") is the same
+// on both runtimes. Re-exported here because this is the path the browser tests import it from.
+export { composePunch } from '../compose.js'
+import { composePunch } from '../compose.js'
 
 /**
  * @param {object} [opts] {trackers, iceServers, relays, RTCPeerConnection, WebSocket, now,
