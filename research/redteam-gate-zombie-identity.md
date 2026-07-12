@@ -96,3 +96,52 @@ are strong evidence; the real-browser pass is the last mile.
 
 ## Standing-resident
 b5d8d88 clear to ship (the web↔web zombie root cause). Resident.
+
+---
+
+## FOLLOW-UP GATE 2026-07-12 — 20ed84a (honest banner + de-vacuous tripwire) — CONFIRMED-SHIP, one tripwire residual flagged
+
+Landed AFTER b5d8d88; files `src/browser/app.js` + `test/browser-duplicate-identity.test.js`. Two gaps
+its own lane caught: (1) the auto-adopt reload wiped the banner explaining why the key changed; (2) the
+source tripwire was VACUOUS (`/readAdopted\(\)/`, `/nextFreeSlot\(\)/` matched the FUNCTION DECLARATIONS).
+
+**Change 2 — the tripwire (the check that matters most): mostly fixed, ONE anchor still generic.**
+I mutated app.js myself (call site removed, declaration left intact) and watched the test:
+```
+GREEN  intact file                                              → TRIPWIRE ✔
+RED    remove `const next = await nextFreeSlot()` (keep the fn)  → ✖ "adopts the next free slot"   ✓ bites
+RED    replace `sessionStorage.setItem(ADOPTED`                  → ✖ "carries the reason…"          ✓ bites
+GREEN  remove the auto-adopt `location.reload()` (line 228)      → TRIPWIRE ✔  ← STILL PASSES (residual)
+```
+Root cause of the residual: app.js has TWO `location.reload()` calls — line 228 (auto-adopt) and line
+283 (the idswitch `onchange`). The tripwire pattern `/location\.reload\(\)/` is not anchored to the
+auto-adopt context, so it matches the idswitch reload; deleting the auto-adopt reload (which leaves the
+tab stuck OFFLINE — `location.hash` is set but a fragment change does not navigate, so `main()` returns
+without going online and without restarting) does NOT trip the test. So the lane's claim "all six
+re-verified by mutation (each mutation fails)" is **not fully true** — 5 of 6 anchors bite; the
+`location.reload()` anchor is still vacuous-adjacent.
+
+**Why CONFIRMED-SHIP, not FIX-FIRST:** the auto-adopt block is pinned by 5 genuine call-site anchors
+(`err.reason !== 'identity-live' || slotWasAskedFor`, `const next = await nextFreeSlot()`,
+`location.hash = 'id=' + next`, `sessionStorage.setItem(ADOPTED`, `const adopted = readAdopted()`), so a
+wholesale removal fails the test; the residual only escapes an implausible partial edit that deletes just
+the reload and leaves obvious dead code. And correctness does not rest on the tripwire: the new GUARDED
+end-to-end test (below) exercises the adopt LOGIC directly, and b5d8d88's claimIdentity gate stands.
+**Recommendation (cheap, SHOULD-fix before relying on the tripwire):** anchor the reload to the
+auto-adopt path — e.g. assert the sequence `sessionStorage.setItem(ADOPTED … )` → `location.hash='id='+next`
+→ `location.reload()` as one multiline match, or require the auto-adopt reload specifically. team-lead's
+call whether it gates the bump.
+
+**Change 1 — the banner: CLEAN.** `readAdopted()` uses **sessionStorage** (per-TAB, survives the reload,
+does NOT leak across tabs — confirmed no `localStorage` anywhere in app.js), and `removeItem` runs BEFORE
+`JSON.parse`, so it is read-once and cannot wedge even on a corrupt value (a bad parse → `catch → null`,
+already cleared). `setItem` is try/wrapped for private mode. The banner is not load-bearing (failure ⇒
+no banner, tab still online). ✓
+
+**New GUARDED end-to-end test — the real value:** a second tab asking for a live identity auto-adopts a
+fresh one; both become REAL dialable peers that each receive their OWN messages; and the invariant is
+asserted directly — `no tab may report a live peer while receiving nothing` (that IS the zombie). The
+zombie is now structurally impossible, not merely unlikely. **My run: full file 6/6 pass.**
+
+**Verdict: CONFIRMED-SHIP** with the `location.reload()` tripwire-anchor residual flagged (SHOULD-fix;
+not a product bug — the feature is correct and 5/6 anchors bite). Banner clean, GUARDED test strong.
