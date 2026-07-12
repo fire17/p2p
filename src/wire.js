@@ -1,12 +1,30 @@
 // src/wire.js — transport-agnostic framing + reliability channel for p2p (v1).
 //
-// Frame: [1B type][8B connId][4B seq][4B ack][payload]. Types below. DATA payloads are
-// OPAQUE (an AEAD frame from noise split states) — NO crypto happens here.
+// Frame: [1B type][8B connId][4B seq][4B ack][payload][16B MAC]. Types below. DATA payloads
+// are OPAQUE (an AEAD frame from noise split states) — no payload crypto happens here.
+//
+// CONTROL-PLANE AUTHENTICATION (WIRE-1/2/3, research/wargame-findings.md §2).
+// Every channel frame carries a MAC over the WHOLE frame — `type‖connId‖seq‖ack‖payload` —
+// keyed by a post-handshake secret (node.js derives it from the Noise handshake hash and
+// hands it in as opts.mac). onDatagram VERIFIES before it touches any state: nothing —
+// not the ack, not rcvNext, not roaming, not CLOSE — moves for a frame that does not
+// authenticate. Before this, only DATA *payloads* were protected and the control plane was
+// forgeable by anyone who read a cleartext connId off the wire (an on-path observer or a
+// hostile WSS relay), yielding: a forged ack that drained the send window (silent message
+// loss + a wedged sender), a forged CLOSE that tore the channel down, and a forged DATA
+// that advanced rcvNext pre-AEAD so the REAL frame for that seq was later dropped as
+// "already delivered" — permanent, silent, per-message loss.
+// Keys are DIRECTIONAL (tx ≠ rx), so an attacker cannot reflect our own frames back at us
+// (a reflected DATA would otherwise authenticate and re-open WIRE-3). Cross-session replay
+// dies with the key: each handshake derives fresh MAC keys.
+// The pre-handshake frames (HELLO/HS1/HS2) have no key yet — they are NOT channel frames and
+// never reach onDatagram; their auth is the commitment gate + Noise itself (DESIGN D4).
 //
 // Provides: sliding-window ARQ (ordered, exactly-once via seq dedup), cumulative ack
 // (piggybacked + standalone ACK), RTT-adaptive resend (RFC6298 srtt/rttvar + Karn +
 // exponential backoff), PING/PONG keepalive emitted from tick(), QUIC-style connId
-// roaming (D9 — accept any rinfo carrying my connId), CLOSE, backpressure via stats().
+// roaming (D9 — accept any rinfo carrying my connId, now only on an AUTHENTICATED frame),
+// CLOSE, backpressure via stats().
 //
 // Zero deps, ESM. No Math.random / no Date.now in the hot path — all time comes from the
 // injected `now` clock, so callers/tests stay deterministic. connId (if not supplied) is
@@ -14,7 +32,7 @@
 //
 // Contract: docs/INTERFACES.md §src/wire.js. Semantics: DESIGN.md D8/D9.
 
-import { randomBytes } from 'node:crypto'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 /** @enum {number} Frame type tags (order per DESIGN/INTERFACES). */
 export const TYPE = Object.freeze({
@@ -25,11 +43,16 @@ const TYPE_NAME = Object.freeze(
 )
 
 export const HEADER_LEN = 17            // 1 + 8 + 4 + 4
+/** Bytes appended to every CHANNEL frame: truncated HMAC-SHA256 over the whole frame. */
+export const MAC_LEN = 16
 const OFF_TYPE = 0
 const OFF_CONNID = 1
 const OFF_SEQ = 9
 const OFF_ACK = 13
 const OFF_PAYLOAD = 17
+
+/** Truncated HMAC-SHA256(key, bytes) — 128-bit tag (same strength class as the AEAD tag). */
+const macTag = (key, bytes) => createHmac('sha256', key).update(bytes).digest().subarray(0, MAC_LEN)
 
 const SEQ_MOD = 0x1_0000_0000          // 2^32
 const SEQ_HALF = 0x8000_0000           // 2^31
@@ -49,38 +72,56 @@ const seqGt = (a, b) => seqCmp(a, b) > 0
 const seqLte = (a, b) => seqCmp(a, b) <= 0
 
 /**
- * Encode a frame.
+ * Encode a frame. With `macKey`, a 16-byte MAC over `[header][payload]` is appended —
+ * that is what makes the header (type/connId/seq/ack) unforgeable. Handshake frames
+ * (HELLO/HS1/HS2) predate the key and are encoded WITHOUT one.
  * @param {number} type
  * @param {Buffer} connId  8 bytes
  * @param {number} seq     uint32
  * @param {number} ack     uint32
  * @param {Buffer|Uint8Array} [payload]
+ * @param {Buffer} [macKey]  post-handshake send key; omit for pre-handshake frames
  * @returns {Buffer}
  */
-export function encodeFrame(type, connId, seq, ack, payload) {
+export function encodeFrame(type, connId, seq, ack, payload, macKey) {
   const plen = payload ? payload.length : 0
-  const buf = Buffer.allocUnsafe(HEADER_LEN + plen)
+  const tag = macKey ? MAC_LEN : 0
+  const buf = Buffer.allocUnsafe(HEADER_LEN + plen + tag)
   buf[OFF_TYPE] = type & 0xff
   connId.copy(buf, OFF_CONNID, 0, 8)
   buf.writeUInt32BE(seq >>> 0, OFF_SEQ)
   buf.writeUInt32BE(ack >>> 0, OFF_ACK)
   if (plen) Buffer.from(payload).copy(buf, OFF_PAYLOAD)
+  if (macKey) macTag(macKey, buf.subarray(0, HEADER_LEN + plen)).copy(buf, HEADER_LEN + plen)
   return buf
 }
 
 /**
  * Decode a frame header + payload view. Returns null on a runt buffer.
+ *
+ * With `macKey` this is an AUTHENTICATED decode: the trailing MAC must verify over the
+ * whole frame or the frame is REJECTED (null) — a forged/tampered/reflected header never
+ * becomes a `f` the caller can act on. Fail-closed by construction: every caller already
+ * drops null.
  * @param {Buffer} buf
+ * @param {Buffer} [macKey]  post-handshake receive key; omit to parse an unauthenticated frame
  * @returns {{type:number, connId:Buffer, seq:number, ack:number, payload:Buffer}|null}
  */
-export function decodeFrame(buf) {
-  if (!buf || buf.length < HEADER_LEN) return null
+export function decodeFrame(buf, macKey) {
+  const tag = macKey ? MAC_LEN : 0
+  if (!buf || buf.length < HEADER_LEN + tag) return null
+  const end = buf.length - tag
+  if (macKey) {
+    const want = macTag(macKey, buf.subarray(0, end))
+    const got = Buffer.from(buf.subarray(end))          // copy: timingSafeEqual wants a real Buffer
+    if (got.length !== MAC_LEN || !timingSafeEqual(want, got)) return null   // forged -> DROP
+  }
   return {
     type: buf[OFF_TYPE],
     connId: buf.subarray(OFF_CONNID, OFF_CONNID + 8),
     seq: buf.readUInt32BE(OFF_SEQ),
     ack: buf.readUInt32BE(OFF_ACK),
-    payload: buf.subarray(OFF_PAYLOAD),
+    payload: buf.subarray(OFF_PAYLOAD, end),
   }
 }
 
@@ -91,6 +132,11 @@ const noop = () => {}
  *
  * @param {object} opts
  * @param {(datagram:Buffer)=>void} opts.send  sends one datagram to the current peer.
+ * @param {{tx:Buffer, rx:Buffer}} opts.mac  REQUIRED post-handshake control-plane MAC keys
+ *                                    (≥16 bytes each, DIRECTIONAL: my-send key ≠ my-receive
+ *                                    key — see the WIRE-1/2/3 note in the file header).
+ *                                    A channel cannot be built without them: an
+ *                                    unauthenticated control plane is the vulnerability.
  * @param {Buffer} [opts.connId]      8-byte connection id; both peers MUST share it.
  *                                    Generated from crypto.randomBytes if omitted.
  * @param {number} [opts.mtu=1200]    max datagram size; sendReliable throws if exceeded.
@@ -106,6 +152,16 @@ const noop = () => {}
  */
 export function createChannel(opts = {}) {
   if (typeof opts.send !== 'function') throw new TypeError('createChannel: opts.send required')
+  // FAIL CLOSED: no MAC keys, no channel. There is deliberately no "unauthenticated mode" —
+  // that mode WAS the bug (WIRE-1/2/3). Keys are directional; the same key on both sides
+  // would let an attacker reflect our own frames back at us and re-open WIRE-3.
+  const mac = opts.mac
+  const okKey = (k) => Buffer.isBuffer(k) && k.length >= MAC_LEN
+  if (!mac || !okKey(mac.tx) || !okKey(mac.rx)) {
+    throw new TypeError('createChannel: opts.mac {tx,rx} post-handshake MAC keys required (control-plane auth)')
+  }
+  if (mac.tx.equals(mac.rx)) throw new TypeError('createChannel: opts.mac tx and rx must differ (reflection guard)')
+  const macTx = mac.tx, macRx = mac.rx
   const send = opts.send
   const now = opts.now || (() => Date.now())
   const connId = opts.connId ? Buffer.from(opts.connId) : randomBytes(8)
@@ -116,7 +172,7 @@ export function createChannel(opts = {}) {
   const livenessMs = opts.livenessMs ?? keepaliveMs * 3
   const rtoMin = opts.rtoMin ?? 200
   const rtoMax = opts.rtoMax ?? 60000
-  const maxPayload = mtu - HEADER_LEN
+  const maxPayload = mtu - HEADER_LEN - MAC_LEN      // the MAC rides in the datagram budget too
 
   // ---- send (reliable, outbound) state ----
   let sndNext = 0                  // next seq to assign
@@ -137,7 +193,7 @@ export function createChannel(opts = {}) {
   let lastRecvAt = now()
 
   // ---- stats ----
-  let sentFrames = 0, resends = 0
+  let sentFrames = 0, resends = 0, authFails = 0
   let peerRinfo = null
   let closed = false
 
@@ -151,7 +207,7 @@ export function createChannel(opts = {}) {
 
   function rawSend(type, seq, payload) {
     if (closed && type !== TYPE.CLOSE) return
-    const frame = encodeFrame(type, connId, seq, ackField(), payload)
+    const frame = encodeFrame(type, connId, seq, ackField(), payload, macTx)
     lastSentAt = now()
     sentFrames++
     send(frame)
@@ -176,7 +232,7 @@ export function createChannel(opts = {}) {
       const payload = sendQueue.shift()
       const seq = sndNext; sndNext = (sndNext + 1) >>> 0
       const t = now()
-      const frame = encodeFrame(TYPE.DATA, connId, seq, ackField(), payload)
+      const frame = encodeFrame(TYPE.DATA, connId, seq, ackField(), payload, macTx)
       inflight.set(seq, { seq, payload, firstSentAt: t, tries: 1, deadline: t + rto })
       lastSentAt = t; sentFrames++
       send(frame)
@@ -240,17 +296,27 @@ export function createChannel(opts = {}) {
 
   /**
    * Feed every incoming datagram here.
+   *
+   * TWO GATES, cheap-before-expensive:
+   *   1. connId — a memcmp; drops everything not aimed at this connection.
+   *   2. the MAC — the SECURITY gate. Nothing below this line runs for a frame that does
+   *      not authenticate: no lastRecvAt (no liveness extension), no roaming, no onAck (so
+   *      a forged ack cannot drain the send window — WIRE-1), no onData (so a forged DATA
+   *      cannot advance rcvNext and erase the real message for that seq — WIRE-3), no
+   *      teardown (so a forged CLOSE is a no-op — WIRE-2).
    * @param {Buffer} buf
    * @param {object} [rinfo]  transport address; used for connId roaming (D9).
    */
   function onDatagram(buf, rinfo) {
-    const f = decodeFrame(buf)
-    if (!f) return
-    if (!f.connId.equals(connId)) return               // not my connection — ignore
+    const hdr = decodeFrame(buf)                       // cheap, UNAUTHENTICATED header view
+    if (!hdr || !hdr.connId.equals(connId)) return     // not my connection — ignore
+    const f = decodeFrame(buf, macRx)                  // AUTHENTICATED decode (fail-closed)
+    if (!f) { authFails++; return }                    // forged / tampered / reflected — DROP
     lastRecvAt = now()
 
-    // QUIC-style migration: any datagram bearing my connId is authoritative for the
-    // peer address, whatever the source rinfo. (Real auth is the AEAD layer above.)
+    // QUIC-style migration: any AUTHENTICATED datagram bearing my connId is authoritative
+    // for the peer address, whatever the source rinfo. (Pre-MAC, any on-path forger could
+    // move it; now only the key holder can.)
     if (rinfo && (peerRinfo === null || !sameRinfo(peerRinfo, rinfo))) {
       peerRinfo = rinfo
       onRoamCb(rinfo)
@@ -304,7 +370,8 @@ export function createChannel(opts = {}) {
   }
 
   function rawSendData(seg) {
-    const frame = encodeFrame(TYPE.DATA, connId, seg.seq, ackField(), seg.payload)
+    // Re-MAC on every resend: the ack field is refreshed here, so the tag must be too.
+    const frame = encodeFrame(TYPE.DATA, connId, seg.seq, ackField(), seg.payload, macTx)
     lastSentAt = now()
     sentFrames++
     send(frame)
@@ -321,7 +388,7 @@ export function createChannel(opts = {}) {
     onCloseCb('local')
   }
 
-  /** @returns {{inflight:number, queued:number, rtt:number, rto:number, loss:number, sent:number, resends:number, closed:boolean}} */
+  /** @returns {{inflight:number, queued:number, rtt:number, rto:number, loss:number, sent:number, resends:number, authFails:number, closed:boolean}} */
   function stats() {
     return {
       inflight: inflight.size,
@@ -331,6 +398,7 @@ export function createChannel(opts = {}) {
       loss: sentFrames ? resends / sentFrames : 0,
       sent: sentFrames,
       resends,
+      authFails,                                       // frames dropped by the MAC gate (forgery attempts)
       closed,
     }
   }
@@ -358,4 +426,4 @@ function sameRinfo(a, b) {
   return a.address === b.address && a.port === b.port && a.family === b.family
 }
 
-export default { createChannel, encodeFrame, decodeFrame, seqCmp, TYPE, TYPE_NAME, HEADER_LEN }
+export default { createChannel, encodeFrame, decodeFrame, seqCmp, TYPE, TYPE_NAME, HEADER_LEN, MAC_LEN }

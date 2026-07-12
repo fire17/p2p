@@ -15,12 +15,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { hkdfSync, randomBytes } from 'node:crypto';
 
 import { generateIdentity, decodeKey, verifyCommitment } from '../../src/key.js';
 import { initiator, responder, HandshakeError } from '../../src/noise.js';
 import { createChannel } from '../../src/wire.js';
 import { createEndpoint } from '../../src/transport.js';
+
+/** Directional wire-MAC keys from the Noise handshake hash — mirrors src/node.js wireMacKeys(). */
+const macKeys = (hh, role) => {
+  const d = (info) => Buffer.from(hkdfSync('sha256', hh, Buffer.alloc(0), Buffer.from(info, 'utf8'), 32));
+  const i2r = d('p2p-wire-mac-v1-i2r'), r2i = d('p2p-wire-mac-v1-r2i');
+  return role === 'initiator' ? { tx: i2r, rx: r2i } : { tx: r2i, rx: i2r };
+};
 
 // ---- pre-wire message framing (HELLO / HS1 / HS2 ride raw datagrams; DATA rides wire) ----
 const T = { HELLO: 0x10, HS1: 0x11, HS2: 0x12 };
@@ -75,9 +82,11 @@ function firstContact(o) {
 
     let hsA = null; // listener's responder, created when HS1 arrives
 
-    const attachWire = (sock, split, onPlain, dir) => {
+    const attachWire = (sock, split, onPlain, dir, role) => {
       const connId = split.handshakeHash.subarray(0, 8); // both sides derive the SAME id
-      const ch = createChannel({ send: (frame) => sock.send(frame), connId });
+      // Control-plane MAC keys (WIRE-1/2/3): same derivation node.js uses — directional keys
+      // out of the handshake hash, so the ack/seq/close plane is authenticated, not just DATA.
+      const ch = createChannel({ send: (frame) => sock.send(frame), connId, mac: macKeys(split.handshakeHash, role) });
       ch.onReliable((ct) => { try { onPlain(split.rx.decrypt(ct)); } catch { /* AEAD fail = drop */ } });
       sock.onMessage = (buf) => ch.onDatagram(buf, { address: dir, port: 0, family: 'IPv4' });
       return { ch, send: (pt) => ch.sendReliable(split.tx.encrypt(pt)), close: () => ch.close() };
@@ -92,7 +101,7 @@ function firstContact(o) {
           const hs2 = hsA.writeMessage(Buffer.from('ack')); // msg2 payload = the ack
           sockL.send(tag(T.HS2, hs2));
           const split = hsA.split();
-          aWire = attachWire(sockL, split, (pt) => recvResolveL(pt), 'B');
+          aWire = attachWire(sockL, split, (pt) => recvResolveL(pt), 'B', 'responder');
         }
       } catch (e) { result.error = 'listener: ' + e.message; /* dialer will time out with no ack */ }
     };
@@ -112,7 +121,7 @@ function firstContact(o) {
           const ack = sockD._hs1.readMessage(buf.subarray(1)); // SUCCESS == provably no MITM
           result.firstAck = true; result.ackBytes = ack;
           const split = sockD._hs1.split();
-          bWire = attachWire(sockD, split, (pt) => recvResolveD(pt), 'A');
+          bWire = attachWire(sockD, split, (pt) => recvResolveD(pt), 'A', 'initiator');
           clearTimeout(to); settle();
         }
       } catch (e) { result.error = 'dialer: ' + e.message; result.firstAck = false; }

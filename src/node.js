@@ -18,8 +18,8 @@
 // SEAM NOTE (flagged to main): inbound accept uses ep.onConnection(socketLike) — not yet
 // in docs/INTERFACES.md §src/transport.js. Needs main to ratify the seam.
 
-import { randomBytes } from 'node:crypto'
-import { createChannel, encodeFrame, decodeFrame, TYPE, HEADER_LEN } from './wire.js'
+import { hkdfSync, randomBytes } from 'node:crypto'
+import { createChannel, encodeFrame, decodeFrame, TYPE, HEADER_LEN, MAC_LEN } from './wire.js'
 import { createGroup } from './group.js'
 import { parseShare, createInvite, hasInvite, TypoError } from './invite.js'
 
@@ -29,6 +29,28 @@ const ZERO8 = Buffer.alloc(8)
 /** Bytes an app payload loses on the way to the wire: app header [1B kind][4B seq] + Noise AEAD tag. */
 const APP_HDR = 5
 const AEAD_TAG = 16
+
+/**
+ * Post-handshake MAC keys for the wire CONTROL PLANE (WIRE-1/2/3 — see wire.js header).
+ *
+ * The Noise handshake hash `h` is the canonical binding of the whole handshake and is
+ * IDENTICAL on both sides after split() — but it is NOT secret-key material, so we run it
+ * through HKDF with the split() chaining key's sibling domain separation and derive two
+ * INDEPENDENT directional keys. Directional matters: with one shared key, an attacker could
+ * reflect our own frames back at us and they would authenticate (re-opening WIRE-3).
+ * Fresh per handshake => a captured frame from a previous session can never replay into a
+ * new one. Same derivation on both peers, opposite roles => my tx == your rx.
+ * @param {Buffer} handshakeHash  from noise split()
+ * @param {'initiator'|'responder'} role
+ * @returns {{tx:Buffer, rx:Buffer}}
+ */
+function wireMacKeys(handshakeHash, role) {
+  const derive = (info) =>
+    Buffer.from(hkdfSync('sha256', handshakeHash, Buffer.alloc(0), Buffer.from(info, 'utf8'), 32))
+  const i2r = derive('p2p-wire-mac-v1-i2r')            // initiator -> responder frames
+  const r2i = derive('p2p-wire-mac-v1-r2i')            // responder -> initiator frames
+  return role === 'initiator' ? { tx: i2r, rx: r2i } : { tx: r2i, rx: i2r }
+}
 
 /** Opt-in trace (P2P_DEBUG=1) for first-contact diagnostics — no-op by default. */
 const DBG = process.env.P2P_DEBUG ? (...a) => { try { console.error('[p2p]', ...a) } catch { /* */ } } : () => {}
@@ -112,8 +134,8 @@ function makePeer(node, { S = null } = {}) {
     remoteStatic: null,     // remote X25519 pubkey
     remoteEd: null,         // remote Ed25519 pubkey
     get connected() { return connected },
-    /** Largest app payload that still fits the wire budget (mtu - wire header - Noise tag - app header). */
-    get maxMessage() { return node._mtu - HEADER_LEN - AEAD_TAG - APP_HDR },
+    /** Largest app payload that still fits the wire budget (mtu - wire header - wire MAC - Noise tag - app header). */
+    get maxMessage() { return node._mtu - HEADER_LEN - MAC_LEN - AEAD_TAG - APP_HDR },
     /** @param {Buffer|string} data @returns {Promise<number>} resolves with appSeq on ack, REJECTS on a permanent send error */
     send(data) {
       const buf = asBuf(data)
@@ -175,8 +197,12 @@ function makePeer(node, { S = null } = {}) {
     }
   }
 
-  /** Bind a freshly-handshaked socket+session; replay any unacked outbox in order. */
-  function attach({ socket: sock, tx: txN, rx: rxN, connId, instance }) {
+  /**
+   * Bind a freshly-handshaked socket+session; replay any unacked outbox in order.
+   * `mac` = the directional control-plane keys (wireMacKeys) — REQUIRED by createChannel:
+   * a channel is never built without an authenticated control plane (WIRE-1/2/3).
+   */
+  function attach({ socket: sock, tx: txN, rx: rxN, connId, instance, mac }) {
     // Peer RESTART detection: a different per-process instance nonce means the remote is a
     // fresh process with its outbound appSeq reset to 0. Its new low seqs would collide with
     // the dead session's entries in `delivered` and be dropped as dups — so reset inbound
@@ -187,7 +213,7 @@ function makePeer(node, { S = null } = {}) {
     }
     if (instance && instance.length) peerInstance = instance
     socket = sock; tx = txN; rx = rxN
-    ch = createChannel({ connId, mtu: node._mtu, keepaliveMs: node._keepaliveMs, now: node._now, send: (frame) => socket.send(frame) })
+    ch = createChannel({ connId, mac, mtu: node._mtu, keepaliveMs: node._keepaliveMs, now: node._now, send: (frame) => socket.send(frame) })
     ch.onReliable(onAppCipher)
     ch.onClose(() => { if (connected) { connected = false; node.emit('disconnect', peer) } })
     connected = true
@@ -381,8 +407,10 @@ function initiatorHandshake(node, deps, S, dec, ctx = {}) {
           try { payload = hs.readMessage(f.payload) }               // decrypt SUCCESS == first ack == MITM proof
           catch (err) { return fail('handshake', err) }             // fail CLOSED
           void payload
-          const { tx, rx } = hs.split()
-          rec.attach({ socket, tx, rx, connId: myConnId, instance: peerInstance })
+          const { tx, rx, handshakeHash } = hs.split()
+          // Control-plane keys ride out of the SAME handshake that proves the peer (D4) —
+          // so the ARQ/ack/close plane is authenticated from the very first channel frame.
+          rec.attach({ socket, tx, rx, connId: myConnId, instance: peerInstance, mac: wireMacKeys(handshakeHash, 'initiator') })
           if (!settled) { settled = true; resolve(rec.peer) }
         } else if (rec.channel()) {
           rec.channel().onDatagram(buf, socket.rinfo)
@@ -439,8 +467,8 @@ function acceptConnection(node, deps, socket) {
       // already be live to receive it. (Real async transport is unaffected; this is the
       // safe order either way.)
       const hs2 = hs.writeMessage(encodeIntro(id.edPub, id.xPub, node._instance))
-      const { tx, rx } = hs.split()
-      rec.attach({ socket, tx, rx, connId, instance })
+      const { tx, rx, handshakeHash } = hs.split()
+      rec.attach({ socket, tx, rx, connId, instance, mac: wireMacKeys(handshakeHash, 'responder') })
       socket.send(encodeFrame(TYPE.HS2, connId, 0, 0, hs2))
     } else if (rec && rec.channel()) {
       rec.channel().onDatagram(buf, socket.rinfo)

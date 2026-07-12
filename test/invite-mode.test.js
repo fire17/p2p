@@ -229,7 +229,7 @@ test('send: oversized payload rejects (never hangs) over the REAL Noise/wire sta
   try {
     await nextTick()
     const peer = await B.connect(alice.S)
-    const limit = peer.maxMessage                                     // 1200 - 17 - 16 - 5 = 1162
+    const limit = peer.maxMessage                                     // 1200 - 17 - 16(mac) - 16 - 5 = 1146
     const got = []
     A.on('message', (_p, d) => got.push(d.length))
 

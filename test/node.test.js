@@ -360,8 +360,8 @@ test('send: oversized payload REJECTS (does not hang) and never enters the outbo
   const B = await buildNode(board, 'QQQQQQQQQQQQQQQQQQQQQQQQQQ', 'ob')
   try {
     const peer = await B.node.connect('PPPPPPPPPPPPPPPPPPPPPPPPPP')
-    const limit = peer.maxMessage                       // mtu(1200) - wire header(17) - AEAD tag(16) - app header(5)
-    assert.equal(limit, 1162)
+    const limit = peer.maxMessage      // mtu(1200) - wire hdr(17) - wire MAC(16) - AEAD tag(16) - app hdr(5)
+    assert.equal(limit, 1146)           // 16B smaller since the wire MAC (WIRE-1/2/3) rides in the datagram
 
     const err = await withTimeout(
       peer.send(Buffer.alloc(limit + 1, 0x41)).then(() => null, (e) => e),

@@ -5,7 +5,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  createChannel, seqCmp, encodeFrame, decodeFrame, TYPE, HEADER_LEN,
+  createChannel, seqCmp, encodeFrame, decodeFrame, TYPE, HEADER_LEN, MAC_LEN,
 } from '../src/wire.js'
 
 /** Seeded PRNG — deterministic float in [0,1). */
@@ -21,6 +21,18 @@ function mulberry32(seed) {
 
 const CONNID = Buffer.from('0011223344556677', 'hex')
 const idxBuf = (i) => { const b = Buffer.allocUnsafe(4); b.writeUInt32BE(i >>> 0); return b }
+
+// Post-handshake control-plane MAC keys (node.js derives these from the Noise handshake hash).
+// DIRECTIONAL: A signs with KA and verifies KB; B is the mirror. Stand-ins for the real HKDF
+// output — wire.js only cares that they are ≥MAC_LEN bytes and differ.
+const KA = Buffer.alloc(32, 0xa1)                 // A -> B frames
+const KB = Buffer.alloc(32, 0xb2)                 // B -> A frames
+const MAC_A = { tx: KA, rx: KB }                  // channel A's view
+const MAC_B = { tx: KB, rx: KA }                  // channel B's view
+/** A frame as the PEER (B) would legitimately send it to A. */
+const peerFrame = (type, seq, ack, payload, connId = CONNID) => encodeFrame(type, connId, seq, ack, payload, KB)
+/** A frame an ATTACKER can build: right connId, right shape, NO valid MAC (it has no key). */
+const forged = (type, seq, ack, payload, connId = CONNID) => encodeFrame(type, connId, seq, ack, payload)
 
 // ---------------------------------------------------------------------------
 test('seqCmp is rollover-safe (RFC1982 serial arithmetic)', () => {
@@ -81,8 +93,8 @@ test('1000 msgs each way under 20% loss + reorder + dup arrive exactly-once in-o
     connId: CONNID, mtu: 1200, window: 256,
     rtoMin: 15, rtoMax: 300, keepaliveMs: 1e12, now: () => T,
   }
-  chA = createChannel({ ...optsCommon, send: net.link((buf) => chB.onDatagram(buf, rinfoA)) })
-  chB = createChannel({ ...optsCommon, send: net.link((buf) => chA.onDatagram(buf, rinfoB)) })
+  chA = createChannel({ ...optsCommon, mac: MAC_A, send: net.link((buf) => chB.onDatagram(buf, rinfoA)) })
+  chB = createChannel({ ...optsCommon, mac: MAC_B, send: net.link((buf) => chA.onDatagram(buf, rinfoB)) })
 
   const aRecv = [], bRecv = []
   chA.onReliable((b) => aRecv.push(b.readUInt32BE(0)))
@@ -125,8 +137,8 @@ test('connId roaming mid-stream: peer IP change keeps delivery flowing (D9)', ()
   // B's datagrams to A start from one address, then migrate mid-stream.
   let bAddr = { address: '198.51.100.7', port: 5000, family: 'IPv4' }
   const roams = []
-  chA = createChannel({ ...opts, send: net.link((buf) => chB.onDatagram(buf, { address: '203.0.113.9', port: 6000, family: 'IPv4' })) })
-  chB = createChannel({ ...opts, send: net.link((buf) => chA.onDatagram(buf, bAddr)) })
+  chA = createChannel({ ...opts, mac: MAC_A, send: net.link((buf) => chB.onDatagram(buf, { address: '203.0.113.9', port: 6000, family: 'IPv4' })) })
+  chB = createChannel({ ...opts, mac: MAC_B, send: net.link((buf) => chA.onDatagram(buf, bAddr)) })
   chA.onRoam((r) => roams.push(r.address))
 
   const aRecv = []
@@ -158,8 +170,8 @@ test('keepalive PING emitted from tick after idle interval', () => {
   let T = 0
   const frames = []
   const ch = createChannel({
-    connId: CONNID, keepaliveMs: 1000, now: () => T,
-    send: (buf) => frames.push(decodeFrame(buf)),
+    connId: CONNID, keepaliveMs: 1000, now: () => T, mac: MAC_A,
+    send: (buf) => frames.push(decodeFrame(buf, KA)),
   })
   ch.tick(T)                                        // fresh -> no ping
   assert.equal(frames.filter((f) => f.type === TYPE.PING).length, 0)
@@ -177,11 +189,11 @@ test('keepalive PING emitted from tick after idle interval', () => {
 test('liveness: channel dies after livenessMs of inbound silence; a frame resets it', () => {
   let T = 0
   const closes = []
-  const ch = createChannel({ connId: CONNID, now: () => T, keepaliveMs: 100, livenessMs: 300, send: () => {} })
+  const ch = createChannel({ connId: CONNID, now: () => T, keepaliveMs: 100, livenessMs: 300, mac: MAC_A, send: () => {} })
   ch.onClose((why) => closes.push(why))
-  ch.onDatagram(encodeFrame(TYPE.PING, CONNID, 0, 0, null), {})   // inbound at T=0 sets lastRecvAt
+  ch.onDatagram(peerFrame(TYPE.PING, 0, 0, null), {})             // inbound at T=0 sets lastRecvAt
   T = 250; ch.tick(T); assert.equal(closes.length, 0, 'within livenessMs -> alive')
-  ch.onDatagram(encodeFrame(TYPE.PONG, CONNID, 0, 0, null), {})   // fresh inbound at 250 resets liveness
+  ch.onDatagram(peerFrame(TYPE.PONG, 0, 0, null), {})             // fresh inbound at 250 resets liveness
   T = 500; ch.tick(T); assert.equal(closes.length, 0, 'reset kept it alive (500-250 < 300)')
   T = 560; ch.tick(T); assert.deepEqual(closes, ['timeout'], 'silence 250->560 = 310 >= 300 -> dead')
   assert.equal(ch.closed, true)
@@ -190,8 +202,8 @@ test('liveness: channel dies after livenessMs of inbound silence; a frame resets
 test('PING is answered with PONG', () => {
   let T = 0
   const frames = []
-  const ch = createChannel({ connId: CONNID, now: () => T, send: (buf) => frames.push(decodeFrame(buf)) })
-  const ping = encodeFrame(TYPE.PING, CONNID, 0, 0, null)
+  const ch = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: (buf) => frames.push(decodeFrame(buf, KA)) })
+  const ping = peerFrame(TYPE.PING, 0, 0, null)
   ch.onDatagram(ping, { address: '1.2.3.4', port: 9 })
   assert.equal(frames.filter((f) => f.type === TYPE.PONG).length, 1)
 })
@@ -200,8 +212,8 @@ test('exactly-once under pure duplication (no loss)', () => {
   let T = 0
   let chA, chB
   const dup = (deliver) => (buf) => { deliver(Buffer.from(buf)); deliver(Buffer.from(buf)) } // every frame twice
-  chA = createChannel({ connId: CONNID, now: () => T, send: dup((b) => chB.onDatagram(b, {})) })
-  chB = createChannel({ connId: CONNID, now: () => T, send: dup((b) => chA.onDatagram(b, {})) })
+  chA = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: dup((b) => chB.onDatagram(b, {})) })
+  chB = createChannel({ connId: CONNID, now: () => T, mac: MAC_B, send: dup((b) => chA.onDatagram(b, {})) })
   const got = []
   chB.onReliable((b) => got.push(b.readUInt32BE(0)))
   for (let i = 0; i < 50; i++) chA.sendReliable(idxBuf(i))
@@ -212,8 +224,8 @@ test('exactly-once under pure duplication (no loss)', () => {
 test('CLOSE shuts both ends', () => {
   let T = 0
   let chA, chB
-  chA = createChannel({ connId: CONNID, now: () => T, send: (b) => chB.onDatagram(Buffer.from(b), {}) })
-  chB = createChannel({ connId: CONNID, now: () => T, send: (b) => chA.onDatagram(Buffer.from(b), {}) })
+  chA = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: (b) => chB.onDatagram(Buffer.from(b), {}) })
+  chB = createChannel({ connId: CONNID, now: () => T, mac: MAC_B, send: (b) => chA.onDatagram(Buffer.from(b), {}) })
   let bClosedReason = null
   chB.onClose((why) => { bClosedReason = why })
   chA.close()
@@ -226,18 +238,152 @@ test('CLOSE shuts both ends', () => {
 test('foreign connId datagrams are ignored', () => {
   let T = 0
   const got = []
-  const ch = createChannel({ connId: CONNID, now: () => T, send: () => {} })
+  const ch = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: () => {} })
   ch.onReliable((b) => got.push(b))
-  const wrong = encodeFrame(TYPE.DATA, Buffer.alloc(8, 0xaa), 0, 0, idxBuf(1))
+  const wrong = peerFrame(TYPE.DATA, 0, 0, idxBuf(1), Buffer.alloc(8, 0xaa))   // valid MAC, WRONG connId
   ch.onDatagram(wrong, {})
   assert.equal(got.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// CONTROL-PLANE AUTHENTICATION — the WIRE-1/2/3 regression battery
+// (research/wargame-findings.md §2). Attacker model: on-path observer / hostile WSS relay.
+// It has read every cleartext header, so it KNOWS connId and can predict seq. What it does
+// NOT have is the post-handshake MAC key. Each test below is the exact attack, and asserts
+// the state that used to move now does not.
+// ---------------------------------------------------------------------------
+
+test('WIRE-1: a forged ack (even inside a PING) does NOT drain the send window', () => {
+  let T = 0
+  const ch = createChannel({ connId: CONNID, window: 8, rtoMin: 1e9, now: () => T, mac: MAC_A, send: () => {} })
+  for (let i = 0; i < 5; i++) ch.sendReliable(idxBuf(i))
+  assert.equal(ch.stats().inflight, 5, 'precondition: 5 segments in flight')
+
+  // THE ATTACK: one forged frame with a wildly inflated cumulative ack. Pre-fix, onAck ran
+  // unconditionally on the cleartext header and deleted every inflight seg (the sender then
+  // believes them delivered and never resends -> silent loss), and poisoned sndUna so later
+  // REAL acks were ignored -> a wedged sender.
+  ch.onDatagram(forged(TYPE.PING, 0, 0xfffffff0, null), {})
+  ch.onDatagram(forged(TYPE.ACK, 0, 0xfffffff0, null), {})
+  ch.onDatagram(forged(TYPE.DATA, 0, 0xfffffff0, idxBuf(99)), {})   // ack rides on DATA too
+
+  assert.equal(ch.stats().inflight, 5, 'window NOT drained by forged acks')
+  assert.equal(ch.stats().authFails, 3, 'all three forgeries hit the MAC gate')
+
+  // ...and the sender is NOT wedged: the peer's REAL cumulative ack still drains it.
+  ch.onDatagram(peerFrame(TYPE.ACK, 0, 2, null), {})                // acks seq 0,1,2
+  assert.equal(ch.stats().inflight, 2, 'legit ack still advances the window (0,1,2 acked)')
+})
+
+test('WIRE-2: a forged CLOSE is ignored; the real CLOSE still closes', () => {
+  let T = 0
+  const closes = []
+  const ch = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: () => {} })
+  ch.onClose((why) => closes.push(why))
+
+  ch.onDatagram(forged(TYPE.CLOSE, 0, 0, null), {})                 // one packet used to = instant teardown
+  assert.equal(ch.closed, false, 'forged CLOSE did NOT tear the channel down')
+  assert.deepEqual(closes, [], 'no close callback fired')
+  ch.sendReliable(idxBuf(0))                                        // still usable
+
+  ch.onDatagram(peerFrame(TYPE.CLOSE, 0, 0, null), {})              // the authentic one
+  assert.equal(ch.closed, true, 'authenticated CLOSE still closes')
+  assert.deepEqual(closes, ['peer'])
+})
+
+test('WIRE-3: a forged DATA does NOT advance rcvNext — the real frame for that seq still delivers', () => {
+  let T = 0
+  const got = []
+  const ch = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: () => {} })
+  ch.onReliable((b) => got.push(b.toString()))
+
+  // THE ATTACK (exact WIRE-3 loss scenario): the attacker injects garbage for the NEXT
+  // expected seq (0 — fully predictable). Pre-fix: onData delivered it upward (the AEAD then
+  // failed harmlessly in node.js) but rcvNext advanced to 1 anyway. The peer's REAL seq-0
+  // frame then arrived as seqCmp < 0 -> "already delivered" -> dropped. That application
+  // message was gone forever, silently. One packet, one erased message.
+  assert.equal(ch._rcvNext, 0)
+  ch.onDatagram(forged(TYPE.DATA, 0, 0, Buffer.from('GARBAGE')), {})
+  assert.equal(ch._rcvNext, 0, 'rcvNext did NOT advance on the forged frame')
+  assert.deepEqual(got, [], 'nothing delivered upward from a frame that never authenticated')
+
+  // The REAL seq-0 frame now arrives — it must NOT be swallowed as "already delivered".
+  ch.onDatagram(peerFrame(TYPE.DATA, 0, 0, Buffer.from('real-message-0')), {})
+  assert.deepEqual(got, ['real-message-0'], 'the real message for the attacked seq still delivers')
+  assert.equal(ch._rcvNext, 1)
+
+  // and the stream keeps its ordering guarantee afterwards
+  ch.onDatagram(peerFrame(TYPE.DATA, 1, 0, Buffer.from('real-message-1')), {})
+  assert.deepEqual(got, ['real-message-0', 'real-message-1'])
+  assert.equal(ch.stats().authFails, 1)
+})
+
+test('reflection: our OWN frames echoed back at us do not authenticate (directional keys)', () => {
+  let T = 0
+  const got = []
+  const sent = []
+  const ch = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: (b) => sent.push(Buffer.from(b)) })
+  ch.onReliable((b) => got.push(b.toString()))
+  ch.sendReliable(Buffer.from('mine'))
+  assert.equal(sent.length, 1)
+
+  // A shared (non-directional) key would make this verify: our own DATA seq-0 would be
+  // accepted as the peer's, advancing rcvNext -> WIRE-3 by reflection. tx !== rx kills it.
+  ch.onDatagram(sent[0], {})
+  assert.equal(ch._rcvNext, 0, 'reflected frame rejected — rcvNext untouched')
+  assert.deepEqual(got, [])
+  assert.equal(ch.stats().authFails, 1)
+})
+
+test('a single flipped byte in an authentic frame is dropped (integrity, not just origin)', () => {
+  let T = 0
+  const got = []
+  const ch = createChannel({ connId: CONNID, now: () => T, mac: MAC_A, send: () => {} })
+  ch.onReliable((b) => got.push(b.toString()))
+
+  const good = peerFrame(TYPE.DATA, 0, 0, Buffer.from('payload'))
+  const tampered = Buffer.from(good); tampered[HEADER_LEN] ^= 0x01      // flip a payload bit
+  ch.onDatagram(tampered, {})
+  assert.deepEqual(got, [], 'tampered frame dropped')
+  assert.equal(ch._rcvNext, 0)
+
+  const truncated = good.subarray(0, good.length - 1)                   // chop the MAC
+  ch.onDatagram(truncated, {})
+  assert.deepEqual(got, [])
+  assert.equal(ch.stats().authFails, 2)
+
+  ch.onDatagram(good, {})                                               // untouched original still works
+  assert.deepEqual(got, ['payload'])
+})
+
+test('createChannel FAILS CLOSED without directional MAC keys (no unauthenticated mode)', () => {
+  assert.throws(() => createChannel({ connId: CONNID, send: () => {} }), /mac/i, 'no keys -> throws')
+  assert.throws(() => createChannel({ connId: CONNID, mac: { tx: KA }, send: () => {} }), /mac/i, 'half a key pair -> throws')
+  assert.throws(
+    () => createChannel({ connId: CONNID, mac: { tx: Buffer.alloc(8, 1), rx: Buffer.alloc(8, 2) }, send: () => {} }),
+    /mac/i, 'undersized keys -> throws',
+  )
+  assert.throws(
+    () => createChannel({ connId: CONNID, mac: { tx: KA, rx: KA }, send: () => {} }),
+    /differ|reflection/i, 'same key both directions -> throws (reflection guard)',
+  )
+})
+
+test('MAC rides inside the MTU budget (sendReliable still refuses to exceed the datagram)', () => {
+  let T = 0
+  const sizes = []
+  const ch = createChannel({ connId: CONNID, mtu: 1200, now: () => T, mac: MAC_A, send: (b) => sizes.push(b.length) })
+  const limit = 1200 - HEADER_LEN - MAC_LEN
+  ch.sendReliable(Buffer.alloc(limit, 7))
+  assert.equal(sizes[0], 1200, 'a max-size frame is exactly one MTU on the wire')
+  assert.throws(() => ch.sendReliable(Buffer.alloc(limit + 1)), /mtu budget/)
 })
 
 test('backpressure: sends past window queue, then drain (stats reflect it)', () => {
   let T = 0
   // Black-hole send (no peer -> no acks) so the window fills and excess queues.
   const sink = []
-  const chA = createChannel({ connId: CONNID, window: 8, rtoMin: 1e9, now: () => T, send: (b) => sink.push(b) })
+  const chA = createChannel({ connId: CONNID, window: 8, rtoMin: 1e9, now: () => T, mac: MAC_A, send: (b) => sink.push(b) })
   for (let i = 0; i < 40; i++) chA.sendReliable(idxBuf(i))
   assert.equal(chA.stats().inflight, 8, 'window cap respected')
   assert.equal(chA.stats().queued, 32, 'excess queued behind the window')
@@ -246,8 +392,8 @@ test('backpressure: sends past window queue, then drain (stats reflect it)', () 
   // Now drain by feeding cumulative acks from a real peer, verifying in-order delivery.
   let T2 = 0
   let a, b
-  a = createChannel({ connId: CONNID, window: 8, rtoMin: 15, now: () => T2, send: (x) => b.onDatagram(Buffer.from(x), {}) })
-  b = createChannel({ connId: CONNID, window: 8, rtoMin: 15, now: () => T2, send: (x) => a.onDatagram(Buffer.from(x), {}) })
+  a = createChannel({ connId: CONNID, window: 8, rtoMin: 15, now: () => T2, mac: MAC_A, send: (x) => b.onDatagram(Buffer.from(x), {}) })
+  b = createChannel({ connId: CONNID, window: 8, rtoMin: 15, now: () => T2, mac: MAC_B, send: (x) => a.onDatagram(Buffer.from(x), {}) })
   const got = []
   b.onReliable((x) => got.push(x.readUInt32BE(0)))
   for (let i = 0; i < 40; i++) a.sendReliable(idxBuf(i))
