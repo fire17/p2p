@@ -42,12 +42,35 @@ function slotKey(slot) {
   return !slot || slot === 'default' ? ID_KEY : 'id:' + slot
 }
 
+// A browser that will not open IndexedDB must FAIL, not hang. Mobile private browsing (and "block all
+// cookies"/site-data) can make `indexedDB.open` throw, or — worse — settle neither `onsuccess` nor
+// `onerror`, and `onblocked` fires whenever another tab still holds an older version of the database.
+// A hang there is invisible: identity() awaits it forever and the page sits on "booting…" with nothing
+// on screen and nothing in the console. So: guard all three, and time out rather than wait forever.
+// (app/boot-guard.js is the outer net; this is the specific one. The timeout is deliberately shorter
+// than the guard's watchdog, so the real reason wins the race and the user sees THAT.)
+const IDB_TIMEOUT_MS = 5000
+const IDB_BLOCKED_MSG = 'this browser is blocking storage — private browsing, or cookies/site data are '
+  + 'turned off. p2p needs IndexedDB to keep your identity. Try a normal window, or use the CLI.'
+
 function idb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    if (typeof indexedDB === 'undefined' || !indexedDB) { reject(new Error(IDB_BLOCKED_MSG)); return }
+    let req
+    try {
+      req = indexedDB.open(DB_NAME, 1)
+    } catch (err) { // Safari private mode throws SecurityError here rather than firing onerror.
+      reject(new Error(IDB_BLOCKED_MSG + ` (${err.message})`))
+      return
+    }
+    const timer = setTimeout(() => reject(new Error(IDB_BLOCKED_MSG + ' (it never responded)')), IDB_TIMEOUT_MS)
+    const settle = (fn) => (v) => { clearTimeout(timer); fn(v) } // first one home wins; the rest no-op
     req.onupgradeneeded = () => req.result.createObjectStore(STORE)
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
+    req.onsuccess = () => settle(resolve)(req.result)
+    req.onerror = () => settle(reject)(req.error || new Error('IndexedDB refused to open'))
+    req.onblocked = () => settle(reject)(new Error(
+      'another tab is holding an older version of this browser\'s p2p storage — close the other tabs and reload',
+    ))
   })
 }
 
@@ -131,7 +154,11 @@ export async function identity(opts = {}) {
   const slot = opts.slot || 'default'
   const k = slotKey(slot)
   if (!opts.fresh) {
-    const saved = await idbGet(k).catch(() => null)
+    // Do NOT swallow a storage failure here. Minting a fresh identity on top of a broken IndexedDB
+    // hands the user a key that cannot survive a reload — they would share it, and lose it. idb() has
+    // already turned every way this can fail (throws, errors, blocked, silence) into a rejection a
+    // human can act on, so let it through: app.js's boot catch puts it on screen.
+    const saved = await idbGet(k)
     if (saved) return hydrate(saved)
   }
   const create = async () => {

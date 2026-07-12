@@ -206,6 +206,11 @@ async function main() {
     $('mykey').textContent = id.S
     $('idname').textContent = slot
     await refreshIdSwitcher(slot)
+    // The app is alive and owns the status line from here on — app/boot-guard.js watches this flag
+    // (and this status text) to decide whether the page is booting or has silently died. Set it only
+    // once we have really got this far: setting it earlier would silence the guard for exactly the
+    // failures it exists to report.
+    window.__p2pBooted = true
     status('going online…')
 
     try {
@@ -269,7 +274,10 @@ async function main() {
     window.__secureGroupSend = (text) => secureGroup && secureGroup.send(text)
     window.__secureGroupMembers = () => (secureGroup ? secureGroup.members() : [])
   } catch (err) {
-    status('failed to start', false)
+    // The REASON goes in the status line, not just the log: on a phone the log is below the fold, and
+    // "failed to start" on its own is barely better than the "booting…" it replaced. Whoever is stuck
+    // is looking at this one line — so it has to be the line that tells them what to do.
+    status('Failed to start — ' + err.message, false)
     say(err.message, 'sys err')
     throw err
   }
