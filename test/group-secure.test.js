@@ -178,6 +178,36 @@ test('group: removal is cryptographic — after rotation the removed member decr
   t.close()
 })
 
+// ── GRP-2: removal ejects the removed member from EVERY sender, not just the admin ───────────────
+test('group GRP-2: after a removal a NON-ADMIN survivor rotates too — the removed member cannot DECRYPT it', async () => {
+  const t = await threeParty()
+  // Warm C's receive-ratchet for B while C is still a member, so the ONLY thing that can stop C
+  // decrypting post-removal is B rotating — not a missing key.
+  await t.gB.send('pre-removal from B'); await wait(150)
+  assert.equal(t.got.C.at(-1)?.text, 'pre-removal from B', 'C reads B while still a member')
+
+  // Tap the ciphertext B fans to the admin. The removed member C is dropped from B's fan-out, but the
+  // GRP-2 claim is that C cannot DECRYPT B's traffic even if it OBTAINS the ciphertext (on-path /
+  // relay — a conceded adversary). So we capture the wire envelope and hand it straight to C.
+  const captured = []
+  t.nA.on('message', (_p, buf) => { if (Buffer.isBuffer(buf) && buf[0] === 0x67 && buf[1] === 2) captured.push(Buffer.from(buf)) })
+
+  await t.gA.remove(t.C.S); await wait(250)                 // admin removes C; EVERY survivor rotates
+  assert.deepEqual(t.gA.members().sort(), [t.A.S, t.B.S].sort())
+
+  await t.gB.send('post-removal from a NON-ADMIN'); await wait(250)
+  assert.equal(t.got.A.at(-1)?.text, 'post-removal from a NON-ADMIN', 'the admin survivor still reads B across the rotation')
+  assert.ok(captured.length, 'captured B’s post-removal MSG ciphertext off the wire')
+
+  // Inject B's post-removal ciphertext into the removed member C (still holds its pre-removal ratchet).
+  const cBefore = t.got.C.length, divBefore = t.div.C.length
+  t.nC.emit('message', {}, captured.at(-1))
+  await wait(100)
+  assert.equal(t.got.C.length, cBefore, 'the removed member decrypts NOTHING even handed B’s ciphertext (GRP-2)')
+  assert.ok(t.div.C.length > divBefore, 'C records a divergence (bad ratchet / decrypt) instead of reading it')
+  t.close()
+})
+
 // ── GRP-1: the membership fold is a PURE FUNCTION of the op SET (deterministic admin) ────────────
 test('group GRP-1: two concurrent `create` roots → every peer folds the SAME admin (hash order), and a rival create is surfaced as divergence', async () => {
   // Two members each author a `create` for the same groupId (causally unlinked roots). The old fold

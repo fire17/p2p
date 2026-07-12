@@ -304,6 +304,17 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     // it so the app sees a member's attempted admin-escalation, not just a quietly-ignored op.
     if (o.t === 'create' && ops.some((x) => x !== o && x.t === 'create')) emit('divergence', { reason: 'rival-create', by: o.by })
     emit('membership', [...membership().members])
+    // GRP-2: cryptographic ejection must cover EVERY sender, not just the admin who authored the
+    // removal. remove() rotates only the caller's sender key; a NON-ADMIN survivor that never rotates
+    // keeps ratcheting the very chain the removed member already holds — so the removed member
+    // computes all of that survivor's future keys forever (one-way ratchet). Fix: on an authoritative
+    // `remove`, every surviving member rotates its OWN sender key and redistributes to survivors only.
+    // Guarded so it fires exactly once per remove (ops dedup above), never on a bogus non-admin remove
+    // (o.by === admin), and never double-rotates the admin (me !== o.by — remove() already rotated it).
+    if (o.t === 'remove') {
+      const m = membership()
+      if (o.by === m.admin && me !== o.by && me !== o.subj && m.members.has(me)) rotate()
+    }
     // Learning the chain can REVEAL members we didn't know existed when we joined. Without this,
     // join-order matters: a member that join()s before the admin's chain reaches it distributes its
     // sender key to nobody, and its messages then decrypt for no one — a silent, order-dependent
