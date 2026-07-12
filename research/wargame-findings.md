@@ -238,3 +238,43 @@ Primary files the opus lead read and confirmed: `key.js`, `noise.js`, `sign.js`,
 ---
 
 *End of sweep. Ranked: INST-1 (CRITICAL) · WIRE-1/2/3 · DOS-1 · META-1 · GRP-1/2/3/4 (HIGH) · NAT-1 (MED-HIGH divergence) · INST-2/LIVE-1/DHT-1/MDNS-1/BRW-1/BRW-2 (MED) · BRW-3/DOS-2/BURN-0 (LOW). Crypto core sound; the breaks are the layers around it. All fixes gate through the Complexity Adversarial Gate. Primary-source scope + UNVERIFIED items in §9.*
+
+---
+
+## 11. Group hardening — post-fix status + honest residuals (2026-07-12, grp-harden lane, opus @ xhigh)
+
+All four GRP findings are fixed and gate-CONFIRMED, plus **GRP-5** (a fifth HIGH, found while
+fixing GRP-1). Each fix ships a filled CAG §6 block and a red-without-fix / green-with-fix
+regression test in `test/group-secure.test.js` (group suite 9 → 11 checks; full suite 182/182;
+browser group-ui e2e green).
+
+| Fix | Commit | One line |
+|---|---|---|
+| **GRP-1** | `8aa4b10` | fold is now a canonical Kahn topo-sort tie-broken by `opHash` (lowest wins) — a pure function of the op SET; a rival `create` raises a `rival-create` divergence. |
+| **GRP-5** | `8aa4b10` | `opBytes` omitted `init`, so a create's roster was neither signed nor hashed — any relay could splice members (incl. itself) into a create. `init` is now in the signed bytes + `opHash`. |
+| **GRP-2** | `29b66c0` | every surviving member (not just the removing admin) auto-rotates its sender key on an observed authoritative `remove` — the removed member decrypts nothing further even if it obtains the ciphertext. |
+| **GRP-3** | `575f1d4` | KEYDIST bodies are Ed25519-signed over `gid‖keydist‖s‖ck‖q` and verified before apply — kills the forged-KEYDIST intra-group per-sender DoS. |
+| **GRP-4** | `adb99f2` | member-side pull (`T.KEYREQ`): a late joiner asks peers it knows to (re)send their sender key, so a keydist dropped because the recipient's group didn't exist yet no longer strands it. |
+
+**Honest residuals (the fixes SURFACE these, they do NOT close them — accept-and-document under the CAG):**
+
+- **GRP-1 residual — canonicalization surfaces contention; it does NOT prevent insider admin seizure.**
+  `opHash = sha256(opBytes ‖ sig).slice(0, 32)` is **grindable**: a G-holder varies its create's `init`
+  (or any signed field) and re-authors until its create-hash sorts *below* the honest admin's — expected
+  ~2 attempts against a single target, trivially cheap. It then wins the lowest-hash tiebreak and becomes
+  admin on **every honest peer**. So GRP-1 makes the fold order-independent (no receipt-order split-brain)
+  and makes contention **loud** (a `rival-create` divergence fires on every peer, never silent) — but a
+  determined insider can still seize the admin slot. The residual *gain* to that attacker is bounded: a
+  G-holder is **already a full member reading all traffic** (G *is* the read capability), so seizing admin
+  only adds add/remove authority — and that act now raises a divergence every honest peer can observe.
+  **True prevention needs a founder-pin** (bind the group to the founder's pubkey out-of-band) or a PKI
+  root, which v1 deliberately omits. **v-next: founder-pin / signed-genesis so admin identity is not
+  grindable.**
+
+- **GRP-4 residual — a founding member holding ONLY the secret G with NO member contact** has nobody to
+  pull from until an admin re-pushes. Closing it needs group-rid rendezvous, which lives in
+  `node.js`/transport (out of the group-lane single-writer scope). Documented in `adb99f2`.
+
+Both residuals are net-positive and degrade to current behavior under the CAG (checks 1/5), not silent
+gaps. GRP-5's `opBytes` change is wire-breaking (op hashes/signatures change) → folds into the **v0.3.0**
+envelope alongside the wire-auth control-plane change.

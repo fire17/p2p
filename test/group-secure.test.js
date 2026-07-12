@@ -295,26 +295,44 @@ test('group GRP-1: two concurrent `create` roots → every peer folds the SAME a
   nA.close(); nB.close(); nC.close()
 })
 
-// ── GRP-5: a create op's `init` roster is signed + hashed (no relay-spliced members) ─────────────
-test('group GRP-5: initial roster is covered by the op signature — a tampered `init` is rejected', async () => {
-  const t = await threeParty()
-  // C forges an OP frame: A's real create op with an EXTRA member (C's confederate D) spliced into
-  // init. Because init is now part of opBytes, A's signature no longer verifies over the tampered op.
-  const D = await identity()
-  // Reconstruct A's create op shape and tamper init. We do not have A.edPriv-signed bytes for the new
-  // init, so the signature (whatever we put) cannot match — the gate must reject it as op-signature.
-  const forged = { t: 'create', by: t.A.S, subj: null, parents: [], n: 0,
-    init: [t.B.S, t.C.S, D.S], e: Buffer.from(t.A.edPub).toString('base64'),
-    x: Buffer.from(t.A.xPub).toString('base64'), sig: 'AAAA' }
-  const body = Buffer.from(JSON.stringify(forged), 'utf8')
-  const env = Buffer.allocUnsafe(2 + 32 + body.length)
-  env[0] = 0x67; env[1] = 3                                 // GMAGIC, T.OP
-  Buffer.from(t.gA.groupId, 'hex').copy(env, 2)
-  body.copy(env, 34)
-  const cToB = t.nC.peers().find((p) => p.key === t.B.S)
-  await cToB.send(env); await wait(150)
+// ── GRP-5: a create op's `init` roster is covered by the SIGNATURE (splice-after-sign is rejected) ─
+test('group GRP-5: splicing a member into a genuinely-signed create’s init is rejected (init is signed)', async () => {
+  // A REAL red-without-fix guard: a bogus-signature forgery (sig:'AAAA') would fail Ed25519 under BOTH
+  // the old and the new opBytes, so it proves nothing. Instead we take A's GENUINELY-signed create op
+  // off the wire, splice a confederate into init WITHOUT re-signing, and hand it to a FRESH receiver
+  // (no prior copy → no opHash-dedup shortcut can hide the tamper). Pre-fix (init not in opBytes) the
+  // signature still verifies and the confederate is folded in; post-fix it fails as op-signature.
+  const bd = board()
+  const A = await identity(), B = await identity(), D = await identity(), X = await identity()
+  const nA = await listen(A, { endpoint: bd.endpoint(A.S), deps: rv })
+  const nB = await listen(B, { endpoint: bd.endpoint(B.S), deps: rv })
+  const nD = await listen(D, { endpoint: bd.endpoint(D.S), deps: rv })
+  const G = randomBytes(32)
 
-  assert.ok(t.div.B.includes('op-signature'), 'B must reject the tampered-init create (signature covers init)')
-  assert.ok(!t.gB.members().includes(D.S), 'the spliced member D must NOT appear in the group')
-  t.close()
+  // Capture A's real, correctly-signed create op (A pushes it to B as a T.OP frame on join).
+  let createEnv = null
+  nB.on('message', (_p, buf) => {
+    if (Buffer.isBuffer(buf) && buf[0] === 0x67 && buf[1] === 3) {              // GMAGIC, T.OP
+      try { if (JSON.parse(buf.subarray(34).toString('utf8')).t === 'create') createEnv = Buffer.from(buf) } catch { /* not it */ }
+    }
+  })
+  const gA = createSecureGroup(nA, A, { secret: G, members: [B.S], create: true })
+  createSecureGroup(nB, B, { secret: G })
+  await gA.join(); await wait(120)
+  assert.ok(createEnv, 'captured A’s genuinely-signed create op off the wire')
+
+  // Fresh receiver D holds NO prior copy of the create — so the tampered op cannot be silently deduped.
+  const gD = createSecureGroup(nD, D, { secret: G })
+  const divD = []
+  gD.on('divergence', (x) => divD.push(x.reason))
+
+  // Splice confederate X into the SIGNED create's init, WITHOUT re-signing, and deliver it to D.
+  const tbody = JSON.parse(createEnv.subarray(34).toString('utf8'))
+  tbody.init = [...(tbody.init || []), X.S]
+  const tampered = Buffer.concat([createEnv.subarray(0, 34), Buffer.from(JSON.stringify(tbody), 'utf8')])
+  nD.emit('message', {}, tampered); await wait(80)
+
+  assert.ok(divD.includes('op-signature'), 'the tampered roster must fail the op signature (init is signed)')
+  assert.ok(!gD.members().includes(X.S), 'the spliced confederate must NOT be folded into the group')
+  nA.close(); nB.close(); nD.close()
 })
