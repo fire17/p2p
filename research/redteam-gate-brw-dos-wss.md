@@ -5,6 +5,29 @@
 > **Method:** read diff → run committed tests → independent real-PC soak → werift wire gate → full CAG §6.
 > Reproduce the soak: `node scratch/redteam-brw4-soak.mjs [fixed|prefix] [seconds]`.
 
+## ⚠️ Method limitation — this gate has a WERIFT BLIND SPOT (added 2026-07-12, post-owner-feeltest)
+
+The owner hit a LIVE BRW-4 RESIDUAL feel-testing on real Chrome: `Cannot create so many
+PeerConnections` — which also breaks group connections. My BRW-4 soak bounded the wrong axis.
+
+- What my soak proved: the **parked/live** RTCPeerConnection count stays bounded (`LIVE=8` at the cap).
+  True, and it is what the committed test asserts.
+- What it did NOT prove: that the **creation CHURN** is survivable on a real browser. My own soak run
+  **created 320 PCs** (closing 312) in 20 s — werift accepts that churn happily because it enforces NO
+  browser-style ceiling on concurrent/rapidly-created RTCPeerConnections. A real Chromium does: closed
+  PCs are not freed synchronously, so the announce cadence (still `OFFERS_PER_ANNOUNCE` PCs minted per
+  interval — the fix caps how many are *parked*, NOT the creation *rate*) accumulates un-GC'd PC objects
+  and eventually throws `Cannot create so many PeerConnections`.
+- Root cause of the blind spot: **werift is not a browser.** A werift-injected `RTCPeerConnection` has no
+  creation-rate/concurrency limit, so a soak on it is structurally incapable of reproducing a browser
+  exhaustion that is about creation churn rather than live count. My "real-PC soak" was real werift, not
+  real browser — a category I conflated.
+- Correct instrument: a **REAL-CHROMIUM** soak (Playwright/headed Chrome) that drives the same announce
+  churn and asserts the browser does not throw. That is the `browser-pc-churn` lane. When it lands I will
+  gate it by confirming (a) the soak is genuinely a browser (not werift), (b) it reproduces RED on the
+  pre-fix code (`Cannot create so many PeerConnections`), and (c) the count/churn stays bounded with the
+  fix. Standing method fix: **any browser-resource claim must be gated on a real browser, never werift.**
+
 ## Verdicts
 
 | Commit | Item | Verdict |
