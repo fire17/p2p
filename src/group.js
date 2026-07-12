@@ -279,7 +279,12 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   const handlers = { message: [], membership: [], divergence: [] }
   const keyedTo = new Set()         // members who already hold my sender key (join-order independence)
   const pulling = new Set()         // members I have an outstanding KEYREQ to (bounds pull amplification)
+  const stash = new Map()           // S -> [body]  MSGs held because their sender's key hasn't landed yet
+  const earlyKeys = new Map()       // S -> body    a VERIFIED keydist that outran the op that adds S
   let joined = false
+
+  const MAX_STASH = 32              // per sender; a peer must never be able to grow our heap without bound
+  const MAX_EARLY = 64
 
   const emit = (ev, ...a) => { for (const fn of handlers[ev] || []) { try { fn(...a) } catch { /* handler threw */ } } }
   const membership = () => foldMembership(ops)
@@ -335,6 +340,17 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     // sender key to nobody, and its messages then decrypt for no one — a silent, order-dependent
     // dead end. Re-sync instead: anyone newly visible who lacks my sender key gets it now (push), AND
     // pull any sender key I'm still missing from the members the chain just revealed (GRP-4).
+    // GRP-6: a keydist we held because it outran the op admitting its sender can be applied the
+    // moment that op lands. Without this the key sat there unused and the sender — already marked
+    // `keyedTo` on its side — never re-sent it.
+    if (earlyKeys.size) {
+      const now = membership().members
+      for (const [S, kd] of [...earlyKeys]) {
+        if (!now.has(S)) continue
+        earlyKeys.delete(S)
+        applyKeydist(S, kd)
+      }
+    }
     if (joined) { syncKeys(); pullKeys() }
     return true
   }
@@ -371,8 +387,34 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   }
 
   // ── send/receive plumbing over the pairwise links ──
+
+  /**
+   * The live pairwise peer for S — in EITHER direction.
+   *
+   * GRP-6 (the no-sender-key bug). node.connect(S) does NOT reuse an accepted (inbound) link: node.js
+   * keys DIALED peers by S (node.js:406) but ACCEPTED ones by 'static:'+xPub (node.js:584), and
+   * connect() only looks up the former (node.js:632). So `await node.connect(S)` on a peer that
+   * already has an inbound link from S starts a whole NEW dial — rendezvous, NAT punch, the lot.
+   *
+   * For a browser (or anything behind a hostile NAT) that dial is exactly the leg that doesn't work:
+   * it is REACHABLE but cannot cheaply dial BACK. Every group control frame went through connect(),
+   * so such a member could never hand anyone its sender key ⇒ `no-sender-key`, forever, and its
+   * messages were unreadable. TUI↔TUI hid it (the reverse dial usually succeeds on a LAN); web and
+   * mixed groups failed exactly as reported.
+   *
+   * The fix is to ride the channel that ALREADY EXISTS. peer.key is set at handshake on both sides
+   * (node.js:130) from the Noise-authenticated remote static, so matching on it is sound — not a
+   * guess. Falls back to a real dial when we genuinely have no link yet.
+   */
+  function livePeer(S) {
+    const peers = typeof node.peers === 'function' ? node.peers() : []
+    return peers.find((p) => p && p.connected && String(p.key || p.S || '').toUpperCase() === S) || null
+  }
+
   async function toMember(S, env) {
-    const peer = await node.connect(S)          // reuses the existing Noise link if already up
+    const live = livePeer(S)
+    if (live) return live.send(env)             // the existing Noise link — no dial, no punch, no glare
+    const peer = await node.connect(S)
     return peer.send(env)
   }
 
@@ -419,9 +461,17 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
         emit('divergence', { reason: 'keydist-signature', by: S }); return true
       }
       for (const o of body.ops || []) ingestOp(o)             // learn the membership chain
-      if (!membership().members.has(S)) { emit('divergence', { reason: 'keydist-nonmember', by: S }); return true }
-      recvChains.set(S, ratchet(unb64(body.ck), body.q || 0))
-      pulling.delete(S)                                       // GRP-4: the pull for S is satisfied
+      // GRP-6: a keydist that merely OUTRAN the op admitting S used to be DROPPED here, and the
+      // sender — which had already marked us `keyedTo` — never re-sent it. The result was a permanent
+      // key gap on a perfectly good channel: `no-sender-key` for a member we can see and talk to.
+      // Hold it instead (it is already signature-verified) and apply it the moment the chain catches
+      // up. Bounded, so a stranger cannot grow our heap; still never APPLIED unless an admin-signed
+      // op makes S a real member.
+      if (!membership().members.has(S)) {
+        if (earlyKeys.size < MAX_EARLY) earlyKeys.set(S, body)
+        return true
+      }
+      applyKeydist(S, body)
       return true
     }
 
@@ -445,35 +495,90 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
       return true
     }
 
-    if (type === T.MSG) {
-      const S = String(body.s).toUpperCase()
-      const { members } = membership()
-      if (!members.has(S)) { emit('divergence', { reason: 'msg-nonmember', by: S }); return true }
-      const id = idOf.get(S)
-      if (!id) { emit('divergence', { reason: 'msg-unknown-identity', by: S }); return true }
+    if (type === T.MSG) return onMsg(body)
+    return true
+  }
 
-      const canon = utf8([gidHex, S, body.q, body.c, (body.p || []).join(',')].join('|'))
-      if (!verifyEd(id.edPub, canon, unb64(body.g))) { emit('divergence', { reason: 'msg-signature', by: S }); return true }
+  /**
+   * Apply a VERIFIED keydist: install the sender's receive-ratchet, then replay anything of theirs we
+   * were holding for want of exactly this key.
+   */
+  function applyKeydist(S, body) {
+    const q = body.q || 0
+    recvChains.set(S, ratchet(unb64(body.ck), q))
+    pulling.delete(S)                                         // GRP-4: the pull for S is satisfied
+    const held = stash.get(S)
+    if (!held || !held.length) return
+    stash.delete(S)
+    // Only messages from `q` on are recoverable: the chain key we were handed is the one for seq q,
+    // and the ratchet is one-way, so anything the sender wrote BEFORE it is gone for good. That is
+    // forward secrecy doing its job (the same posture as Signal's sender keys) — report it honestly
+    // rather than pretend, and never claim a message we cannot actually read.
+    const lost = held.filter((b) => (b.q || 0) < q).length
+    if (lost) emit('divergence', { reason: 'unrecoverable-history', by: S, count: lost })
+    for (const b of held) if ((b.q || 0) >= q) onMsg(b)
+  }
 
-      const h = sha256(canon, unb64(body.g)).toString('hex').slice(0, 32)
-      if (seenMsgs.has(h)) return true                        // dedup (fan-out + relay ⇒ duplicates)
+  /**
+   * GRP-6: pull a sender key AT THE MOMENT WE FIND IT MISSING. Before this, `no-sender-key` was a
+   * dead end — the message was dropped and nothing was ever asked for, so the warning repeated
+   * forever. The KEYREQ rides the existing pairwise link (toMember prefers a live peer), which is the
+   * only leg guaranteed to work when the sender is a browser that cannot dial back.
+   */
+  function requestKey(S) {
+    if (pulling.has(S) || recvChains.has(S) || S === me) return
+    pulling.add(S)
+    toMember(S, encodeEnv(T.KEYREQ, groupId, { s: me, ...myPub() }))
+      .catch(() => { pulling.delete(S) })                     // unreachable right now — retry on the next gap
+  }
 
-      const r = recvChains.get(S)
-      if (!r) { emit('divergence', { reason: 'no-sender-key', by: S }); return true }
-      const mk = keyForSeq(r, body.q)
-      if (!mk) { emit('divergence', { reason: 'ratchet', by: S }); return true }
+  /** A group MESSAGE: verify authorship, decrypt under the sender's ratchet, deliver causally. */
+  function onMsg(body) {
+    const S = String(body.s).toUpperCase()
+    const { members } = membership()
+    if (!members.has(S)) { emit('divergence', { reason: 'msg-nonmember', by: S }); return true }
 
-      let plain
-      try {
-        plain = aeadDec(mk, body.q, Buffer.concat([groupId, utf8(S), Buffer.from(String(body.q))]), unb64(body.c))
-      } catch (error) { emit('divergence', { reason: 'group-decrypt', by: S, error }); return true }
-
-      seenMsgs.add(h)
-      const msg = { from: S, data: plain, hash: h, parents: body.p || [] }
-      deliverCausally(msg)
+    // A message from a member whose keydist never landed: we know they're in the group (the signed
+    // chain says so) but we hold neither their pubkeys nor their sender key. HOLD the message and ASK
+    // — do not drop it and warn into the void.
+    const id = idOf.get(S)
+    if (!id) {
+      emit('divergence', { reason: 'msg-unknown-identity', by: S })
+      hold(S, body); requestKey(S)
       return true
     }
+
+    const canon = utf8([gidHex, S, body.q, body.c, (body.p || []).join(',')].join('|'))
+    if (!verifyEd(id.edPub, canon, unb64(body.g))) { emit('divergence', { reason: 'msg-signature', by: S }); return true }
+
+    const h = sha256(canon, unb64(body.g)).toString('hex').slice(0, 32)
+    if (seenMsgs.has(h)) return true                          // dedup (fan-out + relay ⇒ duplicates)
+
+    const r = recvChains.get(S)
+    if (!r) {
+      emit('divergence', { reason: 'no-sender-key', by: S })
+      hold(S, body); requestKey(S)                            // …and now it self-heals instead of warning forever
+      return true
+    }
+    const mk = keyForSeq(r, body.q)
+    if (!mk) { emit('divergence', { reason: 'ratchet', by: S }); return true }
+
+    let plain
+    try {
+      plain = aeadDec(mk, body.q, Buffer.concat([groupId, utf8(S), Buffer.from(String(body.q))]), unb64(body.c))
+    } catch (error) { emit('divergence', { reason: 'group-decrypt', by: S, error }); return true }
+
+    seenMsgs.add(h)
+    deliverCausally({ from: S, data: plain, hash: h, parents: body.p || [] })
     return true
+  }
+
+  /** Hold an undecryptable message until its sender's key arrives. Bounded per sender. */
+  function hold(S, body) {
+    const q = stash.get(S) || []
+    if (q.length >= MAX_STASH) return                         // never unbounded — a peer must not grow our heap
+    q.push(body)
+    stash.set(S, q)
   }
 
   /** Causal (DAG) order: hold a message until every parent it named has been delivered. */
