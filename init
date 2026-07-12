@@ -19,9 +19,24 @@
 set -e
 
 # ── config (override via env) ───────────────────────────────────────────────────
-# PRODUCTION DEFAULT: the GitHub tarball of the p2p repo. `P2P_SRC` may also be a
-# local directory (used by the installer's own tests: P2P_SRC=/path/to/repo sh ./init).
-P2P_SRC="${P2P_SRC:-https://github.com/fire17/p2p/archive/refs/heads/main.tar.gz}"
+# PRODUCTION DEFAULT: a PINNED release of the p2p repo (an immutable tag — NEVER the
+# floating `main` branch). The source archive is fetched as a release asset and
+# SHA256-verified against its SHASUMS256.txt manifest BEFORE extraction (fail CLOSED),
+# exactly the way the node runtime is already verified — the protocol/crypto code
+# deserves at least the integrity the runtime gets. See docs/RELEASE-SIGNING.md.
+#   - Why not `main`: a moving branch means a compromised push, a malicious merged PR,
+#     or a MITM of the tarball would be executed with zero verification.
+#   - Why still "latest": the /init served from the site is regenerated to the newest
+#     release tag on every release, so `curl … | sh` still installs the latest version
+#     — a pinned, checksummed tag, not a moving branch.
+# Overrides (local testing / private forks):
+#   P2P_REF       release tag to install                 (default: the newest release)
+#   P2P_SRC       a local DIRECTORY (trusted, unverified — the installer's own tests),
+#                 OR a .tar.gz/.tgz URL (checksum-verified against P2P_SRC_SUMS).
+#   P2P_SRC_SUMS  URL/path of the SHASUMS256.txt covering the P2P_SRC archive.
+P2P_REF="${P2P_REF:-v0.2.0}"
+P2P_SRC="${P2P_SRC:-https://github.com/fire17/p2p/releases/download/$P2P_REF/p2p-$P2P_REF.tar.gz}"
+P2P_SRC_SUMS="${P2P_SRC_SUMS:-https://github.com/fire17/p2p/releases/download/$P2P_REF/SHASUMS256.txt}"
 NODE_DIST="${P2P_NODE_DIST:-https://nodejs.org/dist/latest-v22.x}"   # portable node source
 NODE_MIN=22
 P2P_HOME="${P2P_HOME:-$HOME/.p2p}"
@@ -129,6 +144,36 @@ sha256_of() {
   else echo ""; fi
 }
 
+# verify a downloaded SOURCE archive against its SHASUMS256.txt manifest. FAIL CLOSED —
+# die (never warn-and-proceed) on: no hash tool, no/empty manifest, no matching entry, or
+# a hash mismatch. Mirrors the node-runtime checksum path; see docs/RELEASE-SIGNING.md.
+# NOTE: a same-repo checksum only stops a tampered *download* (MITM / a bad mirror). It
+# does NOT stop an attacker who can rewrite the source repo itself (they rewrite the
+# manifest too) — for that, verify the manifest's signature (RELEASE-SIGNING.md).
+verify_source_archive() {
+  _arch="$1"
+  step "verify-source-checksum"
+  _got="$(sha256_of "$_arch")"
+  [ -n "$_got" ] || die "no sha256 tool (sha256sum/shasum/openssl) found — cannot verify the p2p source.
+  refusing to install an unverified source. install one of those tools and re-run,
+  or point P2P_SRC at a trusted local directory."
+  [ -n "$P2P_SRC_SUMS" ] || die "no source checksum manifest (P2P_SRC_SUMS is empty) — refusing to
+  install an unverified source archive. set P2P_SRC_SUMS to its SHASUMS256.txt,
+  or point P2P_SRC at a trusted local directory."
+  say "↓ verifying source integrity…"
+  fetch "$P2P_SRC_SUMS" "$TMPD/src.sums" 2>"$ERRFILE" || die "could not fetch the source checksum manifest: $P2P_SRC_SUMS"
+  _name="$(basename "$P2P_SRC")"
+  _want="$(grep -E "  $(printf '%s' "$_name" | sed 's/\./\\./g')\$" "$TMPD/src.sums" | awk '{print $1}' | head -n 1)"
+  [ -n "$_want" ] || die "the source manifest ($P2P_SRC_SUMS) has no SHA256 entry for '$_name'
+  — is it the right manifest for this archive?"
+  [ "$_got" = "$_want" ] || die "source checksum MISMATCH for $_name
+  expected $_want
+  got      $_got
+  the downloaded p2p source does not match its manifest — refusing to install."
+  say "  ✓ source sha256 verified  ·  $_name"
+  log "source sha256 OK: $_name = $_got"
+}
+
 # ── 1. node >= 22 ───────────────────────────────────────────────────────────────
 step "find-node"
 node_major() { "$1" -e 'process.stdout.write(String(process.versions.node.split(".")[0]))' 2>/dev/null || echo 0; }
@@ -167,17 +212,17 @@ else
   fetch "$NODE_DIST/$TARBALL" "$TMPD/$TARBALL" 2>"$ERRFILE" || die "download failed: $NODE_DIST/$TARBALL"
 
   step "node-verify-checksum"
+  # FAIL CLOSED: an unverified runtime is refused. A malicious node also "runs", so the
+  # run-check below is not a substitute for the hash (this closes the old fail-open path).
   GOT_SHA="$(sha256_of "$TMPD/$TARBALL")"
-  if [ -n "$GOT_SHA" ] && [ -n "$WANT_SHA" ]; then
-    [ "$GOT_SHA" = "$WANT_SHA" ] || die "checksum MISMATCH for $TARBALL
+  [ -n "$GOT_SHA" ] || die "no sha256 tool (sha256sum/shasum/openssl) found — cannot verify the node runtime.
+  refusing to run an unverified runtime. install one of those tools and re-run."
+  [ -n "$WANT_SHA" ] || die "nodejs.org SHASUMS256.txt has no hash for $TARBALL — cannot verify the download"
+  [ "$GOT_SHA" = "$WANT_SHA" ] || die "checksum MISMATCH for $TARBALL
   expected $WANT_SHA
   got      $GOT_SHA"
-    say "  ✓ sha256 verified"
-    log "sha256 OK"
-  else
-    log "WARN: no sha256 tool available — skipped checksum (will still verify node runs)"
-    say "  ! no sha256 tool found — skipping checksum (node will still be run-verified)"
-  fi
+  say "  ✓ sha256 verified"
+  log "sha256 OK"
 
   step "node-extract"
   rm -rf "$RUNTIME_DIR.new"
@@ -205,6 +250,9 @@ mkdir -p "$STAGE"
 case "$P2P_SRC" in
   /*|./*|../*)
     [ -d "$P2P_SRC" ] || die "P2P_SRC='$P2P_SRC' is not a directory"
+    # A local directory is an EXPLICIT operator choice (dev/test/private fork) — trusted,
+    # so no checksum is applied here. Only remote ARCHIVES are verified (below).
+    log "P2P_SRC is a local directory — trusted, no checksum verification"
     say "↓ copying p2p source from $P2P_SRC"
     # COPYFILE_DISABLE: stop macOS bsdtar emitting ._ AppleDouble/xattr noise
     ( COPYFILE_DISABLE=1; export COPYFILE_DISABLE; cd "$P2P_SRC" && tar -cf - --exclude .git --exclude node_modules --exclude scratch . ) 2>>"$LOG" \
@@ -216,6 +264,7 @@ case "$P2P_SRC" in
     log "source tarball: $P2P_SRC"
     fetch "$P2P_SRC" "$TMPD/src.tar.gz" 2>"$ERRFILE" || die "could not download the p2p source: $P2P_SRC
   (if the repo is private or not published yet, set P2P_SRC to a local path or another tarball URL)"
+    verify_source_archive "$TMPD/src.tar.gz"
     run tar -xzf "$TMPD/src.tar.gz" -C "$STAGE" --strip-components 1 || die "the downloaded source archive is not a valid .tar.gz"
     ;;
   *)

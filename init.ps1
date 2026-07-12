@@ -28,10 +28,23 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 # ── config (override via env) ───────────────────────────────────────────────────
-# PRODUCTION DEFAULT: the GitHub tarball of the p2p repo. P2P_SRC may also be a local
-# directory (used by the installer's own tests) or a .zip / .tar.gz URL.
-$SrcDefault = 'https://github.com/fire17/p2p/archive/refs/heads/main.zip'
+# PRODUCTION DEFAULT: a PINNED release of the p2p repo (an immutable tag — NEVER the
+# floating `main` branch). The source archive is fetched as a release asset and
+# SHA256-verified against its SHASUMS256.txt manifest BEFORE extraction (fail CLOSED),
+# exactly the way the node runtime is already verified. See docs/RELEASE-SIGNING.md.
+#   - Why not `main`: a moving branch means a compromised push or a MITM of the archive
+#     would be executed with zero verification.
+#   - Why still "latest": the /init.ps1 served from the site is regenerated to the newest
+#     release tag on every release, so `irm … | iex` still installs the latest version.
+# Overrides (local testing / private forks):
+#   P2P_REF       release tag to install                 (default: the newest release)
+#   P2P_SRC       a local DIRECTORY (trusted, unverified), OR a .zip/.tar.gz URL
+#                 (checksum-verified against P2P_SRC_SUMS).
+#   P2P_SRC_SUMS  URL/path of the SHASUMS256.txt covering the P2P_SRC archive.
+$Ref        = if ($env:P2P_REF) { $env:P2P_REF } else { 'v0.2.0' }
+$SrcDefault = "https://github.com/fire17/p2p/releases/download/$Ref/p2p-$Ref.zip"
 $Src        = if ($env:P2P_SRC) { $env:P2P_SRC } else { $SrcDefault }
+$Sums       = if ($env:P2P_SRC_SUMS) { $env:P2P_SRC_SUMS } else { "https://github.com/fire17/p2p/releases/download/$Ref/SHASUMS256.txt" }
 $NodeDist   = if ($env:P2P_NODE_DIST) { $env:P2P_NODE_DIST } else { 'https://nodejs.org/dist/latest-v22.x' }
 $NodeMin    = 22
 $UserHome   = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -102,6 +115,32 @@ try {
   function DownloadText([string]$url) {
     Log "GET $url"
     try { (Invoke-WebRequest -Uri $url -UseBasicParsing).Content } catch { throw "download failed: $url`n  $($_.Exception.Message)" }
+  }
+  # read a manifest from either a local path (tests/private forks) or an http(s) URL
+  function ReadOrDownload([string]$src) {
+    if (Test-Path -LiteralPath $src) { return (Get-Content -Raw -LiteralPath $src) }
+    return (DownloadText $src)
+  }
+  # verify a downloaded SOURCE archive against its SHASUMS256.txt manifest. FAIL CLOSED —
+  # Fail() (never warn-and-proceed) on: no/empty manifest, no matching entry, or a hash
+  # mismatch. Get-FileHash ships with PowerShell 5.1+, so (unlike the POSIX path) there is
+  # no "no hash tool" case on Windows. Mirrors the node path; see docs/RELEASE-SIGNING.md.
+  # NOTE: a same-repo checksum stops a tampered DOWNLOAD (MITM/bad mirror), not an attacker
+  # who can rewrite the repo itself (they rewrite the manifest too) — for that verify the
+  # manifest's signature (RELEASE-SIGNING.md).
+  function VerifySourceArchive([string]$archive) {
+    Step 'verify-source-checksum'
+    $got = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()
+    if (-not $Sums) { Fail "no source checksum manifest (P2P_SRC_SUMS is empty) — refusing to install an unverified source archive.`n  set P2P_SRC_SUMS to its SHASUMS256.txt, or point P2P_SRC at a trusted local directory." }
+    Say "v verifying source integrity..."
+    $sumsText = ReadOrDownload $Sums
+    $name = Split-Path -Leaf $Src
+    $line = ($sumsText -split "`n") | Where-Object { $_ -match ("\s+" + [Regex]::Escape($name) + "\s*$") } | Select-Object -First 1
+    if (-not $line) { Fail "the source manifest ($Sums) has no SHA256 entry for '$name' — is it the right manifest for this archive?" }
+    $want = (($line.Trim() -split '\s+')[0]).ToLower()
+    if ($got -ne $want) { Fail "source checksum MISMATCH for $name`n  expected $want`n  got      $got`n  the downloaded p2p source does not match its manifest — refusing to install." }
+    Say "  + source sha256 verified  ·  $name" 'Green'
+    Log "source sha256 OK: $name = $got"
   }
 
   # ── 1. node >= 22 ─────────────────────────────────────────────────────────────
@@ -188,6 +227,9 @@ try {
   New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
   if (Test-Path -LiteralPath $Src -PathType Container) {
+    # A local directory is an EXPLICIT operator choice (dev/test/private fork) — trusted,
+    # so no checksum is applied here. Only remote ARCHIVES are verified (below).
+    Log "P2P_SRC is a local directory — trusted, no checksum verification"
     Say "v copying p2p source from $Src"
     Get-ChildItem -LiteralPath $Src -Force |
       Where-Object { $_.Name -notin @('.git', 'node_modules', 'scratch') } |
@@ -196,6 +238,7 @@ try {
     Say "v downloading p2p source..."
     $srcZip = Join-Path $script:Tmp 'src.zip'
     Download $Src $srcZip
+    VerifySourceArchive $srcZip
     $exSrc = Join-Path $script:Tmp 'srcx'
     New-Item -ItemType Directory -Force -Path $exSrc | Out-Null
     try {
@@ -209,6 +252,7 @@ try {
     Say "v downloading p2p source..."
     $srcTgz = Join-Path $script:Tmp 'src.tar.gz'
     Download $Src $srcTgz
+    VerifySourceArchive $srcTgz
     # bsdtar ships with Windows 10 1803+ as tar.exe
     if (-not (Get-Command tar -ErrorAction SilentlyContinue)) { Fail "P2P_SRC is a .tar.gz but this Windows has no tar.exe — use the .zip URL instead" }
     & tar -xzf $srcTgz -C $stage --strip-components 1
