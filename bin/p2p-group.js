@@ -18,7 +18,7 @@ import readline from 'node:readline'
 import { randomBytes, createHash } from 'node:crypto'
 import { createSecureGroup } from '../src/group.js'
 import {
-  loadNode, loadOrCreateIdentity, decodeKey, TypoError,
+  loadNode, loadOrCreateIdentity, decodeKey, TypoError, drainBounded,
   bold, dim, red, green, cyan, yellow, magenta, peerLabel, shortId,
 } from './lib.js'
 
@@ -219,19 +219,34 @@ export async function groupMain(positional = [], o = {}) {
     rl.prompt()
   })
 
-  let closing = false
-  async function shutdown() {
-    if (closing) return
-    closing = true
-    try { await inflight } catch { /* */ }
-    console.log('\n' + dim('  closing…'))
+  // ── teardown: Ctrl-C must ALWAYS exit ────────────────────────────────────────
+  // peer.send() resolves ONLY on its ACK (src/node.js) — a send to a dead/hung peer NEVER settles.
+  // The old shutdown did an unbounded `await inflight` behind `if (closing) return`, so the first
+  // Ctrl-C hung in that await and the guard then swallowed every retry: an unkillable process. A
+  // GROUP makes it likelier still — group.send() fans out to every member, so ONE dead member is
+  // enough to trap the exit. Now the drain is BOUNDED, and a second Ctrl-C exits immediately.
+  let closing = false   // a graceful shutdown has begun
+  let exiting = false   // teardown is running — the first exit wins (rl.close() re-enters via 'close')
+  const finish = (code) => {
+    if (exiting) return // re-entered from the 'close' event below; let the in-flight exit stand
+    exiting = true
     try { node.close() } catch { /* */ }
     try { rl.close() } catch { /* */ }
-    process.exit(0)
+    try { process.stdin.setRawMode?.(false) } catch { /* */ } // readline raw-mode: hand back a sane shell
+    process.exit(code)
+  }
+  const shutdown = async () => {
+    if (closing) return finish(130) // a SECOND Ctrl-C: stop waiting for anything, get out now
+    closing = true
+    await drainBounded(inflight, 300) // let a landing ack finish — but NEVER hang on it
+    console.log('\n' + dim('  closing…'))
+    finish(0)
   }
   rl.on('SIGINT', shutdown)
   rl.on('close', () => { if (process.stdin.isTTY) shutdown() })
   process.on('SIGINT', shutdown)
+  process.on('SIGTERM', () => finish(143))
+  process.on('SIGHUP', () => finish(129))
 }
 
 // Runnable on its own (`node bin/p2p-group.js new KEY…`) as well as via `p2p group`.

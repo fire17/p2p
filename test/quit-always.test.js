@@ -32,9 +32,10 @@ const codeLines = (text) =>
     return t && !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*')
   })
 
-// The chat front-ends whose teardown this lane fixed. (bin/p2p-group.js is another lane's file and
-// still carries the unbounded drain at :226 — reported, not silently adopted here.)
-const FRONTENDS = ['p2p.js', 'p2p-tui.js', 'p2p-chat.js']
+// EVERY chat front-end. p2p-group.js was the fourth instance of the same bug — a group makes it
+// likelier still, since group.send() fans out to every member and one dead member is enough to trap
+// the exit. All four are now covered, so the hang cannot creep back into any of them.
+const FRONTENDS = ['p2p.js', 'p2p-tui.js', 'p2p-chat.js', 'p2p-group.js']
 
 // ── the property that makes the hang impossible ───────────────────────────────────────────────
 test('drainBounded: a never-settling send (dead peer) cannot trap the exit path', async () => {
@@ -68,4 +69,21 @@ test('p2p.js: teardown is re-entrancy safe (rl.close() fires "close" -> shutdown
   // finish() calls rl.close(), which synchronously emits 'close', whose handler calls shutdown()
   // again. Without an `exiting` latch that re-entry would hijack the graceful exit code.
   assert.match(src('p2p.js'), /if \(exiting\) return/, 'the first exit must win')
+})
+
+// p2p-group.js was the 4th instance and adopts the SAME teardown contract — hold it to the same bar,
+// not merely to "it calls drainBounded". (p2p-tui.js / p2p-chat.js reach the same guarantee through
+// their own teardown shapes, so these two are asserted per-file rather than across FRONTENDS.)
+test('p2p-group.js: a second Ctrl-C force-exits instead of being swallowed', () => {
+  const s = src('p2p-group.js')
+  assert.doesNotMatch(s, /if \(closing\) return;\s*closing = true/, 'the swallowing guard is back')
+  assert.match(s, /if \(closing\) return finish\(130\)/, 'a 2nd Ctrl-C must force-exit')
+})
+
+test('p2p-group.js: teardown is re-entrancy safe + releases the terminal', () => {
+  const s = src('p2p-group.js')
+  assert.match(s, /if \(exiting\) return/, 'the first exit must win')
+  assert.match(s, /setRawMode\?\.\(false\)/, 'readline raw mode must be handed back on exit')
+  assert.match(s, /process\.on\('SIGTERM'/, 'SIGTERM must force-exit')
+  assert.match(s, /process\.on\('SIGHUP'/, 'SIGHUP must force-exit')
 })
