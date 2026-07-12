@@ -24,7 +24,7 @@ import {
   loadNode, loadOrCreateIdentity, saveIdentity, generateIdentity, decodeKey, TypoError, doctor,
   bold, dim, red, green, cyan, yellow, magenta, peerLabel, shortId, idFilePath,
   loadFriends, addFriend, resolveFriend, peerKey,
-  mintInvite, parseShare, looksLikeShare, isOwnKey, OWN_KEY_MSG,
+  mintInvite, parseShare, looksLikeShare, isOwnKey, OWN_KEY_MSG, drainBounded,
 } from './lib.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -121,19 +121,34 @@ async function lineMode({ dialKey, ephemeral, profile, mintInviteMode = false })
     }
     rl.prompt()
   })
-  let closing = false
-  const shutdown = async () => {
-    if (closing) return; closing = true
-    try { await inflight } catch { /* */ }
-    console.log('\n' + dim('  closing…'))
+  // ── teardown: Ctrl-C must ALWAYS exit ────────────────────────────────────────
+  // peer.send() resolves ONLY on its ACK (src/node.js) — a send to a dead/hung peer NEVER settles.
+  // The old shutdown did an unbounded `await inflight` behind `if (closing) return`, so the first
+  // Ctrl-C hung in that await and the guard then swallowed every retry: an unkillable process.
+  // Now the drain is BOUNDED, and a second Ctrl-C exits immediately, waiting on nothing.
+  let closing = false   // a graceful shutdown has begun
+  let exiting = false   // teardown is running — the first exit wins (rl.close() re-enters via 'close')
+  const finish = (code) => {
+    if (exiting) return // re-entered from the 'close' event below; let the in-flight exit stand
+    exiting = true
     try { node.close() } catch { /* */ }
     try { rl.close() } catch { /* */ }
-    process.exit(0)
+    try { process.stdin.setRawMode?.(false) } catch { /* */ } // readline raw-mode: hand back a sane shell
+    process.exit(code)
+  }
+  const shutdown = async () => {
+    if (closing) return finish(130) // a SECOND Ctrl-C: stop waiting for anything, get out now
+    closing = true
+    await drainBounded(inflight, 300) // let a landing ack finish — but NEVER hang on it
+    console.log('\n' + dim('  closing…'))
+    finish(0)
   }
   const isDialer = !!dialKey
   rl.on('SIGINT', shutdown)
   rl.on('close', () => { if (isDialer || process.stdin.isTTY) shutdown() })
   process.on('SIGINT', shutdown)
+  process.on('SIGTERM', () => finish(143))
+  process.on('SIGHUP', () => finish(129))
 }
 
 // ── doctor ──────────────────────────────────────────────────────────────────────
