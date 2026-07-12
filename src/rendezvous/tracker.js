@@ -8,9 +8,12 @@ import crypto from 'node:crypto';
 
 // live-probed healthy 2026-07-11 (research/rendezvous.md appendix)
 export const TRACKERS = [
-  'wss://tracker.openwebtorrent.com',
+  // Pool vetted live 2026-07-12 (research/tracker-pool.md): openwebtorrent.com DROPPED — it answers
+  // announce (so naive liveness passes) but relays ZERO offers (a dead matchmaker), and it's a
+  // metadata liability for no benefit. ftorrent added as a working 3rd with independent ASN/operator.
   'wss://tracker.webtorrent.dev',
   'wss://tracker.btorrent.xyz',
+  'wss://open.ftorrent.com',
 ];
 
 // 20-char printable-ASCII id (avoids UTF-8 mangling of the JSON string on the wire)
