@@ -15,32 +15,56 @@
 // calls — test/tui-group.test.js drives THOSE, so the test proves the shipped path, not a copy.
 
 import readline from 'node:readline'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, createHash } from 'node:crypto'
 import { createSecureGroup } from '../src/group.js'
 import {
   loadNode, loadOrCreateIdentity, decodeKey, TypoError,
   bold, dim, red, green, cyan, yellow, magenta, peerLabel, shortId,
 } from './lib.js'
 
-// ── group code: base64 of the 32-byte group secret G (exactly what the browser shows/accepts) ──
+// ── the group CODE ────────────────────────────────────────────────────────────
+//
+//   CODE = base64( G(32B) ‖ SHA256(G)[0..3) )        — 35 bytes, 48 chars
+//
+// The 3-byte checksum exists to kill the GHOST GROUP: raw base64(G) has no redundancy, so a single
+// mistyped body character that happens to stay valid base64 decodes to a DIFFERENT G — hence a
+// different groupId — and the victim sees a cheerful "joined" while sitting alone in a group nobody
+// else is in, with no error, ever. A typo must fail LOUDLY at parse, not silently succeed into
+// nowhere. 3 bytes ⇒ a mistyped code slips through ~1 in 16.7M, and the code stays one short line.
+//
+// G itself is UNCHANGED (still the 32-byte group secret the protocol hashes into groupId), so this
+// is purely a transport encoding for humans — src/group.js is untouched.
+//
+// The browser mints and parses the SAME format with the SAME bytes (src/browser/app.js — its
+// node:crypto shim gives it the identical sync SHA-256), so a code minted in either client parses in
+// the other. That interop is the whole point; test/tui-group.test.js pins the checksum bytes.
 
-/** A fresh group code — 32 random bytes, base64. Treat it like a key: whoever holds it is in. */
-export const newGroupCode = () => randomBytes(32).toString('base64')
+const codeSum = (G) => createHash('sha256').update(G).digest().subarray(0, 3)
+
+/** Encode a 32-byte group secret G as the shareable CODE (G ‖ 3-byte checksum, base64). */
+export const encodeGroupCode = (G) => Buffer.concat([Buffer.from(G), codeSum(G)]).toString('base64')
+
+/** A fresh group code. Treat it like a key: whoever holds it is in. */
+export const newGroupCode = () => encodeGroupCode(randomBytes(32))
 
 /**
  * Validate a pasted group code and return the raw 32-byte secret G.
- * Strict: a truncated/typo'd code must fail LOUDLY here, not silently produce a different groupId
- * (which would look like "joined" while nobody can ever hear you).
+ * Every failure mode below is LOUD on purpose — a group code that "works" but points at a group
+ * nobody else is in is the worst outcome this CLI can produce.
  * @param {string} code
  * @returns {Buffer} G (32 bytes)
  */
 export function parseGroupCode(code) {
   const s = String(code || '').trim()
   if (!s) throw new TypoError('no group code given')
-  const G = Buffer.from(s, 'base64')
-  if (G.length !== 32) throw new TypoError(`bad group code (decodes to ${G.length} bytes, expected 32) — copy the whole code`)
-  if (G.toString('base64') !== s) throw new TypoError('bad group code (not valid base64) — copy it exactly, no spaces')
-  return G
+  const raw = Buffer.from(s, 'base64')
+  if (raw.length !== 35) throw new TypoError(`bad group code (decodes to ${raw.length} bytes, expected 35) — copy the whole code`)
+  if (raw.toString('base64') !== s) throw new TypoError('bad group code (not valid base64) — copy it exactly, no spaces')
+  const G = raw.subarray(0, 32)
+  if (!codeSum(G).equals(raw.subarray(32))) {
+    throw new TypoError('bad group code (checksum failed) — you likely mistyped or truncated it. Ask for the code again and paste it whole.')
+  }
+  return Buffer.from(G)
 }
 
 /**
@@ -167,7 +191,9 @@ export async function groupMain(positional = [], o = {}) {
   const command = async (text) => {
     const [cmd, arg] = text.split(/\s+/)
     if (cmd === '/quit' || cmd === '/exit') return shutdown()
-    if (cmd === '/code') return printLine(dim('  group code: ') + yellow(group.secret))
+    // `code`, never group.secret: group.js hands back the RAW base64 G (no checksum), which is not a
+    // shareable code any more — printing it would emit a string the other side now refuses at parse.
+    if (cmd === '/code') return printLine(dim('  group code: ') + yellow(code))
     if (cmd === '/members') {
       const m = group.members()
       return printLine(dim('  members (') + m.length + dim('): ') + m.map((k) => (k === id.S.toUpperCase() ? bold(cyan(shortId(k) + ' (you)')) : shortId(k))).join(dim(', ')) +
@@ -177,7 +203,7 @@ export async function groupMain(positional = [], o = {}) {
       const k = String(arg || '').trim().toUpperCase()
       try { decodeKey(k) } catch { return printLine(red('  ✗ usage: /add <26-char-key>')) }
       if (group.admin() !== id.S.toUpperCase()) return printLine(red('  ✗ only the group admin can add members'))
-      printLine(dim(`  adding ${shortId(k)}… — they must run: `) + bold('p2p group join ' + group.secret))
+      printLine(dim(`  adding ${shortId(k)}… — they must run: `) + bold('p2p group join ' + code))
       try { await group.add(k); printLine(green('  ✔ added ') + shortId(k)) }
       catch (e) { printLine(red('  ✗ add failed: ') + e.message) }
       return

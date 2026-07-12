@@ -3,6 +3,7 @@
 // One copy of this file runs everywhere — /app/index.html loads it by absolute path and its relative
 // imports resolve against /src/browser/.
 
+import { createHash } from 'node:crypto' // import-mapped to shim/node-crypto.js (app/index.html)
 import { identity, listIdentities, listen } from './p2p.js'
 
 const $ = (id) => document.getElementById(id)
@@ -80,21 +81,24 @@ function wirePeer(peer) {
 
 // ── group state ──
 let group = null
+let groupCode = null // the SHAREABLE code (G ‖ checksum) — NOT group.secret, which is the raw G
 function updateMembers() {
   if (!group) return
   const n = group.members().length
   $('groupMembers').textContent = n + (n === 1 ? ' member' : ' members')
 }
 function enableGroupChat(isAdmin) {
-  $('groupCode').textContent = group.secret
+  $('groupCode').textContent = groupCode
   $('groupCopy').disabled = false
   $('groupMsg').disabled = false
   $('groupSend').disabled = false
   $('addRow').hidden = !isAdmin // only the admin can grow the group later
   updateMembers()
 }
-async function startGroup(secret, { create = false, memberKeys = [] } = {}) {
-  if (!secret) return
+async function startGroup(code, { create = false, memberKeys = [] } = {}) {
+  if (!code) return
+  const secret = parseGroupCode(code) // throws on a typo — the caller reports it, never a ghost group
+  groupCode = code
   group = node.secureGroup({ secret, members: memberKeys, create })
   group.on('message', (from, data) => chatLine($('grouplog'), String(from).slice(0, 8), Buffer.from(data).toString('utf8'), { cls: 'grpmsg' }))
   group.on('membership', updateMembers)
@@ -121,10 +125,39 @@ async function startGroup(secret, { create = false, memberKeys = [] } = {}) {
   }
 }
 
-function newGroupSecret() {
+// ── the group CODE ──
+//
+//   CODE = base64( G(32B) ‖ SHA256(G)[0..3) )        — 35 bytes, 48 chars
+//
+// The 3-byte checksum kills the GHOST GROUP: raw base64(G) carries no redundancy, so one mistyped
+// character that stays valid base64 decodes to a DIFFERENT G — a different groupId — and the victim
+// gets a cheerful "Joined" while sitting alone in a group nobody else is in, forever, with no error.
+// A typo must fail LOUDLY here instead. G itself is unchanged (still the 32-byte group secret), so
+// group.js is untouched — this is only the human-facing encoding.
+//
+// bin/p2p-group.js mints and parses the SAME bytes (same sync SHA-256: node:crypto there, the
+// node-crypto shim here), so a code minted in the terminal joins here and vice-versa.
+const codeSum = (G) => createHash('sha256').update(G).digest().subarray(0, 3)
+
+function newGroupCode() {
   const b = new Uint8Array(32)
   globalThis.crypto.getRandomValues(b)
-  return Buffer.from(b).toString('base64')
+  const G = Buffer.from(b)
+  return Buffer.concat([G, codeSum(G)]).toString('base64')
+}
+
+/** Validate a pasted code → the raw 32-byte G. Throws (loudly) on anything but an exact code. */
+function parseGroupCode(code) {
+  const s = String(code || '').trim()
+  if (!s) throw new Error('no group code given')
+  const raw = Buffer.from(s, 'base64')
+  if (raw.length !== 35) throw new Error(`bad group code (decodes to ${raw.length} bytes, expected 35) — paste the whole code`)
+  if (raw.toString('base64') !== s) throw new Error('bad group code (not valid base64) — paste it exactly, no spaces')
+  const G = raw.subarray(0, 32)
+  if (!codeSum(G).equals(raw.subarray(32))) {
+    throw new Error('bad group code (checksum failed) — you likely mistyped or truncated it. Ask for the code again and paste it whole.')
+  }
+  return Buffer.from(G)
 }
 
 async function main() {
@@ -263,16 +296,18 @@ $('groupNew').onclick = async () => {
   const memberKeys = $('groupSeed').value.trim().toUpperCase().split(/[\s,]+/).filter((k) => k.length === 26)
   $('groupNew').disabled = true
   try {
-    await startGroup(newGroupSecret(), { create: true, memberKeys })
+    await startGroup(newGroupCode(), { create: true, memberKeys })
     if (memberKeys.length) gsay(`${memberKeys.length} member(s) listed — share the code so they can join.`)
     else gsay('Empty group created. Paste member keys before creating, or add them below once they\'re online.', 'sys')
   } catch (err) { gsay(`could not create the group: ${err.message}`, 'sys err'); $('groupNew').disabled = false }
 }
 $('groupJoin').onclick = async () => {
-  const secret = $('groupSecret').value.trim()
-  if (!secret) return
+  const code = $('groupSecret').value.trim()
+  if (!code) return
   $('groupJoin').disabled = true
-  try { await startGroup(secret, { create: false }) }
+  // A mistyped code now THROWS in startGroup (checksum) and lands here — loudly — instead of quietly
+  // "joining" a groupId nobody else shares.
+  try { await startGroup(code, { create: false }) }
   catch (err) { gsay(`could not join: ${err.message}`, 'sys err') }
   finally { $('groupJoin').disabled = false }
 }

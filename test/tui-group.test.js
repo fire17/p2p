@@ -10,8 +10,10 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { identity, listen } from '../src/node.js'
-import { newGroupCode, parseGroupCode, makeGroup } from '../bin/p2p-group.js'
+import { newGroupCode, parseGroupCode, encodeGroupCode, makeGroup } from '../bin/p2p-group.js'
 
 // ── in-memory switchboard ────────────────────────────────────────────────────────────────────
 function board() {
@@ -70,16 +72,91 @@ async function member({ id, node }, code, { create = false, members = [] } = {})
 }
 
 // ── the group code (what `p2p group new` prints and `p2p group join` takes) ───────────────────
-test('group code: fresh code is a 32-byte secret; a typo is refused LOUDLY', () => {
-  const code = newGroupCode()
-  assert.equal(parseGroupCode(code).length, 32, 'a fresh code must decode to the 32-byte group secret G')
-  assert.equal(parseGroupCode(code).toString('base64'), code, 'round-trip must be exact')
+// CODE = base64( G(32B) ‖ SHA256(G)[0..3) ). A deterministic vector keeps the mutation sweep below
+// flake-free: a random code could, with ~1-in-16.7M luck per mutation, collide on the checksum.
+const G_VEC = createHash('sha256').update('tui-group test vector').digest()   // 32 bytes, fixed
+const CODE_VEC = encodeGroupCode(G_VEC)
 
-  // A truncated/typo'd code must THROW — never silently yield a different groupId (which would look
-  // like "joined" while nobody can ever hear you).
+test('group code: a fresh code carries the 32-byte secret + a checksum; garbage is refused LOUDLY', () => {
+  const code = newGroupCode()
+  assert.equal(parseGroupCode(code).length, 32, 'a code must decode to the 32-byte group secret G')
+  assert.equal(encodeGroupCode(parseGroupCode(code)), code, 'encode/parse must round-trip exactly')
+  assert.equal(Buffer.from(code, 'base64').length, 35, 'the wire code is G(32) + a 3-byte checksum')
+
   assert.throws(() => parseGroupCode(code.slice(0, 20)), /bad group code/, 'truncated code must be refused')
   assert.throws(() => parseGroupCode(''), /no group code/, 'empty code must be refused')
   assert.throws(() => parseGroupCode('not a real code'), /bad group code/, 'garbage must be refused')
+})
+
+// ── the GHOST GROUP (the bug the checksum exists to kill) ─────────────────────────────────────
+// Before the checksum, the code was raw base64(G) with zero redundancy: one mistyped character that
+// still decoded gave a DIFFERENT G ⇒ a different groupId ⇒ the victim saw a cheerful "joined" while
+// sitting alone in a group nobody else was in — no error, ever. These are the exact probes the
+// red-team lane found (a middle-char typo and a last-char change both used to be ACCEPTED as a
+// different group). They must now THROW.
+test('ghost group: a mistyped code THROWS — it never silently becomes a different group', () => {
+  const mid = CODE_VEC.length >> 1
+  const midTypo = CODE_VEC.slice(0, mid) + (CODE_VEC[mid] === 'A' ? 'B' : 'A') + CODE_VEC.slice(mid + 1)
+  assert.notEqual(midTypo, CODE_VEC, 'the probe must really differ from the real code')
+  assert.throws(() => parseGroupCode(midTypo), /checksum failed|not valid base64|expected 35/,
+    'a MIDDLE-character typo must be refused, not accepted as a different group')
+
+  // last-char probe (redteam's 'w' -> 'A'): the final base64 char carries real bytes of G
+  const lastTypo = CODE_VEC.slice(0, -2) + (CODE_VEC.at(-2) === 'A' ? 'B' : 'A') + CODE_VEC.at(-1)
+  assert.notEqual(lastTypo, CODE_VEC, 'the probe must really differ from the real code')
+  assert.throws(() => parseGroupCode(lastTypo), /checksum failed|not valid base64|expected 35/,
+    'a LAST-character typo must be refused, not accepted as a different group')
+
+  // The strong form: EVERY single-character mutation of a real code is refused. Nothing slips.
+  const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+  let mutations = 0
+  const accepted = []
+  for (let i = 0; i < CODE_VEC.length; i++) {
+    for (const ch of ALPHABET) {
+      if (ch === CODE_VEC[i]) continue
+      const bad = CODE_VEC.slice(0, i) + ch + CODE_VEC.slice(i + 1)
+      mutations++
+      try { parseGroupCode(bad); accepted.push(bad) } catch { /* refused, as it must be */ }
+    }
+  }
+  assert.ok(mutations > 3000, `the sweep must be real (${mutations} mutations)`)
+  assert.deepEqual(accepted, [], `every single-char typo must be refused — ${accepted.length} slipped through`)
+})
+
+// ── browser <-> CLI: one format, byte-identical ───────────────────────────────────────────────
+// The interop is the whole point: a code minted in the browser must join from the terminal and vice
+// versa. app.js needs a DOM, so it cannot be imported here — instead this mirrors the browser's
+// algorithm EXACTLY as written in src/browser/app.js and asserts the bytes agree in both mint
+// directions, plus a source-level tripwire so the two copies cannot silently drift apart.
+test('browser<->CLI: the same code format, the same checksum bytes, both mint directions', () => {
+  // verbatim mirror of src/browser/app.js
+  const browserSum = (G) => createHash('sha256').update(G).digest().subarray(0, 3)
+  const browserMint = (G) => Buffer.concat([Buffer.from(G), browserSum(G)]).toString('base64')
+  const browserParse = (code) => {
+    const raw = Buffer.from(String(code).trim(), 'base64')
+    if (raw.length !== 35) throw new Error('bad group code')
+    const G = raw.subarray(0, 32)
+    if (!browserSum(G).equals(raw.subarray(32))) throw new Error('bad group code (checksum failed)')
+    return Buffer.from(G)
+  }
+
+  // CLI mints -> the browser parses it back to the SAME G (a terminal code joins in the browser)
+  const cliCode = newGroupCode()
+  assert.deepEqual(browserParse(cliCode), parseGroupCode(cliCode), 'browser must recover the CLI code\'s G')
+
+  // browser mints -> the CLI parses it back to the SAME G (a browser code joins in the terminal)
+  const browserCode = browserMint(G_VEC)
+  assert.equal(browserCode, CODE_VEC, 'both clients must mint the IDENTICAL code for the same G')
+  assert.deepEqual(parseGroupCode(browserCode), G_VEC, 'the CLI must recover the browser code\'s G')
+
+  // and the browser rejects a typo exactly like the CLI does
+  assert.throws(() => browserParse(CODE_VEC.slice(0, -2) + 'AA'), /bad group code/)
+
+  // drift tripwire: the browser's copy of the format must still BE this format.
+  const appjs = readFileSync(new URL('../src/browser/app.js', import.meta.url), 'utf8')
+  assert.match(appjs, /createHash\('sha256'\)\.update\(G\)\.digest\(\)\.subarray\(0, 3\)/, 'app.js must use the same 3-byte SHA-256 checksum')
+  assert.match(appjs, /raw\.length !== 35/, 'app.js must expect the same 35-byte code')
+  assert.match(appjs, /checksum failed/, 'app.js must refuse a bad checksum')
 })
 
 // ── the deliverable: create → share code → join → send → the other member receives it ─────────
