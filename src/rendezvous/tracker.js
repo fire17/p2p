@@ -87,37 +87,185 @@ export function trackerRelayProbe(url, infoHash = randId20(), { timeout = 15000 
   });
 }
 
+// ── live WSS matchmaker (v1.1, DESIGN D6 — trystero pattern, research/rendezvous.md §3) ────────
+// The tracker is a pure relay: it matches announcers under an infohash and forwards their
+// WebRTC offer/answer SDP blobs. We piggyback our candidate blob inside the SDP (an a=p2p-blob
+// line survives the tracker's opaque relay), keyed by a derived infohash. No WebRTC is actually
+// used — the tracker is just the signaling rendezvous.
+
+const NUMWANT = 10;
+const OFFERS_PER_ANNOUNCE = 4;   // each offer is single-use; a handful lets several dialers match
+const DEFAULT_INTERVAL_MS = 10000; // trystero cadence; offers expire ~120s so we refresh
+const RECONNECT_MS = 3000;
+const SDP_HEAD = 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n';
+
+/** Wrap a candidate blob in a minimal SDP so it relays cleanly through the tracker. */
+function packSdp(blob) {
+  const b64 = Buffer.from(JSON.stringify(blob), 'utf8').toString('base64');
+  return SDP_HEAD + 'a=p2p-blob:' + b64 + '\r\n';
+}
+/** Extract a candidate blob from an SDP produced by packSdp (null if absent/corrupt). */
+function unpackSdp(sdp) {
+  const m = typeof sdp === 'string' && /a=p2p-blob:([A-Za-z0-9+/=]+)/.exec(sdp);
+  if (!m) return null;
+  try { return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')); } catch { return null; }
+}
+/**
+ * Deterministic 20-char printable-ASCII infohash from a 20-byte rid. Both peers derive the same
+ * from the same rid; printable ASCII avoids the JSON UTF-8 mangling that a raw binary id suffers.
+ */
+export function infoHashFor(rid) {
+  if (!Buffer.isBuffer(rid) || rid.length < 20) throw new TypeError('rid must be a >=20-byte Buffer');
+  let s = '';
+  for (let i = 0; i < 20; i++) s += String.fromCharCode(0x21 + (rid[i] % 0x5d)); // 0x21..0x7d
+  return s;
+}
+
 /**
  * Uniform rendezvous-channel descriptor over WSS trackers — consumed by src/rendezvous/race.js
- * alongside createMdns/createDht. tracker carries the FULL candidate blob (DESIGN D6).
- * v1 = announce/echo only: the live offer-RELAY matchmaker (peer discovery via the tracker)
- * is P1 per D6, so lookup surfaces no peers yet — mDNS + DHT carry v1 discovery. Non-fatal.
+ * alongside createMdns/createDht. The tracker carries the FULL candidate blob (DESIGN D6) and is
+ * a LIVE matchmaker: a listener holds persistent connections and answers incoming offers, so a
+ * dialer that shows up later is matched (the tracker retains offers ~120s).
  * @param {object} [opts]
  * @param {string[]} [opts.trackers] tracker URLs (defaults to TRACKERS)
- * @param {(url:string, infoHash:string, o?:object)=>Promise<any>} [opts.probe] injectable (tests)
+ * @param {*} [opts.WebSocket] WebSocket constructor (defaults to global; injectable for tests)
+ * @param {() => number} [opts.now] clock (ms)
+ * @param {number} [opts.announceIntervalMs] re-announce cadence for persistent connections
  * @returns {{name:'tracker', ridLen:20, announce:Function, lookup:Function, close:Function}}
  */
 export function createTracker(opts = {}) {
   const trackers = opts.trackers || TRACKERS;
-  const probe = opts.probe || trackerProbe;
+  const WS = opts.WebSocket || (typeof WebSocket !== 'undefined' ? WebSocket : null);
+  const now = opts.now || (() => Date.now());
+  const intervalMs = opts.announceIntervalMs || DEFAULT_INTERVAL_MS;
+  const myId = randId20();
 
-  // info (full candidate blob) is accepted for forward-compat; v1 announce is an echo only,
-  // so the blob is parked until relay matchmaking lands (P1).
-  function announce(rid, _info) {
-    if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
-    const infoHash = rid.toString('hex'); // ASCII-safe over the tracker's JSON wire
-    Promise.resolve(probe(trackers[0], infoHash)).catch(() => {});
-    return { stop() {} };
+  const active = new Map(); // infoHash -> { blob, conns:[], stop }
+
+  function offersFor(blob) {
+    const sdp = packSdp(blob);
+    return Array.from({ length: OFFERS_PER_ANNOUNCE }, () => ({ offer_id: randId20(), offer: { type: 'offer', sdp } }));
+  }
+  function announceMsg(infoHash, blob) {
+    return { action: 'announce', info_hash: infoHash, peer_id: myId, numwant: NUMWANT, uploaded: 0, downloaded: 0, left: 0, offers: offersFor(blob) };
+  }
+  function answerMsg(infoHash, toPeerId, offerId, blob) {
+    return { action: 'announce', info_hash: infoHash, peer_id: myId, to_peer_id: toPeerId, offer_id: offerId, answer: { type: 'answer', sdp: packSdp(blob) } };
+  }
+  const send = (ws, obj) => { try { ws.send(JSON.stringify(obj)); } catch { /* not open */ } };
+
+  /**
+   * Open a WS to `url` for one infohash. Announces our offers (carrying getBlob()); on an incoming
+   * offer, surfaces the peer's blob AND answers back so they learn us; on an incoming answer,
+   * surfaces the peer's blob. `persistent` connections re-announce + reconnect.
+   */
+  function openConn(url, infoHash, getBlob, onPeerBlob, { persistent = false, signal } = {}) {
+    if (!WS) return { close() {} };
+    let ws, interval, reconnect, closed = false;
+    const clearTimers = () => { if (interval) clearInterval(interval); if (reconnect) clearTimeout(reconnect); };
+    const scheduleReconnect = () => {
+      if (closed || !persistent) return;
+      reconnect = setTimeout(start, RECONNECT_MS);
+      if (reconnect && reconnect.unref) reconnect.unref();
+    };
+    function start() {
+      if (closed) return;
+      try { ws = new WS(url); } catch { scheduleReconnect(); return; }
+      ws.onopen = () => {
+        send(ws, announceMsg(infoHash, getBlob()));
+        if (persistent) {
+          interval = setInterval(() => send(ws, announceMsg(infoHash, getBlob())), intervalMs);
+          if (interval && interval.unref) interval.unref();
+        }
+      };
+      ws.onmessage = (ev) => {
+        let m;
+        try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data?.toString?.() || ''); } catch { return; }
+        if (!m || m.peer_id === myId) return; // ignore our own echoes
+        if (m.offer && m.offer_id && m.peer_id) {
+          const blob = unpackSdp(m.offer.sdp);
+          if (blob) onPeerBlob(blob);
+          send(ws, answerMsg(infoHash, m.peer_id, m.offer_id, getBlob())); // let them learn us too
+        } else if (m.answer && m.peer_id) {
+          const blob = unpackSdp(m.answer.sdp);
+          if (blob) onPeerBlob(blob);
+        }
+      };
+      ws.onclose = () => { clearTimers(); scheduleReconnect(); };
+      ws.onerror = () => { try { ws.close(); } catch { /* */ } };
+    }
+    const close = () => { closed = true; clearTimers(); try { ws && ws.close(); } catch { /* */ } };
+    signal?.addEventListener('abort', close, { once: true });
+    start();
+    return { close };
   }
 
-  // ponytail: v1 tracker yields no peers — live offer relay (peer discovery) is P1 per D6.
-  async function* lookup(rid) {
+  /**
+   * Stay registered under the rid's infohash and answer offers (LIVE matchmaker). Idempotent per
+   * infohash — a re-announce just refreshes the blob on the existing connections.
+   * @param {Buffer} rid @param {object} [info] full candidate blob { candidates:[...] }
+   */
+  function announce(rid, info) {
     if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
-    // eslint-disable-next-line no-unreachable — intentional empty async generator (P1 relay pending)
-    return;
+    const infoHash = infoHashFor(rid);
+    const blob = { v: 1, ts: now(), candidates: (info && info.candidates) || [] };
+    const existing = active.get(infoHash);
+    if (existing) { existing.blob = blob; return { stop: existing.stop }; } // refresh, reuse conns
+    const state = { blob };
+    const conns = trackers.map((url) => openConn(url, infoHash, () => state.blob, () => {}, { persistent: true }));
+    const stop = () => { for (const c of conns) c.close(); active.delete(infoHash); };
+    state.conns = conns;
+    state.stop = stop;
+    active.set(infoHash, state);
+    return { stop };
   }
 
-  function close() { /* probes self-close their WebSocket; nothing persistent to tear down */ }
+  /**
+   * Find peers for a rid via the tracker: announce an offer, then yield the candidate blob from
+   * any incoming offer OR answer under the infohash. Ends on timeout/signal.
+   * @param {Buffer} rid
+   * @param {object} [lopts] @param {number} [lopts.timeout=8000] @param {AbortSignal} [lopts.signal]
+   * @returns {AsyncIterable<{candidates:object[], channel:'tracker', ts:number}>}
+   */
+  async function* lookup(rid, lopts = {}) {
+    if (!Buffer.isBuffer(rid)) throw new TypeError('rid must be a Buffer');
+    const infoHash = infoHashFor(rid);
+    const timeout = lopts.timeout ?? 8000;
+    const myBlob = { v: 1, ts: now(), candidates: [] }; // a dialer seeks; it shares no candidates here
+    const queue = [];
+    const seen = new Set();
+    let wake = null;
+    const bump = () => { if (wake) { const w = wake; wake = null; w(); } };
+    const onPeerBlob = (blob) => {
+      const key = JSON.stringify(blob.candidates || []);
+      if (seen.has(key)) return;
+      seen.add(key);
+      queue.push({ candidates: blob.candidates || [], channel: 'tracker', ts: blob.ts || now() });
+      bump();
+    };
+    const conns = trackers.map((url) => openConn(url, infoHash, () => myBlob, onPeerBlob, { persistent: false, signal: lopts.signal }));
+    let done = false;
+    // NOT unref'd: this timer terminates the stream (same rule as mdns.lookup)
+    const timer = setTimeout(() => { done = true; bump(); }, timeout);
+    const onAbort = () => { done = true; bump(); };
+    lopts.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      while (!done || queue.length) {
+        if (queue.length) { yield queue.shift(); continue; }
+        if (done) break;
+        await new Promise((r) => (wake = r));
+      }
+    } finally {
+      clearTimeout(timer);
+      lopts.signal?.removeEventListener('abort', onAbort);
+      for (const c of conns) c.close();
+    }
+  }
+
+  function close() {
+    for (const state of active.values()) for (const c of state.conns) c.close();
+    active.clear();
+  }
 
   return { name: 'tracker', ridLen: 20, announce, lookup, close };
 }

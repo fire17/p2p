@@ -35,14 +35,19 @@ const DESCRIPTOR_KEYS = ['announce', 'close', 'lookup', 'name', 'ridLen']
 
 function makeAll() {
   const dhtBackend = mockDht()
-  const probed = []
   return {
     dhtBackend,
-    probed,
     mdns: createMdns({ socketFactory: inertSocket }),
     dht: createDht({ dht: dhtBackend, now: () => 1000 }),
-    tracker: createTracker({ probe: (url, ih) => (probed.push({ url, ih }), Promise.resolve({ ok: true })), trackers: ['wss://x'] }),
+    tracker: createTracker({ WebSocket: InertWS, trackers: ['wss://mock'] }),
   }
+}
+
+// inert WebSocket: never opens/delivers → no real network; lookups just time out empty
+class InertWS {
+  constructor() { this.readyState = 0 }
+  send() {}
+  close() { this.readyState = 3 }
 }
 
 test('all three factories return the identical uniform descriptor shape', () => {
@@ -95,25 +100,20 @@ test('createDht: lookup yields nothing when no peers found', async () => {
   assert.equal(out.length, 0)
 })
 
-test('createTracker: announce echoes to tracker (hex info_hash); lookup empty in v1 (relay is P1)', async () => {
-  const probed = []
-  const tracker = createTracker({ probe: (url, ih) => (probed.push({ url, ih }), Promise.resolve({ ok: true })), trackers: ['wss://t'] })
+test('createTracker: announce returns {stop}; lookup is a bounded async iterable (matchmaker in tracker.test.js)', async () => {
+  const tracker = createTracker({ WebSocket: InertWS, trackers: ['wss://mock'] })
   const rid = Buffer.alloc(20, 0x5c)
-  tracker.announce(rid, { v: 1, candidates: [] })
-  await Promise.resolve() // let the fire-and-forget microtask run
-  assert.equal(probed.length, 1)
-  assert.equal(probed[0].url, 'wss://t')
-  assert.equal(probed[0].ih, rid.toString('hex'))
-
+  const h = tracker.announce(rid, { v: 1, candidates: [] })
+  assert.equal(typeof h.stop, 'function')
   const out = []
-  for await (const rec of tracker.lookup(rid)) out.push(rec)
-  assert.equal(out.length, 0)
+  for await (const rec of tracker.lookup(rid, { timeout: 60 })) out.push(rec)
+  assert.equal(out.length, 0) // inert WS never delivers → bounded empty
   tracker.close()
 })
 
 test('rid must be a Buffer across dht + tracker', () => {
   const dht = createDht({ dht: mockDht() })
-  const tracker = createTracker({ probe: () => Promise.resolve({}) })
+  const tracker = createTracker({ WebSocket: InertWS, trackers: ['wss://mock'] })
   assert.throws(() => dht.announce('nope', {}), TypeError)
   assert.throws(() => tracker.announce('nope'), TypeError)
   // lookup guards too (generator throws on first pull)
