@@ -18,6 +18,12 @@
 import { identity, listen } from '../src/node.js'
 import { createBrowserTransport } from '../src/browser/webrtc.js'
 
+import { skipLiveScript } from './live-gate.mjs'
+
+// `node --test` auto-runs this file (it executes every .js/.mjs under test/), and its DEFAULT mode is
+// `selftest` — two peers over the REAL public trackers + real ICE. Gate it; by hand it still works.
+if (skipLiveScript('werift-tui-e2e.mjs')) process.exit(0)
+
 const werift = await import('werift').catch(() => null)
 if (!werift) {
   // Not an error: werift is OPTIONAL by design (core package.json stays deps:{}). Skip cleanly.

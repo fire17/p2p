@@ -205,8 +205,13 @@ test('punch rejects when there are no candidates', async () => {
 
 test('punch falls back and rejects on an unreachable candidate within timeout', async () => {
   const ep = await createEndpoint({});
-  // 203.0.113.0/24 is TEST-NET-3 (RFC 5737) — guaranteed unroutable.
-  const dead = [{ proto: 'udp4', ip: '203.0.113.1', port: 9, kind: 'host' }];
+  // A CLOSED LOOPBACK PORT, not a TEST-NET-3 address. 203.0.113.0/24 is unroutable on the INTERNET,
+  // which is not the same as "no packet leaves this machine": the OS still pushed the ICE-lite UDP
+  // burst and a TCP-fallback SYN out the default gateway (observed live — a SYN_SENT to
+  // 203.0.113.1:9 from a plain `node --test`). The owner runs live p2p sessions on this box, so the
+  // suite must put NOTHING on the wire. 127.0.0.1:1 exercises the identical path — nothing validates,
+  // UDP times out, TCP fallback is refused, punch rejects — without emitting a single external byte.
+  const dead = [{ proto: 'udp4', ip: '127.0.0.1', port: 1, kind: 'host' }];
   await assert.rejects(() => ep.punch(dead, { token: 'x', timeout: 1200 }));
   ep.close();
 });

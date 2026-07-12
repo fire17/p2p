@@ -4,6 +4,7 @@
 // success rate + latency. Public-network dependent — flake is logged, not hidden.
 
 import { test } from 'node:test';
+import { liveOnly } from '../live-gate.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { DHT, BOOTSTRAP, deriveRid } from '../../src/rendezvous/dht.js';
@@ -19,7 +20,7 @@ test('deriveRid: deterministic, correct length, channel-separated', () => {
   assert.notDeepEqual(a, deriveRid(S, 'dht', '2026-07-12', 20)); // epoch-separated
 });
 
-test('bootstrap nodes are live (ping)', { timeout: 20000 }, async () => {
+test('bootstrap nodes are live (ping)', { ...liveOnly, timeout: 20000 }, async () => {
   const dht = new DHT();
   await dht.ready();
   let up = 0;
@@ -32,7 +33,7 @@ test('bootstrap nodes are live (ping)', { timeout: 20000 }, async () => {
   assert.ok(up >= 1, 'no DHT bootstrap node reachable — network/UDP blocked');
 });
 
-test('GATE: live announce -> get_peers round-trip on public Mainline DHT', { timeout: 300000 }, async () => {
+test('GATE: live announce -> get_peers round-trip on public Mainline DHT', { ...liveOnly, timeout: 300000 }, async () => {
   const TRIALS = 5;
   const A_RETRY = 2;  // owner re-announces (design: re-announce until it lands)
   const B_RETRY = 3;  // reader races/retries the read (design D6/§10)

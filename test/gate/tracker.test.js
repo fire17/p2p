@@ -1,9 +1,10 @@
 // Live WSS tracker reachability + message-format spike. Public-network dependent.
 import { test } from 'node:test';
+import { liveOnly } from '../live-gate.mjs';
 import assert from 'node:assert/strict';
 import { TRACKERS, trackerProbe, trackerRelayProbe, randId20 } from '../../src/rendezvous/tracker.js';
 
-test('WSS tracker reachability + announce/offer format', { timeout: 60000 }, async () => {
+test('WSS tracker reachability + announce/offer format', { ...liveOnly, timeout: 60000 }, async () => {
   const infoHash = randId20();
   const results = await Promise.all(TRACKERS.map((u) => trackerProbe(u, infoHash)));
   let up = 0;
@@ -15,7 +16,7 @@ test('WSS tracker reachability + announce/offer format', { timeout: 60000 }, asy
   assert.ok(up >= 1, 'no public WSS tracker reachable');
 });
 
-test('two-peer offer relay (matchmaker) — best-effort, non-fatal', { timeout: 15000 }, async () => {
+test('two-peer offer relay (matchmaker) — best-effort, non-fatal', { ...liveOnly, timeout: 15000 }, async () => {
   // Bonus probe only. Full offer/answer matchmaking is P1 (DESIGN D6); the spike gate
   // is reachability+format above. Single tracker, short window, never fails the suite.
   const r = await trackerRelayProbe(TRACKERS[0], randId20(), { timeout: 9000 });

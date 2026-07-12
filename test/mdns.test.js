@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { createMdns, _internals } from '../src/rendezvous/mdns.js'
+import { liveOnly } from './live-gate.mjs'
 import { createInvite, generateInviteSecret, SEALED_LEN } from '../src/invite.js'
 
 const { encodeQuery, encodeResponse, decode, encodeTxt, decodeTxt, encodeName, readName, SERVICE } = _internals
@@ -131,7 +132,7 @@ test('channel descriptor shape matches the uniform surface', () => {
 // caught BOTH: (1) dgram.createSocket('udp4', optsObj) dropping reuseAddr (2nd instance can't
 // bind 5353), and (2) missing setMulticastLoopback(true) (no same-host delivery). Uses REAL
 // multicast; skips (not fails) where the environment blocks it, so CI stays green everywhere.
-test('LIVE: two real-socket instances discover cross-instance over multicast', async (t) => {
+test('LIVE: two real-socket instances discover cross-instance over multicast', liveOnly, async (t) => {
   let a, b
   try {
     a = createMdns()

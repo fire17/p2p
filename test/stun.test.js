@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
 import { stun, stunAny, STUN_SERVERS } from '../src/transport.js';
+import { liveOnly } from './live-gate.mjs';
 
 const MAGIC = 0x2112a442;
 const MAGIC_BUF = Buffer.from([0x21, 0x12, 0xa4, 0x42]);
@@ -73,7 +74,7 @@ test('STUN request/response is txid-bound (wrong txid ignored -> timeout)', asyn
   }
 });
 
-test('LIVE: real public STUN returns a plausible public ip:port', async (t) => {
+test('LIVE: real public STUN returns a plausible public ip:port', liveOnly, async (t) => {
   let r;
   try {
     r = await stunAny(STUN_SERVERS, { timeoutMs: 3000 });
