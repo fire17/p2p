@@ -103,7 +103,7 @@
 </head>
 <body>
 <main>
-  <h1>p2p — browser chat <span style="font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:20px;padding:2px 9px;vertical-align:middle;letter-spacing:0;white-space:nowrap;">v0.3.0 · 2026-07-12</span></h1>
+  <h1>p2p — browser chat <span style="font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:20px;padding:2px 9px;vertical-align:middle;letter-spacing:0;white-space:nowrap;">v0.3.1 · 2026-07-12</span></h1>
   <div class="sub">No backend. No accounts. Same 26-char key & Noise IK handshake as the CLI — a browser and a terminal can chat.</div>
 
   <div id="status"><span class="dot" id="dot"></span><span id="statusText">booting…</span></div>
@@ -206,6 +206,10 @@
   </footer>
 </main>
 
+<!-- Loaded BEFORE the app, and deliberately NOT a module: if the module graph fails to load, nothing
+     inside it runs and this page would sit on "booting…" forever with the error only in the console.
+     boot-guard watches from the outside and replaces "booting…" with what actually went wrong. -->
+<script src="/app/boot-guard.js"></script>
 <script type="module" src="/src/browser/app.js"></script>
 </body>
 </html>

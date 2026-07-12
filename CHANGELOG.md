@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.1] — 2026-07-12
+
+### Fixed
+
+- **CRITICAL — the live site (p2p.akeyo.io) was broken for every cold-cache visitor.** GitHub Pages
+  runs Jekyll, which silently excludes `_`-prefixed files; four vendored crypto files
+  (`_md.js`, `_u64.js`, `_arx.js`, `_poly1305.js`) 404'd, so the ES-module graph failed to load and
+  the app never booted — it hung on "booting…" with no error. Fixed with a repo-root `.nojekyll`.
+  (Mobile was the first to hit it, having no warm cache; desktop was masked by cached assets.)
+- **Group self-heal hardened** — the KEYREQ pull is bounded (≤8 per gap) and the held-message stash
+  is bounded (16/sender, evict-oldest), so an unreachable, chatty member can't storm the network or
+  grow memory (fixes a self-heal storm in the 0.3.0 group delivery fix).
+
 ## [0.3.0] — 2026-07-12
 
 The reliability + hardening release. **Breaking protocol bump from 0.2.0** — the authenticated
