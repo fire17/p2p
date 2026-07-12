@@ -51,6 +51,14 @@ const RECONNECT_MS = 3000
 const ICE_GATHER_MS = 3000 // cap on waiting for ICE gathering (we ship what we have)
 const DIAL_TIMEOUT_MS = 30_000
 
+// BRW-4 (leak fix): a parked, unanswered offer holds a whole RTCPeerConnection (ICE agent + STUN
+// state). It was freed ONLY on dc.onopen or node.close() — so unanswered offers accumulated at
+// ~12 PCs/10s and eventually exhausted a long-lived listener (research/wargame-findings §10.3).
+// Bound BOTH how long one is parked and how many are parked at once.
+const OFFER_TTL_MS = 120_000 // reap a parked offer unanswered this long (== tracker offer-expiry, so nothing still-serveable is dropped)
+const CONNECT_TTL_MS = 30_000 // after an answer arrives, reap if the DataChannel never opens (ICE failed)
+const MAX_PENDING_OFFERS = 64 // hard cap on simultaneously-parked offers; oldest evicted first
+
 /** Wait for ICE gathering to finish (or the cap) — we send one complete SDP, no trickle. */
 function whenIceGathered(pc, capMs = ICE_GATHER_MS) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve()
@@ -82,11 +90,30 @@ const CHUNK_HDR = 8 // msgId(4) | index(2) | total(2)
 const CHUNK_MAX = 16000 // ≤16 KiB per DataChannel message
 const CHUNK_PAYLOAD = CHUNK_MAX - CHUNK_HDR
 const MAX_CHUNKS = 4096 // ≈64 MB ceiling per message — refuse anything larger (anti-OOM)
+// BRW-5: the reassembly buffer is keyed by a SENDER-chosen msgId and was never bounded — a peer with
+// an open channel (post-DTLS, pre-Noise) could stream endless partial messages (distinct ids) and
+// exhaust memory before Noise gates anything (research/wargame-findings §10.3). Cap the concurrent
+// partial count AND the total buffered bytes per channel; evict the oldest partials past the cap.
+// Real traffic never touches this path (node frames are ≤ mtu ⇒ single-chunk fast path); it only
+// bounds the >16 KiB / hostile case, so the caps sit far above any legitimate single message.
+const MAX_REASM_BYTES = 8 * 1024 * 1024 // total in-flight partial bytes per channel
+const MAX_REASM_ENTRIES = 256 // concurrent incomplete messages per channel
 
 export function socketFromChannel(dc, pc) {
   dc.binaryType = 'arraybuffer'
   let sendId = 0
   const reasm = new Map() // msgId -> { parts, have, total, len }
+  let reasmBytes = 0 // BRW-5: total payload bytes currently buffered across all partial reassemblies
+  /** Evict the oldest partial (never `exceptId`) to reclaim reasm memory; returns false if none. */
+  const evictOldestReasm = (exceptId) => {
+    for (const k of reasm.keys()) {
+      if (k === exceptId) continue
+      reasmBytes -= reasm.get(k).len
+      reasm.delete(k)
+      return true
+    }
+    return false
+  }
   const socket = {
     closed: false,
     rinfo: { address: 'webrtc', port: 0 }, // wire.js roams by connId, not by rinfo — this is inert
@@ -115,9 +142,11 @@ export function socketFromChannel(dc, pc) {
       if (socket.closed) return
       socket.closed = true
       reasm.clear()
+      reasmBytes = 0
       try { dc.close() } catch { /* */ }
       try { pc.close() } catch { /* */ }
     },
+    _debug: { reasmCount: () => reasm.size, reasmBytes: () => reasmBytes }, // BRW-5 leak-monitor hook
   }
   dc.onmessage = (ev) => {
     if (!socket.onMessage) return
@@ -136,13 +165,20 @@ export function socketFromChannel(dc, pc) {
     asm.parts[index] = payload
     asm.have++
     asm.len += payload.length
+    reasmBytes += payload.length
     if (asm.have === total) {
       reasm.delete(id)
+      reasmBytes -= asm.len
       const out = new Uint8Array(asm.len)
       let off = 0
       for (const p of asm.parts) { out.set(p, off); off += p.length }
       socket.onMessage(Buffer.from(out))
+      return
     }
+    // BRW-5: still incomplete — enforce the caps. Evict oldest OTHER partials first; if the current
+    // message alone blows the byte cap (only possible for an abusive >8 MB single message), drop it.
+    while ((reasmBytes > MAX_REASM_BYTES || reasm.size > MAX_REASM_ENTRIES) && evictOldestReasm(id)) { /* reclaim */ }
+    if (reasmBytes > MAX_REASM_BYTES) { reasmBytes -= asm.len; reasm.delete(id) }
   }
   dc.onclose = () => {
     socket.closed = true
@@ -161,6 +197,10 @@ export function createBrowserTransport(opts = {}) {
   const PC = opts.RTCPeerConnection || globalThis.RTCPeerConnection
   const WS = opts.WebSocket || globalThis.WebSocket
   const now = opts.now || (() => Date.now())
+  const offerTtlMs = opts.offerTtlMs || OFFER_TTL_MS
+  const connectTtlMs = opts.connectTtlMs || CONNECT_TTL_MS
+  const maxPendingOffers = opts.maxPendingOffers || MAX_PENDING_OFFERS
+  const announceIntervalMs = opts.announceIntervalMs || ANNOUNCE_INTERVAL_MS
   const myPeerId = randId20()
 
   if (!PC) throw new Error('this browser has no RTCPeerConnection — WebRTC is required')
@@ -176,6 +216,7 @@ export function createBrowserTransport(opts = {}) {
     live.add(pc)
     return pc
   }
+  const freePc = (pc) => { try { pc.close() } catch { /* */ } live.delete(pc) }
 
   /** Open (and keep) a tracker WebSocket, dispatching relayed offers/answers to `onMsg`. */
   function openTracker(url, { persistent, onOpen, onMsg, signal }) {
@@ -292,8 +333,7 @@ export function createBrowserTransport(opts = {}) {
               answer: { type: 'answer', sdp: pc.localDescription.sdp },
             })
           } catch (err) {
-            try { pc.close() } catch { /* */ }
-            live.delete(pc)
+            freePc(pc)
             if (!settled) console.warn('[p2p] failed to answer an offer:', err.message)
           }
         }
@@ -341,7 +381,16 @@ export function createBrowserTransport(opts = {}) {
    * @param {string} S our own contact string
    */
   function publishAll(S) {
-    const pending = new Map() // offer_id -> pc (a parked, unanswered offer)
+    const pending = new Map() // offer_id -> { pc, timer } (a parked, still-unanswered offer)
+
+    /** Reap a parked offer that was never answered (or whose answer never opened a channel). */
+    const evict = (offerId) => {
+      const e = pending.get(offerId)
+      if (!e) return
+      clearTimeout(e.timer)
+      pending.delete(offerId)
+      freePc(e.pc)
+    }
 
     /** Build one pc + its DataChannel + an SDP offer, ready to park on a tracker. */
     async function makeOffer() {
@@ -351,19 +400,27 @@ export function createBrowserTransport(opts = {}) {
       const dc = pc.createDataChannel('p2p', { ordered: true }) // reliable+ordered: SCTP does the ARQ
       const offerId = randId20()
       dc.onopen = () => {
-        pending.delete(offerId)
+        const e = pending.get(offerId)
+        if (e) { clearTimeout(e.timer); pending.delete(offerId) } // promoted to a live connection; keep pc in `live` (freed at node.close)
         if (onConnectionCb && !closed) onConnectionCb(socketFromChannel(dc, pc))
       }
       const offer = await pc.createOffer()
       await pc.setLocalDescription(offer)
       await whenIceGathered(pc)
-      pending.set(offerId, pc)
+      if (closed) { freePc(pc); return null } // transport torn down mid-offer — don't park a dead pc
+      // BRW-4: bound parked offers. Evict the oldest before parking a new one, and TTL-reap any that
+      // is never answered. `unref` so a parked offer never keeps a Node werift process alive.
+      while (pending.size >= maxPendingOffers) evict(pending.keys().next().value)
+      const timer = setTimeout(() => evict(offerId), offerTtlMs)
+      timer.unref?.()
+      pending.set(offerId, { pc, timer })
       return { offer_id: offerId, offer: { type: 'offer', sdp: pc.localDescription.sdp } }
     }
 
     const announce = async (ws, infoHash) => {
       try {
-        const offers = await Promise.all(Array.from({ length: OFFERS_PER_ANNOUNCE }, makeOffer))
+        const offers = (await Promise.all(Array.from({ length: OFFERS_PER_ANNOUNCE }, makeOffer))).filter(Boolean)
+        if (!offers.length) return
         send(ws, {
           action: 'announce',
           info_hash: infoHash,
@@ -390,14 +447,20 @@ export function createBrowserTransport(opts = {}) {
           onOpen: (ws) => {
             announce(ws, infoHash)
             clearInterval(timer)
-            timer = setInterval(() => announce(h.ws, infoHash), ANNOUNCE_INTERVAL_MS)
+            timer = setInterval(() => announce(h.ws, infoHash), announceIntervalMs)
           },
           onMsg: async (m) => {
             // Someone took one of our parked offers.
             if (m.answer && m.offer_id && pending.has(m.offer_id)) {
-              const pc = pending.get(m.offer_id)
+              const e = pending.get(m.offer_id)
+              // This offer is no longer "parked unanswered" — a real dialer answered. Swap the park-TTL
+              // for a shorter connect-TTL so a legit-but-slow answerer isn't reaped mid-ICE, yet a pc
+              // whose ICE never opens the channel is still reclaimed (no leak on a failed answer).
+              clearTimeout(e.timer)
+              e.timer = setTimeout(() => evict(m.offer_id), connectTtlMs)
+              e.timer.unref?.()
               try {
-                await pc.setRemoteDescription({ type: 'answer', sdp: m.answer.sdp })
+                await e.pc.setRemoteDescription({ type: 'answer', sdp: m.answer.sdp })
                 // -> ICE connects -> dc.onopen -> onConnectionCb (above)
               } catch (err) {
                 console.warn('[p2p] failed to accept an answer:', err.message)
@@ -414,7 +477,9 @@ export function createBrowserTransport(opts = {}) {
     return {
       stop() {
         for (const s of stops) s()
+        for (const offerId of [...pending.keys()]) evict(offerId) // free every parked offer on teardown
       },
+      pendingCount: () => pending.size, // BRW-4 leak-monitor hook (test/soak)
     }
   }
 
@@ -428,7 +493,14 @@ export function createBrowserTransport(opts = {}) {
     yield { channel: 'webrtc', s: S, ts: now() }
   }
 
-  return { endpoint, createEndpoint: async () => endpoint, publishAll, resolve, close: endpoint.close }
+  return {
+    endpoint,
+    createEndpoint: async () => endpoint,
+    publishAll,
+    resolve,
+    close: endpoint.close,
+    _debug: { liveCount: () => live.size }, // BRW-4 leak-monitor hook: owned RTCPeerConnections
+  }
 }
 
 export default { createBrowserTransport, ICE_SERVERS }

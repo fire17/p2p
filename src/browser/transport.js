@@ -17,6 +17,7 @@
 // hard-breaks on a churn in that file. If WSS loads, both race; if not, WebRTC alone still works.
 
 import { createBrowserTransport } from './webrtc.js'
+import { decodeFrame } from '../wire.js'
 
 /**
  * Compose several transport punches into ONE socket that races to first PEER CONTACT, not first
@@ -50,7 +51,11 @@ export function composePunch(attempts) {
     if (subs.includes(s)) return
     subs.push(s)
     s.onMessage = (buf, ri) => {
-      if (!outbound) outbound = s // first peer contact wins the outbound lock
+      // BRW-1: lock outbound only on a WELL-FORMED wire frame. The peer's real first contact is a full
+      // HELLO frame (≥ HEADER_LEN); a hostile relay injecting a runt/garbage byte no longer wins the
+      // lock and misroutes the handshake outbound. Inbound is ALWAYS forwarded up — node.js's own
+      // decodeFrame drops the junk, and only a validated frame flips the lock.
+      if (!outbound && decodeFrame(buf)) outbound = s // first REAL peer contact wins the outbound lock
       if (nodeHandler) nodeHandler(buf, ri)
     }
   }

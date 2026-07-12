@@ -39,6 +39,16 @@ const ENV_HDR = 1 + 16 + 8 // [1B ver][16B senderId][8B msgId]
 const NS = 'p2p1/'
 const DAY_MS = 86400000
 
+// DOS-1-WSS: the relay is a GUARANTEED on-path attacker — it can inject unlimited PUBLISHes with
+// fresh attacker-chosen 16-byte senderIds, each spawning a socketLike + (via onConnCb) a node
+// peer-record pre-auth. Bound the accepted set (cap + idle-evict) and rate-limit new accepts so a
+// flood cannot grow `accepted` — or the node records it triggers — without bound (wargame §10.3).
+const MAX_ACCEPTED = 1024     // cap concurrently-tracked inbound peers
+const ACCEPT_IDLE_MS = 60_000 // idle-evict an accepted socket silent this long
+const ACCEPT_RATE = 20        // sustained new-accept rate (per second, token-bucket refill)
+const ACCEPT_BURST = 40       // burst cap on new accepts
+const IDLE_SWEEP_MS = 30_000  // idle-sweep cadence
+
 const rnd = (n) => { const b = new Uint8Array(n); globalThis.crypto.getRandomValues(b); return b }
 const hex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('')
 
@@ -160,7 +170,11 @@ function relayConn(url, WS, onPublish) {
  * @param {*} [opts.WebSocket]     WebSocket ctor (default: global). Injectable for tests.
  * @param {()=>number} [opts.now]  clock
  */
-export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = globalThis.WebSocket, now = () => Date.now() } = {}) {
+export function createEndpoint({
+  S = null, relays = RELAYS, WebSocket: WS = globalThis.WebSocket, now = () => Date.now(),
+  maxAccepted = MAX_ACCEPTED, acceptIdleMs = ACCEPT_IDLE_MS, acceptRate = ACCEPT_RATE,
+  acceptBurst = ACCEPT_BURST, idleSweepMs = IDLE_SWEEP_MS,
+} = {}) {
   if (!WS) throw new Error('transport-wss: no WebSocket (need Node >= 22 or a browser)')
 
   const myId = rnd(16)                  // sender id for sockets we ACCEPT
@@ -176,6 +190,36 @@ export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = glob
     return false
   }
 
+  // ── DOS-1-WSS accept guards ───────────────────────────────────────────────────────────────
+  let tokens = acceptBurst, lastRefill = now()
+  const allowNewAccept = () => {                              // token bucket over new-sender accepts
+    const t = now()
+    tokens = Math.min(acceptBurst, tokens + ((t - lastRefill) / 1000) * acceptRate)
+    lastRefill = t
+    if (tokens < 1) return false
+    tokens -= 1
+    return true
+  }
+  const evictAccept = (sender) => {
+    const s = accepted.get(sender)
+    if (!s) return
+    accepted.delete(sender)
+    try { s.close() } catch { /* */ }
+  }
+  const evictMostIdle = () => {                               // shed the stalest inbound to admit a newcomer
+    let oldK = null, oldT = Infinity
+    for (const [k, s] of accepted) if (s.lastSeen < oldT) { oldT = s.lastSeen; oldK = k }
+    if (oldK == null) return false
+    evictAccept(oldK)
+    return true
+  }
+  const sweep = setInterval(() => {
+    const t = now(), stale = []
+    for (const [k, s] of accepted) if (t - s.lastSeen > acceptIdleMs) stale.push(k)
+    for (const k of stale) evictAccept(k)
+  }, idleSweepMs)
+  sweep.unref?.()
+
   const inbound = (topic, payload) => {
     if (payload.length < ENV_HDR || payload[0] !== VER) return
     const sender = hex(payload.subarray(1, 17))
@@ -183,15 +227,18 @@ export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = glob
     const frame = Buffer.from(payload.subarray(ENV_HDR))
 
     const dial = dials.get(topic)                              // a reply to one of MY dials
-    if (dial) { dial._emit(frame, dial.rinfo); return }
+    if (dial) { dial.lastSeen = now(); dial._emit(frame, dial.rinfo); return }
 
     let sock = accepted.get(sender)                            // inbound first contact
     if (!sock) {
       if (!onConnCb) return                                    // not listening — drop
-      sock = socketLike(myId, NS + sender, sender)
+      if (!allowNewAccept()) return                            // rate-limit fresh senderIds
+      if (accepted.size >= maxAccepted && !evictMostIdle()) return   // full & all active — shed newcomer
+      sock = socketLike(myId, NS + sender, sender, () => accepted.delete(sender))
       accepted.set(sender, sock)
       onConnCb(sock)                                           // node.js installs .onMessage here
     }
+    sock.lastSeen = now()
     sock._emit(frame, sock.rinfo)
   }
 
@@ -213,7 +260,7 @@ export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = glob
    * @param {string} replyTopic    where our frames are published
    * @param {string} label         for rinfo/debug
    */
-  function socketLike(senderId, replyTopic, label) {
+  function socketLike(senderId, replyTopic, label, onClose) {
     let handler = () => {}
     let closed = false
     const rinfo = { address: 'wss:' + label.slice(0, 12), port: 0, family: 4 }
@@ -221,6 +268,7 @@ export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = glob
       proto: 'wss',
       remote: { ...rinfo },
       rinfo,
+      lastSeen: now(),                                         // DOS-1-WSS: idle-evict clock
       get closed() { return closed },
       set onMessage(fn) { handler = typeof fn === 'function' ? fn : (() => {}) },
       get onMessage() { return (cb) => { handler = typeof cb === 'function' ? cb : (() => {}) } },
@@ -234,13 +282,14 @@ export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = glob
         env.set(b, ENV_HDR)
         pubAll(replyTopic, env)
       },
-      close() { closed = true },
+      close() { if (closed) return; closed = true; try { onClose?.() } catch { /* */ } }, // deferred map-cleanup
       _emit(frame, ri) { try { handler(frame, ri) } catch { /* consumer threw */ } },
     }
   }
 
   return {
     topics,
+    _debug: { acceptedCount: () => accepted.size, dialsCount: () => dials.size }, // DOS-1-WSS leak-monitor hook
     candidates() { return S ? [{ proto: 'wss', topic: topicFor(S, epochStr(now())), relays }] : [] },
     async stun() { return { ip: 'wss', port: 0 } },             // the relay IS the reflexive address
     onConnection(cb) { onConnCb = cb },
@@ -257,7 +306,7 @@ export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = glob
       if (!c) throw new Error('transport-wss: no wss candidate ({proto:"wss", topic} required)')
       const dialId = rnd(16)                                   // this dial's private reply address
       const myDialTopic = NS + hex(dialId)
-      const sock = socketLike(dialId, c.topic, hex(dialId))
+      const sock = socketLike(dialId, c.topic, hex(dialId), () => dials.delete(myDialTopic)) // no dial-map leak
       dials.set(myDialTopic, sock)
       // Await the FIRST broker's SUBACK before making any noise: the listener answers a knock with
       // a HELLO that node.js retransmits for only ~2s, so our reply topic must already be live.
@@ -288,6 +337,7 @@ export function createEndpoint({ S = null, relays = RELAYS, WebSocket: WS = glob
     },
 
     close() {
+      clearInterval(sweep)
       for (const c of conns) c.close()
       for (const s of [...accepted.values(), ...dials.values()]) s.close()
     },
