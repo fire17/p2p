@@ -216,6 +216,78 @@ test('the owner\'s warning: a missed keydist + a later message must trigger a KE
   A.node.close(); C.node.close()
 })
 
+// ── the self-heal must not become its own DOS ─────────────────────────────────────────────────
+// A member whose key never lands is exactly the case the stash + KEYREQ pull exist for — so it is
+// also the case an attacker (or a merely chatty, unreachable peer) would aim at them. Both are
+// BOUNDED: held messages are capped per sender and evicted oldest-first, and one missing key costs a
+// bounded number of KEYREQs — never one per dropped message.
+const GMAGIC = 0x67
+const T_KEYDIST = 1
+const T_KEYREQ = 5
+const isType = (b, t) => Buffer.isBuffer(b) && b.length > 1 && b[0] === GMAGIC && b[1] === t
+
+/** Wrap every peer this node sends through — to silently DROP frames, or merely count them. */
+function interceptSends(node, fn) {
+  const realPeers = node.peers.bind(node)
+  const realConnect = node.connect.bind(node)
+  const wrap = (p) => new Proxy(p, {
+    get(t, k) {
+      if (k === 'send') return (buf) => (fn(buf) === false ? Promise.resolve(0) : t.send(buf)) // false ⇒ swallow
+      const v = t[k]
+      return typeof v === 'function' ? v.bind(t) : v
+    },
+  })
+  node.peers = () => realPeers().map(wrap)
+  node.connect = async (s) => wrap(await realConnect(s))
+}
+
+test('bounded self-heal: a flood from an un-keyed member cannot grow the heap or storm KEYREQs', async () => {
+  const bd = board()
+  const A = await mkNode(bd)
+  const D = await mkNode(bd)
+
+  // D's KEYDIST frames never make it onto the wire — the pathological case the stash+pull exist for:
+  // its messages arrive, its key never does, and (because the send "succeeds") it never re-sends.
+  let dropKeys = true
+  interceptSends(D.node, (buf) => !(dropKeys && isType(buf, T_KEYDIST)))
+  let keyreqs = 0                                            // every KEYREQ the admin puts on the wire
+  interceptSends(A.node, (buf) => { if (isType(buf, T_KEYREQ)) keyreqs++; return true })
+
+  const G = randomBytes(32)
+  const a = member(A, G, { create: true, members: [D.id.S] })
+  const d = member(D, G)
+  await a.g.join(); await d.g.join()
+  await wait(800)
+
+  const FLOOD = 60                                           // every one of these is undecryptable for A
+  for (let i = 0; i < FLOOD; i++) await d.g.send(`flood ${i}`)
+  await wait(1200)
+
+  assert.equal(a.rx.length, 0, 'the admin genuinely holds no key for D (the scenario is real)')
+  // D's pubkeys ride its KEYDIST too, so with that frame dropped the admin cannot even bind D's
+  // identity — the gap surfaces as msg-unknown-identity rather than no-sender-key. Either way it is
+  // the same hole (we cannot read D), and both branches hold the message and pull the key.
+  const gap = a.warnings.filter((w) => w === 'no-sender-key' || w === 'msg-unknown-identity').length
+  assert.ok(gap > 0, `the gap really was observed — warnings: ${[...new Set(a.warnings)].join(', ') || '(none)'}`)
+
+  // BOUND 1 — no KEYREQ storm: one missing key costs a bounded number of requests, NOT one per
+  // dropped message (each failed pull clears `pulling`, so without the cap every message re-asks).
+  assert.ok(keyreqs > 0 && keyreqs <= 8,
+    `a missing key must cost ≤8 KEYREQs, not one per message — sent ${keyreqs} for ${FLOOD} messages`)
+
+  // BOUND 2 — the heap is capped. Let D's key through and rotate: the admin replays what it HELD.
+  // Those messages are from D's OLD chain, so each replay fails to decrypt — which makes the number
+  // of held messages directly observable. Uncapped it would be 60; capped (evicting oldest) it is 16.
+  dropKeys = false                                           // stop dropping (toggle, not a re-wrap)
+  a.warnings.length = 0
+  await d.g.rotate()
+  await wait(1200)
+  assert.equal(a.warnings.filter((w) => w === 'group-decrypt').length, 16,
+    `the admin must hold at most MAX_STASH(16) messages per sender — replayed ${a.warnings.filter((w) => w === 'group-decrypt').length}`)
+
+  A.node.close(); D.node.close()
+})
+
 // ── 10/10: the one-way member is heard on every one of ten independent runs ───────────────────
 test('10/10: the cannot-dial-back member round-trips on every one of ten runs', async () => {
   for (let i = 0; i < 10; i++) {

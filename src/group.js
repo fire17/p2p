@@ -281,10 +281,15 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
   const pulling = new Set()         // members I have an outstanding KEYREQ to (bounds pull amplification)
   const stash = new Map()           // S -> [body]  MSGs held because their sender's key hasn't landed yet
   const earlyKeys = new Map()       // S -> body    a VERIFIED keydist that outran the op that adds S
+  const keyReqs = new Map()         // S -> count   KEYREQs spent on S (bounds the pull, see requestKey)
   let joined = false
 
-  const MAX_STASH = 32              // per sender; a peer must never be able to grow our heap without bound
-  const MAX_EARLY = 64
+  // Every hold below is BOUNDED by design: a peer that never sends its key — or an attacker aiming a
+  // flood at exactly this path — must not be able to grow our heap or make us spray the network.
+  const MAX_STASH = 16              // held messages per sender; oldest evicted (newest are the ones a
+  //                                   later chain key can actually still decrypt — see applyKeydist)
+  const MAX_EARLY = 64              // verified-but-not-yet-applicable keydists, across all senders
+  const MAX_KEYREQ = 8              // KEYREQs we will ever spend chasing one sender's key
 
   const emit = (ev, ...a) => { for (const fn of handlers[ev] || []) { try { fn(...a) } catch { /* handler threw */ } } }
   const membership = () => foldMembership(ops)
@@ -507,6 +512,7 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     const q = body.q || 0
     recvChains.set(S, ratchet(unb64(body.ck), q))
     pulling.delete(S)                                         // GRP-4: the pull for S is satisfied
+    keyReqs.delete(S)                                         // gap closed — a LATER gap gets a fresh budget
     const held = stash.get(S)
     if (!held || !held.length) return
     stash.delete(S)
@@ -527,6 +533,13 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
    */
   function requestKey(S) {
     if (pulling.has(S) || recvChains.has(S) || S === me) return
+    // No KEYREQ storm: ONE missing key costs ONE request in flight, and at most MAX_KEYREQ over the
+    // life of the gap. Without the cap, a sender we cannot reach would make every dropped message
+    // fire a fresh request (toMember rejects ⇒ `pulling` clears ⇒ the next message asks again) —
+    // a chatty peer whose key never lands would have us spraying the network on its behalf.
+    const spent = keyReqs.get(S) || 0
+    if (spent >= MAX_KEYREQ) return                           // give up asking; the message stays held
+    keyReqs.set(S, spent + 1)
     pulling.add(S)
     toMember(S, encodeEnv(T.KEYREQ, groupId, { s: me, ...myPub() }))
       .catch(() => { pulling.delete(S) })                     // unreachable right now — retry on the next gap
@@ -573,10 +586,14 @@ export function createSecureGroup(node, identity, { secret, members: initial = [
     return true
   }
 
-  /** Hold an undecryptable message until its sender's key arrives. Bounded per sender. */
+  /**
+   * Hold an undecryptable message until its sender's key arrives. Bounded per sender, evicting the
+   * OLDEST: a chain key handed to us at seq q can only ever decrypt seq >= q, so the newest held
+   * messages are precisely the ones still worth keeping (applyKeydist).
+   */
   function hold(S, body) {
     const q = stash.get(S) || []
-    if (q.length >= MAX_STASH) return                         // never unbounded — a peer must not grow our heap
+    while (q.length >= MAX_STASH) q.shift()                   // evict oldest — the heap stays bounded
     q.push(body)
     stash.set(S, q)
   }
