@@ -79,6 +79,54 @@ export function saveIdentity(id, profile = 'default') {
 
 export const idFilePath = idFile
 
+// ── friends: everyone you've connected with, so you can reconnect later ───────
+// Stored at ~/.p2p/<profile>.friends.json — a small list keyed by the friend's 26-char
+// key (their public contact string). Populated automatically on every connection; never
+// clobbered on update (it lives beside the identity in ~/.p2p). No private data — just
+// public keys + a nickname + timestamps.
+const friendsFile = (profile = 'default') => join(P2P_DIR, `${profile}.friends.json`)
+
+export function loadFriends(profile = 'default') {
+  const file = friendsFile(profile)
+  if (!existsSync(file)) return []
+  try {
+    const list = JSON.parse(readFileSync(file, 'utf8'))
+    return Array.isArray(list) ? list : []
+  } catch { return [] }
+}
+
+// Record (or refresh) a friend by their key. Returns { friend, isNew }. Ignores our own key.
+export function addFriend(key, { nick, profile = 'default', selfKey } = {}) {
+  key = String(key || '').trim().toUpperCase()
+  if (key.length !== 26 || key === String(selfKey || '').toUpperCase()) return { friend: null, isNew: false }
+  const list = loadFriends(profile)
+  const now = Date.now()
+  let f = list.find((x) => x.key === key)
+  let isNew = false
+  if (f) { f.lastSeen = now; if (nick) f.nick = nick }
+  else { f = { key, nick: nick || shortId(key), firstSeen: now, lastSeen: now }; list.push(f); isNew = true }
+  try {
+    mkdirSync(P2P_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(friendsFile(profile), JSON.stringify(list, null, 2), { mode: 0o600 })
+  } catch { /* best-effort; a failed friends-write must never break a chat */ }
+  return { friend: f, isNew }
+}
+
+// Resolve a name-or-key to a friend's key: exact key, nick match, or short-id prefix.
+export function resolveFriend(nameOrKey, profile = 'default') {
+  const q = String(nameOrKey || '').trim()
+  if (q.length === 26) return q.toUpperCase()
+  const list = loadFriends(profile)
+  const byNick = list.find((f) => f.nick && f.nick.toLowerCase() === q.toLowerCase())
+  if (byNick) return byNick.key
+  const byShort = list.find((f) => f.key.toLowerCase().startsWith(q.toLowerCase()))
+  return byShort ? byShort.key : null
+}
+
+// The public key of a connected peer, for saving as a friend: peer.key (both sides, once
+// node.js exposes it) or peer.S (the dialer always has the key it dialed).
+export const peerKey = (peer) => (peer && (peer.key || peer.S)) || null
+
 // ── the real network backend ─────────────────────────────────────────────────
 export async function loadNode() {
   const mod = await import(new URL('../src/node.js', import.meta.url))

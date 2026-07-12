@@ -13,7 +13,7 @@
 import process from 'node:process'
 import {
   loadNode, loadOrCreateIdentity, decodeKey, TypoError,
-  peerLabel, shortId,
+  peerLabel, shortId, loadFriends, addFriend, resolveFriend, peerKey,
 } from './lib.js'
 
 const ESC = '\x1b['
@@ -178,15 +178,22 @@ function command(line) {
   const arg = rest.join(' ')
   switch (cmd) {
     case 'help': case '?':
-      add('sys', 'commands: /connect <key> · /key · /peers · /clear · /quit'); break
+      add('sys', 'commands: /connect <key|friend> · /friends · /key · /peers · /clear · /quit'); break
     case 'key':
       add('sys', 'your key (share it): ' + state.id.S); break
     case 'peers': {
       const ps = state.peers()
       add('sys', ps.length ? 'connected: ' + ps.map(peerLabel).join(', ') : 'no peers connected'); break
     }
+    case 'friends': case 'f': {
+      const list = loadFriends(state.profile).sort((a, b) => b.lastSeen - a.lastSeen)
+      if (!list.length) { add('sys', 'no friends yet — connect with someone and they\'re saved'); break }
+      add('sys', `friends (${list.length}): ` + list.map((f) => (f.nick || shortId(f.key))).join(', '))
+      add('sys', 'reconnect: /connect <name>')
+      break
+    }
     case 'connect': case 'c':
-      dial(arg); break
+      dial(resolveFriend(arg, state.profile) || arg); break
     case 'clear':
       state.msgs = []; render(); break
     case 'quit': case 'q': case 'exit':
@@ -242,13 +249,18 @@ async function main() {
     process.exit(1)
   }
 
+  state.profile = profile
   state.id = loadOrCreateIdentity({ ephemeral, profile })
   const mod = await loadNode()
   state.node = await mod.listen(state.id, {})
   state.peers = () => (state.node.peers ? state.node.peers() : [])
 
   state.node.on('message', (peer, data) => add('them', data.toString(), peerLabel(peer)))
-  state.node.on('peer', (peer) => { add('sys', `peer ${peerLabel(peer)} connected`); setStatus('online', 'ok') })
+  state.node.on('peer', (peer) => {
+    const { isNew } = addFriend(peerKey(peer), { selfKey: state.id.S, profile })
+    add('sys', `peer ${peerLabel(peer)} connected` + (isNew ? ' ✚ added to friends' : ''))
+    setStatus('online', 'ok')
+  })
   state.node.on('disconnect', (peer) => add('sys', `peer ${peerLabel(peer)} disconnected`))
 
   // screen setup

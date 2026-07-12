@@ -21,6 +21,7 @@ import readline from 'node:readline'
 import {
   loadNode, loadOrCreateIdentity, saveIdentity, generateIdentity, decodeKey, TypoError, doctor,
   bold, dim, red, green, cyan, yellow, magenta, peerLabel, shortId, idFilePath,
+  loadFriends, addFriend, resolveFriend, peerKey,
 } from './lib.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -58,7 +59,10 @@ async function lineMode({ dialKey, ephemeral, profile }) {
   }
   // attach network handlers up front so no incoming peer/message is missed
   node.on('message', (peer, data) => printLine(bold(magenta(peerLabel(peer) + ' › ')) + data.toString()))
-  node.on('peer', (peer) => printLine(dim('  · peer ' + peerLabel(peer) + ' connected')))
+  node.on('peer', (peer) => {
+    const { isNew } = addFriend(peerKey(peer), { selfKey: id.S, profile })
+    printLine(dim('  · peer ' + peerLabel(peer) + ' connected') + (isNew ? green('  ✚ added to friends') : ''))
+  })
   node.on('disconnect', (peer) => printLine(dim('  · peer ' + peerLabel(peer) + ' disconnected')))
 
   if (dialKey) {
@@ -135,7 +139,8 @@ const HELP = `${bold('p2p')} — MITM-proof, zero-dependency P2P chat
   ${bold('p2p tui')} [KEY]           full-screen TUI; optionally dial KEY on start
   ${bold('p2p chat')} [KEY]          line-mode chat (scriptable)
   ${bold('p2p listen')}              line-mode: go online, print your key, wait
-  ${bold('p2p connect')} <KEY>       line-mode: dial a 26-char key and chat
+  ${bold('p2p connect')} <KEY|name>  line-mode: dial a 26-char key or a saved friend
+  ${bold('p2p friends')}             list everyone you've connected with (reconnect by name)
   ${bold('p2p key')} [--new]         print your stable key (--new rotates it)
   ${bold('p2p doctor')}              check rendezvous reachability
   ${bold('p2p --selftest')}          two in-process nodes end-to-end
@@ -165,9 +170,21 @@ async function main() {
     case 'listen':
       return lineMode({ dialKey: null, ...o })
     case 'connect': case 'dial': {
-      const key = positional[1]
-      if (!key) { console.error(red('  usage: p2p connect <26-char-key>')); process.exit(2) }
+      const arg = positional[1]
+      if (!arg) { console.error(red('  usage: p2p connect <26-char-key | friend-name>')); process.exit(2) }
+      const key = resolveFriend(arg, o.profile) || arg // a saved friend's name/short-id, or a raw key
       return lineMode({ dialKey: key, ...o })
+    }
+    case 'friends': case 'f': {
+      const list = loadFriends(o.profile)
+      if (!list.length) { console.log(dim('\n  no friends yet — connect with someone and they\'re saved here.\n')); return }
+      console.log(bold('\n  your p2p friends') + dim(` (${list.length})`) + '\n')
+      for (const f of list.sort((a, b) => b.lastSeen - a.lastSeen)) {
+        const last = new Date(f.lastSeen).toISOString().slice(0, 16).replace('T', ' ')
+        console.log('  ' + bold(cyan((f.nick || shortId(f.key)).padEnd(14))) + dim(f.key) + dim('  last ' + last))
+      }
+      console.log(dim('\n  reconnect:  ') + bold('p2p connect <name>') + '\n')
+      return
     }
     case 'key': {
       const rotate = argv.includes('--new')
