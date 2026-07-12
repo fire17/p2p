@@ -151,6 +151,47 @@ export async function identity(opts = {}) {
 }
 
 /**
+ * ONE identity, ONE live tab — the "connected but no messages" bug, at its root.
+ *
+ * A tab with no `#id=` in its URL boots the DEFAULT slot (app.js), and the default slot is ONE
+ * IndexedDB record. So two ordinary tabs (a bookmark, a plain second tab, a reload of an old link)
+ * are not two peers — they are the SAME peer, holding the SAME static keypair. Both then subscribe
+ * the same rendezvous topic (it is HKDF(S,…)), both ACCEPT the same incoming dial, and both complete
+ * a genuine Noise IK — each really does hold the private key, so nothing in the protocol can tell
+ * them apart or refuse them. The dialer binds to whichever answered first; every other tab is left
+ * showing "✅ secure channel established" while receiving NOTHING, forever. Messages appear to be
+ * ~50% lost because they are landing in the other tab.
+ *
+ * The protocol cannot fix this (both peers are cryptographically legitimate), so the browser must:
+ * an identity may be ONLINE in exactly one tab. We hold a Web Lock named for S for the whole life of
+ * the node; a second tab finds it taken and refuses to go online with an actionable message instead
+ * of silently becoming a zombie. The lock is released automatically when a tab is closed or
+ * discarded, so nothing can wedge a user out of their own identity.
+ *
+ * Fails OPEN on purpose: where the Web Locks API is missing or errors, we go online as before. The
+ * guard exists to catch an honest footgun, and must never be the reason someone cannot get online.
+ *
+ * @param {string} S the contact string to claim
+ * @param {*} [locks] LockManager (default navigator.locks) — injectable for tests
+ * @returns {Promise<{held:boolean, release:() => void}>} held=false ⇒ already live in another tab
+ */
+export function claimIdentity(S, locks = globalThis.navigator?.locks) {
+  const free = { held: true, release: () => {} }
+  if (!locks || typeof locks.request !== 'function') return Promise.resolve(free)  // no Web Locks ⇒ fail open
+  let release = () => {}
+  const parked = new Promise((r) => { release = r })                               // resolves ⇒ lock let go
+  return new Promise((resolve) => {
+    try {
+      locks.request('p2p-live-' + S, { ifAvailable: true }, (lock) => {
+        if (!lock) { resolve({ held: false, release: () => {} }); return }          // someone else is online as S
+        resolve({ held: true, release })
+        return parked                                                               // hold it for the node's lifetime
+      }).catch(() => resolve(free))                                                 // rejected ⇒ fail open
+    } catch { resolve(free) }                                                       // threw synchronously ⇒ fail open
+  })
+}
+
+/**
  * Every identity this browser holds, for the UI's switcher. ponytail: read straight from the store.
  * @returns {Promise<Array<{slot:string, name:string, S:string}>>}
  */
@@ -181,6 +222,22 @@ export async function listen(id, opts = {}) {
     // WebCrypto's getRandomValues and IndexedDB need a secure context; so does honest security.
     throw new Error('p2p requires a secure context (https:// or localhost)')
   }
+  // ONE identity, ONE live tab — claimed BEFORE any socket is opened, so a refused tab leaves no
+  // trace on the network. Without this, a second tab on the same identity comes online, accepts the
+  // same dials, and silently swallows the messages meant for the first (see claimIdentity).
+  const lease = await claimIdentity(id.S)
+  if (!lease.held) {
+    // `reason` (not the prose) is the contract: app.js adopts a free slot when the tab landed on the
+    // DEFAULT identity implicitly, and shows this message when the user asked for that slot by name.
+    throw Object.assign(
+      new Error(
+        `this identity (${id.S}) is already online in another tab or window — two tabs sharing one `
+        + 'identity steal each other\'s messages, so this tab is staying offline. Close the other tab, '
+        + 'or click “＋ New identity” to chat as a second, separate peer.',
+      ),
+      { reason: 'identity-live', S: id.S },
+    )
+  }
   const t = await createRacedTransport(opts)
   // Pre-build the endpoint WITH our S (the WSS leg subscribes its own inbox at creation). Provide
   // it via BOTH opts.endpoint and a createEndpoint in deps: node.js's resolveDeps only skips the
@@ -210,6 +267,7 @@ export async function listen(id, opts = {}) {
   node.close = () => {
     try { close() } catch { /* */ }
     t.close()
+    lease.release()          // this identity is free to come online in another tab again
   }
 
   // Sender-keys secure group (src/group.js, browser-build's lane) — the browser runs it UNCHANGED

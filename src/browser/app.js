@@ -172,10 +172,11 @@ async function main() {
     // then treat whatever remains exactly as before.
     const rawHash = decodeURIComponent(location.hash.replace(/^#/, ''))
     let slot = 'default'
+    let slotWasAskedFor = false           // did the URL name this slot, or did we just default to it?
     const fragParts = []
     for (const seg of rawHash.split('&')) {
       const m = /^id=(.+)$/.exec(seg)
-      if (m) slot = sanitizeSlot(m[1])
+      if (m) { slot = sanitizeSlot(m[1]); slotWasAskedFor = true }
       else if (seg) fragParts.push(seg)
     }
     const frag = fragParts.join('&').trim()
@@ -194,7 +195,22 @@ async function main() {
     await refreshIdSwitcher(slot)
     status('going online…')
 
-    node = await listen(id)
+    try {
+      node = await listen(id)
+    } catch (err) {
+      // An identity may be ONLINE in only one tab (src/browser/p2p.js claimIdentity): two tabs on one
+      // identity both accept the same dials, and the loser sits there saying "connected" while every
+      // message lands in the other tab. A plain second tab lands on the DEFAULT slot without ever
+      // asking for it — so don't punish the user for that: silently become a SECOND PEER on the next
+      // free slot, which is what they wanted anyway. If they named the slot in the URL, they meant it:
+      // say what's wrong instead of moving them somewhere they didn't ask to be.
+      if (err.reason !== 'identity-live' || slotWasAskedFor) throw err
+      const next = await nextFreeSlot()
+      status('this identity is already open — starting a second identity…')
+      location.hash = 'id=' + next + (frag ? '&' + frag : '')   // keep any deep link across the reload
+      location.reload()
+      return
+    }
 
     node.on('peer', (peer) => {
       // We only reach here AFTER the Noise IK first-ack — the handshake has PROVEN there is no
@@ -238,15 +254,19 @@ $('idswitch').onchange = () => {
   location.hash = 'id=' + next
   location.reload()
 }
-// Mint a brand-new identity and open it in a NEW window — so you instantly have a second peer to chat
-// with. The new window boots on a fresh slot, which first-runs a new keypair (BRW-2-safe).
-$('newId').onclick = async () => {
+/** The first `id-N` slot this browser isn't already using. Shared by ＋New identity and auto-adopt. */
+async function nextFreeSlot() {
   const ids = await listIdentities().catch(() => [])
   const used = new Set(ids.map((i) => i.slot))
   let n = ids.length + 1
   let next = 'id-' + n
   while (used.has(next)) next = 'id-' + (++n)
-  window.open(location.pathname + '#id=' + next, '_blank')
+  return next
+}
+// Mint a brand-new identity and open it in a NEW window — so you instantly have a second peer to chat
+// with. The new window boots on a fresh slot, which first-runs a new keypair (BRW-2-safe).
+$('newId').onclick = async () => {
+  window.open(location.pathname + '#id=' + (await nextFreeSlot()), '_blank')
 }
 
 // ── pair handlers ──
