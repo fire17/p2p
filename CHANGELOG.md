@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.3] — 2026-07-13
+
+Internal reliability + safety hardening — no user-facing behavior change. Every fix gated.
+
+### Fixed
+
+- **Group self-heal is correctly bounded.** The KEYREQ pull now shares one budget across both pull
+  paths (was `1 + MAX` — two "bounded" paths whose sum wasn't), and a member that reconnects after
+  exhausting its budget is pulled again instead of being permanently given up on.
+- **One record per peer.** Dialing a peer that had already reached you inbound no longer opens a
+  duplicate connection / second Noise session (the two peer-table keyings are now bridged by the
+  key's commitment). Bonus: messages queued while a peer was down replay on reconnect.
+
+### Safety / tests
+
+- A **live-egress sweep** now fails the build if any test reaches the real network without a gate —
+  it caught two harnesses that were dialing public brokers on every run, "safe" only because a dev
+  dependency happened to be absent. Plus a first-run-mints regression test for the storage guard.
+
 ## [0.3.2] — 2026-07-12
 
 ### Added / Fixed
