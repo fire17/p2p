@@ -32,8 +32,12 @@ const run = (exe, args, env = {}, stdin = '', timeout = 55000) => new Promise((r
     for (const key of Object.keys(childEnv)) if (key.toUpperCase() === 'PSMODULEPATH') delete childEnv[key]
   }
   const child = spawn(exe, args, { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
-  let out = '', err = ''
-  const timer = setTimeout(() => { child.kill(); reject(new Error('join fixture timed out: ' + out + err)) }, timeout)
+  let out = '', err = '', processExit = null
+  child.once('exit', (code, signal) => { processExit = { code, signal } })
+  const timer = setTimeout(() => {
+    const state = { processExit, stdoutEnded: child.stdout.readableEnded, stderrEnded: child.stderr.readableEnded }
+    child.kill(); reject(new Error('join fixture timed out ' + JSON.stringify(state) + ': ' + out + err))
+  }, timeout)
   child.stdout.on('data', chunk => { out += chunk }); child.stderr.on('data', chunk => { err += chunk })
   child.once('error', error => { clearTimeout(timer); reject(error) })
   child.once('close', code => { clearTimeout(timer); resolve({ code, out, err }) })
@@ -172,7 +176,7 @@ for (const shell of shells) test(`join bootstrap ${shell.label}: HTTP integrity 
     const entryUrl = 'http://127.0.0.1:' + server.address().port + '/join/' + key + (shell.platform === 'ps1' ? '.ps1' : '')
     const invoke = async (script, extraEnv = {}, callerExit = null) => {
       servedScript = script
-      const expression = "try { irm '" + entryUrl + "' | iex } finally { if($env:P2P_REF -ne 'fixture-original') { throw 'Caller environment was not restored' } }"
+      const expression = "try { irm '" + entryUrl + "' | iex; Write-Output 'JOIN_FIXTURE_RETURNED' } finally { if($env:P2P_REF -ne 'fixture-original') { throw 'Caller environment was not restored' } }"
       const psCommand = callerExit === null ? '$PSNativeCommandUseErrorActionPreference=$true; ' + expression
         : 'function Invoke-JoinFixture { $LASTEXITCODE=' + callerExit + '; $PSNativeCommandUseErrorActionPreference=$false; try { ' + expression + ' } finally { Write-Output "CALLER_EXIT=$LASTEXITCODE GLOBAL_EXIT=$global:LASTEXITCODE" } }; Invoke-JoinFixture'
       const args = shell.platform === 'sh' ? ['-c', "curl -fsSL '" + entryUrl + "' | sh"]
