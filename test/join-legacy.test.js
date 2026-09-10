@@ -31,7 +31,11 @@ async function fixture(fn) {
   let key, name
   try {
     mkdirSync(join(home, 'app'), { recursive: true })
-    for (const entry of ['src', 'bin', 'package.json']) cpSync(join(root, entry), join(home, 'app', entry), { recursive: true })
+    // A filter bypasses Node22's silent Windows Unicode cpSync fast-path bug.
+    for (const entry of ['src', 'bin', 'package.json']) cpSync(join(root, entry), join(home, 'app', entry), { recursive: true, filter: () => true })
+    for (const file of ['src/key.js', 'bin/p2p.js', 'package.json']) {
+      assert.deepEqual(readFileSync(join(home, 'app', file)), readFileSync(join(root, file)), 'Installed legacy fixture bytes: ' + file)
+    }
     const listen = await command(host, ['listen', '--name', 'host', '--profile', 'legacy-fixture-host'])
     assert.equal(listen.code, 0, listen.out + listen.err)
     key = (await state(host, 'host')).self; name = 'join-' + key

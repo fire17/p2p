@@ -45,26 +45,28 @@ const status = async (home, name) => {
   assert.equal(result.code, 0, result.out + result.err)
   return JSON.parse(result.out)
 }
-function installFixture(home, aliasHome) {
+function installFixture(home, physicalHome) {
   mkdirSync(join(home, 'app'), { recursive: true })
-  for (const entry of ['src', 'bin', 'package.json']) cpSync(join(root, entry), join(home, 'app', entry), { recursive: true })
+  // Node22's native cpSync fast path can silently skip Unicode destinations
+  // (nodejs/node#61878). A filter selects its Unicode-safe JS traversal.
+  for (const entry of ['src', 'bin', 'package.json']) cpSync(join(root, entry), join(home, 'app', entry), { recursive: true, filter: () => true })
   for (const file of ['src/key.js', 'bin/p2p.js', 'package.json']) {
     assert.deepEqual(readFileSync(join(home, 'app', file)), readFileSync(join(root, file)), 'Installed fixture bytes: ' + file)
-    assert.deepEqual(readFileSync(join(aliasHome, 'app', file)), readFileSync(join(root, file)), 'Original temporary-path bytes: ' + file)
+    assert.deepEqual(readFileSync(join(physicalHome, 'app', file)), readFileSync(join(root, file)), 'Canonical temporary-path bytes: ' + file)
   }
 }
 async function fixture(fn) {
-  // GitHub's Windows TEMP may use RUNNER~1. Use the physical directory returned
-  // by the fixture-owning Node process, preserving the complete Unicode suffix.
-  const aliasTemp = mkdtempSync(join(tmpdir(), 'p2p join fixture ')), temp = realpathSync.native(aliasTemp)
-  const host = join(temp, 'host'), home = join(temp, 'client שלום with spaces'), aliasHome = join(aliasTemp, 'client שלום with spaces'), board = join(temp, 'board')
+  // Keep the original Windows TEMP alias and Hebrew/space suffix as the actual
+  // installation input; independently verify bytes through the physical path.
+  const temp = mkdtempSync(join(tmpdir(), 'p2p join fixture '))
+  const host = join(temp, 'host'), home = join(temp, 'client שלום with spaces'), physicalHome = join(realpathSync.native(temp), 'client שלום with spaces'), board = join(temp, 'board')
   let key
   try {
-    installFixture(home, aliasHome)
+    installFixture(home, physicalHome)
     const listening = await command(host, ['listen', '--name', 'host', '--profile', 'fixture-host', '--rendezvous-dir', board])
     assert.equal(listening.code, 0, listening.out + listening.err)
     key = (await status(host, 'host')).self
-    await fn({ temp, host, home, aliasHome, key, env: { P2P_HOME: home, P2P_RENDEZVOUS_DIR: board } })
+    await fn({ temp, host, home, physicalHome, key, env: { P2P_HOME: home, P2P_RENDEZVOUS_DIR: board } })
   } finally {
     if (key) await command(home, ['stop', '--name', 'join-' + key])
     await command(home, ['stop', '--name', 'default'])
@@ -93,16 +95,16 @@ test('join fixture runtime is available when CI requires it', () => {
 })
 
 test('join helper: real encrypted connection, acknowledged identity, same-session rerun, stable restart, older default reuse', { skip: !bun, timeout: 90000 }, async () => {
-  await fixture(async ({ temp, host, home, aliasHome, key, env }) => {
+  await fixture(async ({ temp, host, home, physicalHome, key, env }) => {
     const launch = () => run(bun, [helper, key, home], env)
     let result = await launch()
     if (result.code !== 0 && process.platform === 'win32') {
       // Capture loader-vs-filesystem evidence on the actual Windows runner. This
       // is diagnostic only: neither production nor the test retries a failed join.
       const probe = join(temp, 'module-diagnostic.mjs')
-      writeFileSync(probe, "import {readFileSync,realpathSync,readdirSync} from 'node:fs';import {dirname} from 'node:path';import {pathToFileURL} from 'node:url';const reports=[];for(const file of process.argv.slice(2)){const r={file};try{r.parent=readdirSync(dirname(file));r.bytes=readFileSync(file).length;r.realpath=realpathSync(file);for(const [kind,spec] of [['fileURL',pathToFileURL(r.realpath).href],['filesystem',r.realpath]]){try{r[kind]=typeof(await import(spec)).decodeKey}catch(e){r[kind]=e.message}}}catch(e){r.fsError=e.message}reports.push(r)}console.log(JSON.stringify(reports))\n")
+      writeFileSync(probe, "import {readFileSync,realpathSync,readdirSync} from 'node:fs';import {dirname} from 'node:path';import {pathToFileURL} from 'node:url';const reports=[];for(const file of process.argv.slice(2)){const r={file,nativeSame:realpathSync.native===realpathSync};try{r.appNative=realpathSync.native(dirname(dirname(file)))}catch(e){r.nativeError=e.message}try{r.parent=readdirSync(dirname(file));r.bytes=readFileSync(file).length;r.realpath=realpathSync(file);for(const [kind,spec] of [['fileURL',pathToFileURL(r.realpath).href],['filesystem',r.realpath]]){try{r[kind]=typeof(await import(spec)).decodeKey}catch(e){r[kind]=e.message}}}catch(e){r.fsError=e.message}reports.push(r)}console.log(JSON.stringify(reports))\n")
       const keyFile = join(home, 'app', 'src', 'key.js'), physical = realpathSync.native(keyFile)
-      const evidence = await run(bun, [probe, keyFile, physical, join(aliasHome, 'app', 'src', 'key.js')], env)
+      const evidence = await run(bun, [probe, keyFile, physical, join(physicalHome, 'app', 'src', 'key.js')], env)
       result.err += '\nWindows Node fixture: ' + JSON.stringify({ physical, bytes: readFileSync(keyFile).length, app: readdirSync(join(home, 'app')), src: readdirSync(join(home, 'app', 'src')) })
       result.err += '\nWindows Bun module diagnostics: ' + evidence.out + evidence.err
     }
