@@ -124,3 +124,6 @@ try {
     foreach ($key in $savedConfig.Keys) { [Environment]::SetEnvironmentVariable($key, $savedConfig[$key], 'Process') }
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
 }
+# The last child intentionally fails the checksum test. Do not leak that expected
+# native exit code into GitHub's shell wrapper after all assertions succeeded.
+$global:LASTEXITCODE = 0

@@ -15,18 +15,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
       - name: Tunnel unit and isolated process tests
         shell: bash
         run: node --test test/tunnel*.test.js
+      - name: Node and Bun interoperability
+        env:
+          P2P_TEST_BUN: bun
+        run: node --test test/runtime-interop.test.js test/installer-bun.test.js
+      - name: Bun independent Noise and invite vectors
+        run: bun test test/noise.test.js test/invite.test.js --timeout 45000
       - name: Windows first install and generated launchers (PowerShell 7)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           ./test/installer-windows.ps1 -PowerShellCommand pwsh
           ./test/installer-downloads.ps1 -PowerShellCommand pwsh
+          ./test/installer-bun-windows.ps1 -PowerShellCommand pwsh
       - name: Windows first install and generated launchers (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           ./test/installer-windows.ps1 -PowerShellCommand powershell.exe
           ./test/installer-downloads.ps1 -PowerShellCommand powershell.exe
+          ./test/installer-bun-windows.ps1 -PowerShellCommand powershell.exe

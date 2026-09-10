@@ -55,7 +55,8 @@
 //
 // Zero deps.
 
-import { createHash, createHmac, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
+import { createCipheriv, createDecipheriv } from './crypto-aead.js'
 import { signEd, verifyEd } from './sign.js'
 import { decodeKey, verifyCommitment } from './key.js'
 

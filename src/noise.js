@@ -7,7 +7,7 @@
 // This is the P0 crypto gate. It is validated against the OFFICIAL rweather/noise-c KAT
 // vector (test/vectors/) byte-exact — handshake msg1/msg2, transport messages, and the
 // handshake hash — plus a fail-closed negative suite. AEAD tag verification is done ONLY
-// by node:crypto (no manual byte compares anywhere).
+// by native crypto or the existing noble adapter (no manual tag compares here).
 //
 // IK pattern:
 //     <- s                         (responder static, pinned by the contact-string commitment)
@@ -24,14 +24,13 @@
 import {
   createHash,
   createHmac,
-  createCipheriv,
-  createDecipheriv,
   createPublicKey,
   createPrivateKey,
   diffieHellman,
   generateKeyPairSync,
   timingSafeEqual,
 } from 'node:crypto'
+import { createCipheriv, createDecipheriv } from './crypto-aead.js'
 
 const PROTOCOL_NAME = 'Noise_IK_25519_ChaChaPoly_SHA256'
 // Invite mode (research/metadata-privacy.md §5): the SAME IK pattern with a psk token appended to

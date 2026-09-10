@@ -41,18 +41,26 @@ Set-StrictMode -Version 2.0
 #   P2P_SRC       a local DIRECTORY (trusted, unverified), OR a .zip/.tar.gz URL
 #                 (checksum-verified against P2P_SRC_SUMS).
 #   P2P_SRC_SUMS  URL/path of the SHASUMS256.txt covering the P2P_SRC archive.
+#   P2P_RUNTIME   node (default) or bun. Bun is installed privately when absent.
+#   P2P_BUN_DIST  mirror of the pinned Bun release (must include SHASUMS256.txt).
 $Ref        = if ($env:P2P_REF) { $env:P2P_REF } else { 'v0.3.4' }
 $SrcDefault = "https://github.com/fire17/p2p/releases/download/$Ref/p2p-$Ref.zip"
 $Src        = if ($env:P2P_SRC) { $env:P2P_SRC } else { $SrcDefault }
 $Sums       = if ($env:P2P_SRC_SUMS) { $env:P2P_SRC_SUMS } else { "https://github.com/fire17/p2p/releases/download/$Ref/SHASUMS256.txt" }
 $NodeDist   = if ($env:P2P_NODE_DIST) { $env:P2P_NODE_DIST } else { 'https://nodejs.org/dist/latest-v22.x' }
 $NodeMin    = 22
+$RuntimeKind = if ($env:P2P_RUNTIME) { $env:P2P_RUNTIME.ToLower() } else { '' }
+$BunDist = if ($env:P2P_BUN_DIST) { $env:P2P_BUN_DIST } else { 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2' }
 $UserHome   = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $P2pHome    = if ($env:P2P_HOME) { $env:P2P_HOME } else { Join-Path $UserHome '.p2p' }
 $BinDir     = if ($env:P2P_BIN_DIR) { $env:P2P_BIN_DIR } else { Join-Path $UserHome '.local\bin' }
 $AppDir     = Join-Path $P2pHome 'app'
 $RuntimeDir = Join-Path $P2pHome 'runtime'
 $LogFile    = Join-Path $P2pHome 'install.log'
+if (-not $RuntimeKind) {
+  $savedKind = Join-Path $P2pHome 'runtime.kind'
+  $RuntimeKind = if (Test-Path -LiteralPath $savedKind) { (Get-Content -LiteralPath $savedKind -Raw).Trim() } else { 'node' }
+}
 
 # a bare positional key may arrive with a leading flag-ish token from `iex` forms
 if ($Key -match '^-') { $Key = '' }
@@ -83,6 +91,7 @@ $script:Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("p2p-install-" + [Sys
 New-Item -ItemType Directory -Force -Path $script:Tmp | Out-Null
 
 try {
+  if ($RuntimeKind -notin @('node', 'bun')) { Fail 'P2P_RUNTIME must be node or bun' }
   # TLS 1.2 — PS 5.1 on older Windows still defaults to SSL3/TLS1.0 and nodejs.org refuses it
   try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol } catch {}
 
@@ -151,7 +160,58 @@ try {
     Log "source sha256 OK: $name = $got"
   }
 
-  # ── 1. node >= 22 ─────────────────────────────────────────────────────────────
+  # ── 1. selected runtime ──────────────────────────────────────────────────────
+  $Node = $null  # historical name; this is the selected executable, Node or Bun
+  if ($RuntimeKind -eq 'bun') {
+    Step 'find-bun'
+    function BunOk([string]$exe) {
+      if (-not $exe) { return $false }
+      try {
+        $v = & $exe -e 'process.stdout.write(String(process.versions.bun||0))' 2>$null
+        return ($LASTEXITCODE -eq 0 -and [version]($v -split '-')[0] -ge [version]'1.4.2')
+      } catch { return $false }
+    }
+    $bunRuntime = Join-Path $P2pHome 'bun-runtime'
+    $bunCandidates = @((Join-Path $bunRuntime 'bun.exe'), (Join-Path $UserHome '.bun\bin\bun.exe'))
+    $pathBun = Get-Command bun -ErrorAction SilentlyContinue
+    if ($pathBun) { $bunCandidates += $pathBun.Source }
+    if ($env:P2P_FORCE_BUN_BOOTSTRAP -ne '1') {
+      foreach ($candidate in $bunCandidates) {
+        if ((Test-Path -LiteralPath $candidate) -and (BunOk $candidate)) { $Node = $candidate; break }
+      }
+    }
+    if (-not $Node) {
+      switch ($NArch) {
+        'x64' { $bunTarget = 'bun-windows-x64-baseline' }
+        'arm64' { $bunTarget = 'bun-windows-aarch64' }
+        default { Fail "Bun has no portable Windows build for $NArch; use P2P_RUNTIME=node" }
+      }
+      $bunZipName = "$bunTarget.zip"
+      Step 'bun-shasums'
+      $bunSums = DownloadText "$BunDist/SHASUMS256.txt"
+      $bunLine = ($bunSums -split "`n") | Where-Object { $_ -match ("\s+" + [Regex]::Escape($bunZipName) + "\s*$") } | Select-Object -First 1
+      if (-not $bunLine) { Fail "Bun manifest has no SHA256 entry for $bunZipName" }
+      $bunWant = ($bunLine.Trim() -split '\s+')[0].ToLower()
+      Step 'bun-download'
+      Say 'v downloading private Bun 1.4.2 (no global runtime changes)...' 'Yellow'
+      $bunZip = Join-Path $script:Tmp $bunZipName
+      Download "$BunDist/$bunZipName" $bunZip
+      Step 'bun-verify-checksum'
+      $bunGot = (Get-FileHash -LiteralPath $bunZip -Algorithm SHA256).Hash.ToLower()
+      if ($bunWant -ne $bunGot) { Fail "Bun checksum MISMATCH for $bunZipName" }
+      Step 'bun-extract'
+      $bunExtract = Join-Path $script:Tmp 'bunx'
+      Expand-Archive -LiteralPath $bunZip -DestinationPath $bunExtract -Force
+      $bunCandidate = Join-Path (Join-Path $bunExtract $bunTarget) 'bun.exe'
+      if (-not (Test-Path -LiteralPath $bunCandidate) -or -not (BunOk $bunCandidate)) { Fail 'The verified Bun archive does not contain a working Bun >=1.4.2' }
+      New-Item -ItemType Directory -Force -Path $bunRuntime | Out-Null
+      Copy-Item -LiteralPath $bunCandidate -Destination (Join-Path $bunRuntime 'bun.exe') -Force
+      $Node = Join-Path $bunRuntime 'bun.exe'
+    }
+    Say ("+ bun " + (& $Node --version) + " (>=1.4.2)  ·  $Node") 'Green'
+    Log "using Bun: $Node"
+  } else {
+  # Node remains the default and retains the existing verified bootstrap.
   Step 'find-node'
   function NodeMajor([string]$exe) {
     try { $v = & $exe -e 'process.stdout.write(String(parseInt(process.versions.node)))' 2>$null; return [int]$v } catch { return 0 }
@@ -225,9 +285,11 @@ try {
     Log "bootstrapped node at $Node"
   }
 
-  # remember WHICH node worked, so the shims keep working even if the user's PATH changes
+  }
+
+  # remember WHICH node worked, so legacy shims keep working after Node installs
   # later. Not a *.json file — user data (identity/friends) is untouched.
-  try { Set-Content -LiteralPath (Join-Path $P2pHome 'node.path') -Value $Node -Encoding ASCII } catch {}
+  if ($RuntimeKind -eq 'node') { try { Set-Content -LiteralPath (Join-Path $P2pHome 'node.path') -Value $Node -Encoding ASCII } catch {} }
 
   # ── 2. fetch the p2p source ───────────────────────────────────────────────────
   Step 'fetch-source'
@@ -334,6 +396,9 @@ try {
 
   # ── 4. the `p2p` launcher on PATH ─────────────────────────────────────────────
   Step 'launcher'
+  # Persist only after source verification/install succeeded.
+  [IO.File]::WriteAllText((Join-Path $P2pHome 'runtime.path'), ($Node + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
+  Set-Content -LiteralPath (Join-Path $P2pHome 'runtime.kind') -Value $RuntimeKind -Encoding ASCII
   New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
   $cmdShim = Join-Path $BinDir 'p2p.cmd'
@@ -343,6 +408,18 @@ setlocal
 if "%P2P_HOME%"=="" set "P2P_HOME=%USERPROFILE%\.p2p"
 set "P2P_APP=%P2P_HOME%\app"
 set "P2P_NODE="
+if exist "%P2P_HOME%\runtime.kind" if not exist "%P2P_HOME%\runtime.path" (
+  echo p2p: selected runtime path is missing. Re-run the installer. 1>&2
+  exit /b 1
+)
+if exist "%P2P_HOME%\runtime.path" (
+  for /f "usebackq delims=" %%N in ("%P2P_HOME%\runtime.path") do if exist "%%~N" set "P2P_NODE=%%~N"
+  if not defined P2P_NODE (
+    echo p2p: selected runtime is missing. Re-run the installer. 1>&2
+    exit /b 1
+  )
+  goto runtime_ready
+)
 if exist "%P2P_HOME%\runtime\node.exe" (
   set "P2P_NODE=%P2P_HOME%\runtime\node.exe"
 ) else (
@@ -351,6 +428,7 @@ if exist "%P2P_HOME%\runtime\node.exe" (
   )
 )
 if "%P2P_NODE%"=="" set "P2P_NODE=node"
+:runtime_ready
 if not exist "%P2P_APP%\bin\p2p.js" (
   echo p2p: %P2P_APP% is missing. Re-run:  irm p2p.akeyo.io/init.ps1 ^| iex 1>&2
   exit /b 1
@@ -368,7 +446,13 @@ $app     = Join-Path $p2pHome 'app'
 $rtNode  = Join-Path $p2pHome 'runtime\node.exe'
 $pinFile = Join-Path $p2pHome 'node.path'
 $pinned  = if (Test-Path $pinFile) { (Get-Content -Raw $pinFile).Trim() } else { '' }
-if (Test-Path $rtNode) { $node = $rtNode }
+$runtimeFile = Join-Path $p2pHome 'runtime.path'
+if ((Test-Path (Join-Path $p2pHome 'runtime.kind')) -and -not (Test-Path $runtimeFile)) { Write-Error 'p2p: selected runtime path is missing. Re-run the installer.'; exit 1 }
+if (Test-Path $runtimeFile) {
+  $node = (Get-Content -Raw -Encoding UTF8 $runtimeFile).Trim()
+  if (-not (Test-Path -LiteralPath $node)) { Write-Error 'p2p: selected runtime is missing. Re-run the installer.'; exit 1 }
+}
+elseif (Test-Path $rtNode) { $node = $rtNode }
 elseif ($pinned -and (Test-Path $pinned)) { $node = $pinned }
 elseif (Get-Command node -ErrorAction SilentlyContinue) { $node = 'node' }
 else { Write-Error 'p2p: no node >= 22 found. Re-run:  irm p2p.akeyo.io/init.ps1 | iex'; exit 1 }
@@ -400,7 +484,7 @@ exit $LASTEXITCODE
   }
 
   Step 'done'
-  Log "SUCCESS — p2p $newVer ($action), node $(& $Node --version), shim $cmdShim"
+  Log "SUCCESS — p2p $newVer ($action), $RuntimeKind $(& $Node --version), shim $cmdShim"
   Remove-Item -Recurse -Force $script:Tmp -ErrorAction SilentlyContinue
 
   # ── 6. next step / auto-launch ────────────────────────────────────────────────

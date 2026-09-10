@@ -61,7 +61,8 @@
 //   5. Publisher stamps the flag when minting an invite: `encodeKey(edPub, xPub, INVITE_FLAG)`
 //      (v2's burn/rotate then stops republishing + retires K_inv after the first handshake).
 
-import { createHash, createPrivateKey, createPublicKey, hkdfSync, randomBytes, sign as edSign, verify as edVerify, createCipheriv, createDecipheriv, timingSafeEqual } from 'node:crypto'
+import { createHash, createPrivateKey, createPublicKey, hkdfSync, randomBytes, sign as edSign, verify as edVerify, timingSafeEqual } from 'node:crypto'
+import { createCipheriv, createDecipheriv } from './crypto-aead.js'
 import { TypoError } from './key.js'
 
 export { TypoError }

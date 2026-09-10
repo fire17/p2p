@@ -34,16 +34,24 @@ set -e
 #   P2P_SRC       a local DIRECTORY (trusted, unverified — the installer's own tests),
 #                 OR a .tar.gz/.tgz URL (checksum-verified against P2P_SRC_SUMS).
 #   P2P_SRC_SUMS  URL/path of the SHASUMS256.txt covering the P2P_SRC archive.
+#   P2P_RUNTIME   node (default) or bun. Bun is installed privately when absent.
+#   P2P_BUN_DIST  mirror of the pinned Bun release (must include SHASUMS256.txt).
 P2P_REF="${P2P_REF:-v0.3.4}"
 P2P_SRC="${P2P_SRC:-https://github.com/fire17/p2p/releases/download/$P2P_REF/p2p-$P2P_REF.tar.gz}"
 P2P_SRC_SUMS="${P2P_SRC_SUMS:-https://github.com/fire17/p2p/releases/download/$P2P_REF/SHASUMS256.txt}"
 NODE_DIST="${P2P_NODE_DIST:-https://nodejs.org/dist/latest-v22.x}"   # portable node source
 NODE_MIN=22
+RUNTIME_KIND="${P2P_RUNTIME:-}"
+BUN_DIST="${P2P_BUN_DIST:-https://github.com/oven-sh/bun/releases/download/bun-v1.4.2}"
 P2P_HOME="${P2P_HOME:-$HOME/.p2p}"
 BIN_DIR="${P2P_BIN_DIR:-$HOME/.local/bin}"
 APP_DIR="$P2P_HOME/app"
 RUNTIME_DIR="$P2P_HOME/runtime"
 LOG="$P2P_HOME/install.log"
+if [ -z "$RUNTIME_KIND" ]; then
+  if [ -f "$P2P_HOME/runtime.kind" ]; then RUNTIME_KIND="$(cat "$P2P_HOME/runtime.kind")"
+  else RUNTIME_KIND=node; fi
+fi
 
 # ── args ────────────────────────────────────────────────────────────────────────
 FORCE=0
@@ -176,7 +184,54 @@ verify_source_archive() {
   log "source sha256 OK: $_name = $_got"
 }
 
-# ── 1. node >= 22 ───────────────────────────────────────────────────────────────
+# ── 1. selected runtime ────────────────────────────────────────────────────────
+NODE="" # historical name; this is the selected executable, Node or Bun
+case "$RUNTIME_KIND" in node|bun) ;; *) die 'P2P_RUNTIME must be node or bun' ;; esac
+if [ "$RUNTIME_KIND" = bun ]; then
+  step "find-bun"
+  bun_ok() { "$1" -e 'const v=(process.versions.bun||"0").split(".").map(Number);process.exit(v[0]>1||(v[0]===1&&(v[1]>4||(v[1]===4&&v[2]>=2)))?0:1)' >/dev/null 2>&1; }
+  BUN_RUNTIME="$P2P_HOME/bun-runtime"
+  if [ "${P2P_FORCE_BUN_BOOTSTRAP:-0}" != 1 ]; then
+    if [ -x "$BUN_RUNTIME/bun" ] && bun_ok "$BUN_RUNTIME/bun"; then NODE="$BUN_RUNTIME/bun"
+    elif command -v bun >/dev/null 2>&1 && bun_ok "$(command -v bun)"; then NODE="$(command -v bun)"
+    elif [ -x "$HOME/.bun/bin/bun" ] && bun_ok "$HOME/.bun/bin/bun"; then NODE="$HOME/.bun/bin/bun"
+    fi
+  fi
+  if [ -z "$NODE" ]; then
+    case "$NARCH" in
+      x64) BUN_ARCH=x64-baseline ;;
+      arm64) BUN_ARCH=aarch64 ;;
+      *) die "Bun has no portable build for $ARCH; use P2P_RUNTIME=node" ;;
+    esac
+    BUN_TARGET="bun-$NPLAT-$BUN_ARCH"
+    if [ "$NPLAT" = linux ] && ldd --version 2>&1 | grep -qi musl; then
+      case "$NARCH" in x64) BUN_TARGET=bun-linux-x64-musl-baseline ;; arm64) BUN_TARGET=bun-linux-aarch64-musl ;; esac
+    fi
+    command -v unzip >/dev/null 2>&1 || die 'unzip is required to extract the portable Bun archive'
+    BUN_ZIP="$BUN_TARGET.zip"
+    step "bun-shasums"
+    fetch "$BUN_DIST/SHASUMS256.txt" "$TMPD/bun.sums" 2>"$ERRFILE" || die 'could not fetch the Bun checksum manifest'
+    BUN_WANT="$(awk -v n="$BUN_ZIP" '$2 == n { print $1; exit }' "$TMPD/bun.sums")"
+    [ -n "$BUN_WANT" ] || die "Bun manifest has no SHA256 entry for $BUN_ZIP"
+    step "bun-download"
+    say '↓ downloading private Bun 1.4.2 (no global runtime changes)…'
+    fetch "$BUN_DIST/$BUN_ZIP" "$TMPD/$BUN_ZIP" 2>"$ERRFILE" || die "could not fetch $BUN_ZIP"
+    step "bun-verify-checksum"
+    BUN_GOT="$(sha256_of "$TMPD/$BUN_ZIP")"
+    [ -n "$BUN_GOT" ] && [ "$BUN_GOT" = "$BUN_WANT" ] || die "Bun checksum MISMATCH for $BUN_ZIP"
+    step "bun-extract"
+    run unzip -q "$TMPD/$BUN_ZIP" -d "$TMPD/bunx" || die 'could not extract Bun'
+    BUN_CANDIDATE="$TMPD/bunx/$BUN_TARGET/bun"
+    [ -x "$BUN_CANDIDATE" ] && bun_ok "$BUN_CANDIDATE" || die 'the verified archive does not contain a working Bun >=1.4.2'
+    mkdir -p "$BUN_RUNTIME"
+    cp "$BUN_CANDIDATE" "$BUN_RUNTIME/bun.new"
+    mv "$BUN_RUNTIME/bun.new" "$BUN_RUNTIME/bun"
+    NODE="$BUN_RUNTIME/bun"
+  fi
+  say "✓ bun $("$NODE" --version) (>=1.4.2)  ·  $NODE"
+  log "using Bun: $NODE"
+else
+# Node remains the default and retains the existing verified bootstrap.
 step "find-node"
 node_major() { "$1" -e 'process.stdout.write(String(process.versions.node.split(".")[0]))' 2>/dev/null || echo 0; }
 node_ok() { [ -x "$1" ] || command -v "$1" >/dev/null 2>&1 || return 1; m="$(node_major "$1")"; [ -n "$m" ] && [ "$m" -ge "$NODE_MIN" ] 2>/dev/null; }
@@ -241,9 +296,11 @@ else
   log "bootstrapped node $("$NODE" --version) at $NODE"
 fi
 
-# remember WHICH node worked, so the shim keeps working even if the user's PATH changes
+fi
+
+# remember WHICH node worked, so legacy shims work after Node installs
 # later (e.g. a version manager unloads). Not a *.json file — user data is untouched.
-printf '%s\n' "$NODE" >"$P2P_HOME/node.path" 2>/dev/null || true
+if [ "$RUNTIME_KIND" = node ]; then printf '%s\n' "$NODE" >"$P2P_HOME/node.path" 2>/dev/null || true; fi
 
 # ── 2. fetch the p2p source ─────────────────────────────────────────────────────
 step "fetch-source"
@@ -323,6 +380,9 @@ esac
 
 # ── 4. the `p2p` launcher on PATH ───────────────────────────────────────────────
 step "launcher"
+# Persist only after source verification/install succeeded.
+printf '%s\n' "$NODE" >"$P2P_HOME/runtime.path"
+printf '%s\n' "$RUNTIME_KIND" >"$P2P_HOME/runtime.kind"
 mkdir -p "$BIN_DIR" || die "could not create $BIN_DIR"
 SHIM="$BIN_DIR/p2p"
 cat >"$SHIM" <<'SHIM_EOF'
@@ -330,6 +390,12 @@ cat >"$SHIM" <<'SHIM_EOF'
 # p2p launcher (generated by the p2p installer — safe to delete along with ~/.p2p)
 P2P_HOME="${P2P_HOME:-$HOME/.p2p}"
 APP="$P2P_HOME/app"
+if [ -f "$P2P_HOME/runtime.kind" ]; then
+  SELECTED="$(cat "$P2P_HOME/runtime.path" 2>/dev/null || true)"
+  [ -n "$SELECTED" ] && [ -x "$SELECTED" ] || { echo 'p2p: selected runtime is missing. Re-run the installer.' >&2; exit 1; }
+  [ -f "$APP/bin/p2p.js" ] || { echo "p2p: $APP is missing. Re-run the installer." >&2; exit 1; }
+  exec "$SELECTED" "$APP/bin/p2p.js" "$@"
+fi
 ok22() { m="$("$1" -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"; [ -n "$m" ] && [ "$m" -ge 22 ] 2>/dev/null; }
 NODE=""
 PINNED=""
@@ -391,7 +457,7 @@ else
 fi
 
 step "done"
-log "SUCCESS — p2p $NEW_VER ($ACTION), node $("$NODE" --version), shim $SHIM"
+log "SUCCESS — p2p $NEW_VER ($ACTION), $RUNTIME_KIND $("$NODE" --version), shim $SHIM"
 rm -rf "$TMPD"; TMPD=""
 # INSTALL IS COMPLETE from here on. Disarm the failure trap + set -e so that anything
 # below (launching the TUI, a missing /dev/tty, the user hitting ^C) can never be
