@@ -12,7 +12,14 @@ const ownerGeneration = 'a'.repeat(32), allowed = 'AUTHENTICATED_ALLOWED_PEER'
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const powerShell = shell => /powershell|pwsh/i.test(shell)
 const quote = (value, shell) => powerShell(shell) ? "'" + value.replaceAll("'", "''") + "'" : "'" + value.replaceAll("'", "'\\''") + "'"
-const program = (shell, script) => (powerShell(shell) ? '& ' : '') + quote(process.execPath, shell) + ' -e ' + quote(script, shell)
+const program = (shell, script) => {
+  // Windows PowerShell 5.1's native argument adapter strips embedded double
+  // quotes. Keep this fixture's Node argument independent of that legacy parser;
+  // the actual terminal command still traverses the real chosen shell.
+  const encoded = Buffer.from(script).toString('base64')
+  const argument = `eval(Buffer.from('${encoded}','base64').toString('utf8'))`
+  return (powerShell(shell) ? '& ' : '') + quote(process.execPath, shell) + ' -e ' + quote(argument, shell)
+}
 function available(shell) {
   return existsSync(shell) || (process.env.PATH || '').split(delimiter).some(dir => existsSync(join(dir, shell)) || existsSync(join(dir, shell + '.exe')))
 }
@@ -23,7 +30,9 @@ test('required Windows CI shells are real PowerShell 7 and Windows PowerShell 5.
   assert.equal(process.platform, 'win32', 'P2P_REQUIRE_WINDOWS_SHELLS=1 requires an actual Windows runner')
   for (const [shell, expected] of [['pwsh', /^7\./], ['powershell.exe', /^5\.1\./]]) {
     assert.ok(available(shell), `required shell ${shell} is missing; Windows coverage must not silently skip`)
-    const probe = spawnSync(shell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'], { encoding: 'utf8', timeout: 15000 })
+    // The first Windows PowerShell startup on a fresh runner may JIT cold. This
+    // allowance applies only to the version preflight, not execution deadlines.
+    const probe = spawnSync(shell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'], { encoding: 'utf8', timeout: 45000 })
     assert.equal(probe.status, 0, `${shell} did not execute: ${probe.error?.message || probe.stderr}`)
     assert.match(probe.stdout.trim(), expected, `${shell} must identify the required PowerShell edition`)
   }
@@ -92,10 +101,12 @@ for (const shell of shells) {
     const first = f.request(change); f.send(first)
     assert.equal((await f.response(first)).code, 0)
     const showVariable = powerShell(shell) ? 'Write-Output $p2pTerminalFixture; ' : 'printf "%s\\n" "$p2pTerminalFixture"; '
-    const second = f.request(showVariable + program(shell, "console.log(process.cwd()); console.log(process.env.P2P_TERMINAL_FIXTURE_STATE); process.exit(7)"))
+    const second = f.request(showVariable + program(shell, "require('node:fs').writeFileSync('cwd-proof.txt','relative-write-proof');console.log(process.cwd());console.log(process.env.P2P_TERMINAL_FIXTURE_STATE);process.exit(7)"))
     f.send(second)
     assert.equal((await f.response(second)).code, 7)
-    assert.ok(f.output(second).includes(subdirectory))
+    const cwdProof = join(subdirectory, 'cwd-proof.txt')
+    assert.ok(existsSync(cwdProof), `native process must write in the persisted directory; observed output: ${f.output(second)}`)
+    assert.equal(readFileSync(cwdProof, 'utf8'), 'relative-write-proof', 'physical cwd proof tolerates Windows long/8.3 path spellings')
     assert.ok(f.output(second).includes('persisted-value'))
     assert.ok(f.output(second).includes('persistent-global'), 'ordinary shell variables persist between separate exec requests')
     const chat = f.request(program(shell, "require('node:fs').writeFileSync('chat-must-not-run','bad')"))

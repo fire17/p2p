@@ -29,6 +29,7 @@ jobs:
           P2P_TEST_BUN: bun
         run: node --test test/runtime-interop.test.js test/installer-bun.test.js
       - name: Bun terminal owner and client
+        if: ${{ !cancelled() }}
         env:
           P2P_REQUIRE_WINDOWS_SHELLS: ${{ runner.os == 'Windows' && '1' || '0' }}
         run: bun test --timeout 45000 test/tunnel-terminal-server.test.js test/tunnel-terminal-client.test.js test/tunnel-owner-failure.test.js test/tunnel-mailbox.test.js
