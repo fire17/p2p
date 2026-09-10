@@ -114,7 +114,15 @@ try {
   }
   function DownloadText([string]$url) {
     Log "GET $url"
-    try { (Invoke-WebRequest -Uri $url -UseBasicParsing).Content } catch { throw "download failed: $url`n  $($_.Exception.Message)" }
+    try {
+      $content = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
+      # GitHub release assets use application/octet-stream: PowerShell 7 returns
+      # byte[] here. Decode before returning, or the pipeline enumerates the bytes
+      # and the caller receives Object[] instead of checksum-manifest text.
+      if ($content -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($content) }
+      if ($content -is [string]) { return $content }
+      throw 'unexpected response content type for text download'
+    } catch { throw "download failed: $url`n  $($_.Exception.Message)" }
   }
   # read a manifest from either a local path (tests/private forks) or an http(s) URL
   function ReadOrDownload([string]$src) {
