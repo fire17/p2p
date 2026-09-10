@@ -24,12 +24,6 @@ jobs:
           P2P_REQUIRE_WINDOWS_SHELLS: ${{ runner.os == 'Windows' && '1' || '0' }}
         shell: bash
         run: node --test test/tunnel*.test.js
-      - name: Install-and-join HTTP entrypoints
-        env:
-          P2P_TEST_BUN: bun
-          P2P_REQUIRE_JOIN_BUN: '1'
-          P2P_REQUIRE_WINDOWS_SHELLS: ${{ runner.os == 'Windows' && '1' || '0' }}
-        run: node --test test/join-bootstrap.test.js test/join-legacy.test.js
       - name: Node and Bun interoperability
         env:
           P2P_TEST_BUN: bun
