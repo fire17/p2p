@@ -60,7 +60,10 @@ async function fixture(t, shell, options = {}) {
     signal: controller.signal, io: { stdout: { write: text => localOutput.push(text) } }, onReady: value => { info = value } })
   runner.catch(error => { terminalError = error })
   t.after(async () => { controller.abort(); await runner.catch(() => {}); rmSync(dir, { recursive: true, force: true }) })
-  await until(() => { if (terminalError) throw terminalError; return info })
+  // Initialization has its own bounded budget, independently of the 5-second
+  // command deadline asserted below. Cold PowerShell may exceed eight seconds
+  // when this fixture shares a runner with the full repository suite.
+  await until(() => { if (terminalError) throw terminalError; return info }, 50000)
   const f = { dir, inbox, info, sent, runner, controller, localOutput,
     send: (payload, from = allowed, channel = 'term') => appendFileSync(inbox, JSON.stringify({ ...makeTermRow(payload, from), channel }) + '\n'),
     request: (command, extra = {}) => ({ v: 1, type: 'exec', requestId: termId(), grantId: info.grantId, generation: ownerGeneration,
@@ -74,7 +77,7 @@ async function fixture(t, shell, options = {}) {
 }
 
 for (const shell of shells) {
-  test(`terminal ${shell}: real client and owner service agree across separate tunnel generations`, { skip: !available(shell), timeout: 30000 }, async t => {
+  test(`terminal ${shell}: real client and owner service agree across separate tunnel generations`, { skip: !available(shell), timeout: 60000 }, async t => {
     let clientInbox
     const f = await fixture(t, shell, { onOutbox: row => appendFileSync(clientInbox, JSON.stringify(row) + '\n') })
     const clientDirectory = join(f.dir, 'client state'); mkdirSync(clientDirectory)
@@ -93,7 +96,7 @@ for (const shell of shells) {
     assert.ok(readFileSync(join(clientDirectory, 'term-client-audit.jsonl'), 'utf8').includes(events.at(-1).requestId))
   })
 
-  test(`terminal owner ${shell}: persistent cwd/env, actual nonzero exit, and chat isolation`, { skip: !available(shell), timeout: 30000 }, async t => {
+  test(`terminal owner ${shell}: persistent cwd/env, actual nonzero exit, and chat isolation`, { skip: !available(shell), timeout: 60000 }, async t => {
     const f = await fixture(t, shell), subdirectory = join(f.dir, 'directory with spaces')
     mkdirSync(subdirectory)
     const change = powerShell(shell)
@@ -118,7 +121,7 @@ for (const shell of shells) {
     assert.ok(f.audit().includes(first.requestId) && f.audit().includes(second.requestId))
   })
 
-  test(`terminal owner ${shell}: shell and native process output preserve Hebrew and emoji`, { skip: !available(shell), timeout: 30000 }, async t => {
+  test(`terminal owner ${shell}: shell and native process output preserve Hebrew and emoji`, { skip: !available(shell), timeout: 60000 }, async t => {
     const f = await fixture(t, shell), text = 'שלום🐙'
     const native = program(shell, `process.stdout.write(${JSON.stringify(text)})`)
     const command = powerShell(shell) ? `Write-Output ${quote(text, shell)}; ${native}` : `printf '%s\\n' ${quote(text, shell)}; ${native}`
@@ -127,7 +130,7 @@ for (const shell of shells) {
     assert.equal(f.output(request).split(text).length - 1, 2, 'shell built-in and native program both retain exact Unicode')
   })
 
-  test(`terminal owner ${shell}: wrong peer, stale grant, expired commands, remote grant, and replay cannot execute`, { skip: !available(shell), timeout: 30000 }, async t => {
+  test(`terminal owner ${shell}: wrong peer, stale grant, expired commands, remote grant, and replay cannot execute`, { skip: !available(shell), timeout: 60000 }, async t => {
     const f = await fixture(t, shell), sentinel = join(f.dir, 'execution-count')
     const command = program(shell, `require('node:fs').appendFileSync(${JSON.stringify(sentinel)},'x')`)
     const wrongPeer = f.request(command); f.send(wrongPeer, 'WRONG_PEER')
@@ -145,7 +148,7 @@ for (const shell of shells) {
     assert.equal(readFileSync(sentinel, 'utf8'), 'x', 'replayed request must not run twice')
   })
 
-  test(`terminal owner ${shell}: timeout kills the owned shell and revokes further execution`, { skip: !available(shell), timeout: 30000 }, async t => {
+  test(`terminal owner ${shell}: timeout kills the owned shell and revokes further execution`, { skip: !available(shell), timeout: 60000 }, async t => {
     const f = await fixture(t, shell)
     const pidFile = join(f.dir, 'owned-descendants.json')
     let descendants = null
@@ -177,7 +180,7 @@ for (const shell of shells) {
     }
   })
 
-  test(`terminal owner ${shell}: output cap is enforced and secrets split across writes are redacted`, { skip: !available(shell), timeout: 30000 }, async t => {
+  test(`terminal owner ${shell}: output cap is enforced and secrets split across writes are redacted`, { skip: !available(shell), timeout: 60000 }, async t => {
     const secret = 'fixture-secret-value-927301'
     const f = await fixture(t, shell, { env: { P2P_TERMINAL_FIXTURE_SECRET: secret } })
     const script = "const s=process.env.P2P_TERMINAL_FIXTURE_SECRET;process.stdout.write(s.slice(0,9));setTimeout(()=>process.stdout.write(s.slice(9)),30)"
@@ -205,7 +208,7 @@ test('terminal owner: disconnected or nonmatching authenticated peer cannot enab
   }
 })
 
-test('terminal owner: local stop or grant-bound cancellation revokes an active process while wrong cancel is ignored', { skip: !available(shells[0]), timeout: 30000 }, async t => {
+test('terminal owner: local stop or grant-bound cancellation revokes an active process while wrong cancel is ignored', { skip: !available(shells[0]), timeout: 60000 }, async t => {
   const shell = shells[0], f = await fixture(t, shell)
   const request = f.request(program(shell, 'setInterval(()=>{},1000)'))
   f.send(request)

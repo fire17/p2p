@@ -43,7 +43,7 @@ Set-StrictMode -Version 2.0
 #   P2P_SRC_SUMS  URL/path of the SHASUMS256.txt covering the P2P_SRC archive.
 #   P2P_RUNTIME   node (default) or bun. Bun is installed privately when absent.
 #   P2P_BUN_DIST  mirror of the pinned Bun release (must include SHASUMS256.txt).
-$Ref        = if ($env:P2P_REF) { $env:P2P_REF } else { 'v0.3.5' }
+$Ref        = if ($env:P2P_REF) { $env:P2P_REF } else { 'v0.3.6' }
 $SrcDefault = "https://github.com/fire17/p2p/releases/download/$Ref/p2p-$Ref.zip"
 $Src        = if ($env:P2P_SRC) { $env:P2P_SRC } else { $SrcDefault }
 $Sums       = if ($env:P2P_SRC_SUMS) { $env:P2P_SRC_SUMS } else { "https://github.com/fire17/p2p/releases/download/$Ref/SHASUMS256.txt" }

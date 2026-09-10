@@ -32,7 +32,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           P2P_REQUIRE_WINDOWS_SHELLS: ${{ runner.os == 'Windows' && '1' || '0' }}
-        run: bun test --timeout 45000 test/tunnel-terminal-server.test.js test/tunnel-terminal-client.test.js test/tunnel-terminal-startup.test.js test/tunnel-owner-failure.test.js test/tunnel-mailbox.test.js
+        run: bun test --timeout 65000 test/tunnel-terminal-server.test.js test/tunnel-terminal-client.test.js test/tunnel-terminal-startup.test.js test/tunnel-owner-failure.test.js test/tunnel-mailbox.test.js
       - name: Bun independent Noise and invite vectors
         run: bun test test/noise.test.js test/invite.test.js --timeout 45000
       - name: Windows first install and generated launchers (PowerShell 7)

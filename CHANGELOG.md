@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.6] — 2026-09-11
+
+- Persistent Agent Tunnel Terminal alongside encrypted chat, with foreground local owner activation bound to one authenticated peer.
+- `tunnel exec`, UTF-8 command files, and a line-oriented `tunnel shell`; explicit local revocation leaves chat connected.
+- Independent startup and command deadlines, replay refusal, bounded output, execution audits, known-secret redaction, and ordinary descendant cleanup.
+- Keep terminal frames out of chat history and custom chat output; read large mailboxes in bounded pages.
+- Verify Node and Bun owners/clients on Windows, macOS and Linux, including Windows PowerShell 5.1 and 7.
+
 ## [0.3.5] — 2026-09-11
 
 - Bun 1.4.2+ runtime selection with a verified private bootstrap and retained runtime choice.
