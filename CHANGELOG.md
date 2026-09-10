@@ -4,6 +4,21 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.5] — 2026-09-11
+
+- Bun 1.4.2+ runtime selection with a verified private bootstrap and retained runtime choice.
+- Reuse the vendored ChaCha20-Poly1305 implementation when the runtime lacks the native cipher; preserve Node, Bun, and browser protocol compatibility.
+- `tunnel send --file PATH` preserves UTF-8 multiline messages through Windows CMD and avoids argument-length limits.
+- Decode binary HTTP checksum manifests correctly under PowerShell 7.
+- Retry transient Windows file-replacement locks without removing the previous valid state.
+- Exercise both Windows PowerShell 5.1 and PowerShell 7 installation, checksums, and generated launchers in CI.
+
+## [0.3.4] — 2026-09-11
+
+- Agent Tunnel: detached listen/invite/join sessions, durable send/receive mailboxes, delivery receipts, and explicit stop.
+- Publish ZIP/tar archives and checksum manifests, and repair stale installer release pins.
+- Validate Windows, macOS, and Linux tunnel behavior and establish the first real Windows-to-Mac agent session.
+
 ## [0.3.3] — 2026-07-13
 
 Internal reliability + safety hardening — no user-facing behavior change. Every fix gated.

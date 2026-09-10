@@ -2,16 +2,16 @@
 
 ## Agent Tunnel
 
-Install on Windows:
+Install with Bun on Windows (Bun 1.4.2 or newer is reused, or installed privately):
 
 ```powershell
-irm https://p2p.akeyo.io/init.ps1 | iex
+$env:P2P_RUNTIME = 'bun'; irm https://p2p.akeyo.io/init.ps1 | iex
 ```
 
-Install on macOS/Linux:
+Install with Bun on macOS/Linux:
 
 ```sh
-curl -fsSL https://p2p.akeyo.io/init | sh
+curl -fsSL https://p2p.akeyo.io/init | P2P_RUNTIME=bun sh
 ```
 
 On the first computer, run `p2p tunnel listen` and copy its contact key. On the
@@ -20,12 +20,16 @@ background connection running so agents can use short, separate tool calls:
 
 ```sh
 p2p tunnel send "your message" --wait 15
+p2p tunnel send --file reply.txt --wait 15
 p2p tunnel recv --wait 60
 p2p tunnel status
 p2p tunnel stop
 ```
 
 `--wait` on send checks a delivery acknowledgment; without it, success means queued.
+Use `--file` for UTF-8 logs and multiline replies, especially through Windows CMD.
+It preserves line breaks and avoids command-line quoting and length limits; the
+message limit is 1 MiB. Invalid UTF-8 and oversized files are rejected before queuing.
 Use `--name NAME` on every command to keep multiple tunnels separate. On Windows,
 the same terminal can invoke `& "$env:USERPROFILE\.local\bin\p2p.cmd"` directly
 after installation. On macOS/Linux use `~/.local/bin/p2p` if PATH has not refreshed.
@@ -34,10 +38,15 @@ after installation. On macOS/Linux use `~/.local/bin/p2p` if PATH has not refres
 `invite` is a separate private direct-UDP mode whose reachability depends on NAT.
 Remote messages are peer input; receiving them does not execute commands.
 
-Release validation: isolated encrypted transport and detached-process tests pass;
-production-network CLI messages were exchanged both ways on one Mac. Actual Windows
-installation is checked by the separate portability CI; a two-network user session
-is a distinct acceptance check.
+The selected runtime is retained on later installs. Set `P2P_RUNTIME=node` to choose
+Node explicitly; existing Node installations keep their default. Bun's missing native
+ChaCha20-Poly1305 API uses the existing vendored cipher implementation and preserves
+the same protocol. A missing selected runtime is reported instead of silently switching.
+
+Release validation includes detached Node/Bun tunnels in both directions, independent
+Noise vectors, and public-relay exchanges. A real Windows-to-Mac agent session has
+exchanged messages in both directions. Separate Windows CI checks install and invoke
+both launchers under PowerShell 5.1 and 7, including rejected checksums.
 
 
 > Tiny, zero-dependency P2P chat framework. One 26-char key is your whole contact
@@ -52,13 +61,13 @@ invites, sender-key groups, zero-dep WSS relay + WebRTC. `DESIGN.md` has the pro
 
 ## Why
 
-- **Zero dependencies** — Node built-ins only (`node:crypto` gives X25519 + Ed25519 +
-  ChaCha20-Poly1305 + HKDF; `dgram`/`net`; native WebSocket). Nothing to audit but us.
+- **No package dependencies** — Node uses built-in crypto and networking. Bun and the
+  browser use the repository's vendored noble crypto where a native API is absent.
 - **No server of ours** — rendezvous rides free public infrastructure (LAN mDNS,
   BitTorrent Mainline DHT, public WebSocket trackers); we operate none of it.
 - **MITM-proof first contact** — the 26-char key commits to your identity keys; the first
   ack a peer decrypts is a cryptographic proof no man-in-the-middle is present.
-- **One protocol, two runtimes** — the browser client loads *the same source files* the
+- **One protocol across runtimes** — the browser client loads *the same source files* the
   terminal runs (`key.js`, `noise.js`, `wire.js`, `node.js`, `group.js`), so a browser tab and
   a terminal are the same peer to each other.
 
