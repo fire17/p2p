@@ -28,7 +28,7 @@ export class PersistentTerminalShell {
       stdio: ['pipe', 'pipe', 'pipe'] })
     this.ready = new Promise((resolve, reject) => { this.child.once('spawn', resolve); this.child.once('error', reject) })
     // Standalone users may call run() immediately; its normal error result still
-    // applies. The owner service awaits this promise before advertising readiness.
+    // applies. The owner service also waits for an interpreter marker before ready.
     void this.ready.catch(() => {})
     this.decoder = new StringDecoder('utf8')
     this.errorDecoder = new StringDecoder('utf8')
@@ -157,7 +157,8 @@ export class PersistentTerminalShell {
 // The CLI is responsible for the local TTY/owner consent gate. Keeping the
 // executor separate permits isolated tests without a hidden CLI bypass switch.
 export async function serveTerminal({ session, allowKey, shell, cwd, env = process.env,
-  io = { stdout: process.stdout, stderr: process.stderr }, signal, onReady } = {}) {
+  io = { stdout: process.stdout, stderr: process.stderr }, signal, onReady, startupTimeoutMs = 45000 } = {}) {
+  if (!Number.isInteger(startupTimeoutMs) || startupTimeoutMs < 1 || startupTimeoutMs > 45000) throw new Error('terminal startup timeout must be between 1 and 45000 ms')
   const generation = session.id, grantId = termId()
   const initial = session.requireLive()
   if (!initial.connected || initial.peerKey !== allowKey) throw new Error('terminal --allow must match the currently authenticated connected peer')
@@ -176,18 +177,28 @@ export async function serveTerminal({ session, allowKey, shell, cwd, env = proce
   let executor, active = null, stopped = false, reason = 'owner stopped'
   const handlers = new Set()
   const seen = new Set()
-  const state = { pid: process.pid, generation, grantId, allowKey, shell, started: Date.now(), active: true, beat: Date.now() }
+  const state = { pid: process.pid, generation, grantId, allowKey, shell, started: Date.now(), active: true, ready: false, beat: Date.now() }
   const save = () => { state.beat = Date.now(); atomicJson(statePath, state) }
   let offset = (() => { try { return statSync(session.termInbox || join(session.dir, 'inbox.jsonl')).size } catch { return 0 } })()
   const refuse = (request, why) => { send({ type: 'refused', requestId: request.requestId, reason: why }); audit({ type: 'refused', requestId: request.requestId, reason: why }) }
   const stop = async why => {
     if (stopped) return
     stopped = true; reason = why
-    if (active) await executor?.abort({ cancelled: true, reason: why })
+    if (executor?.job) await executor.abort({ cancelled: true, reason: why })
     else await executor?.kill()
   }
   const abortSignal = () => { void stop('owner interrupted') }
   signal?.addEventListener('abort', abortSignal, { once: true })
+  const ownerContinues = async () => {
+    if (stopped) return false
+    if (signal?.aborted) { await stop('owner interrupted'); return false }
+    const requestStop = read(stopPath)
+    if (requestStop?.grantId === grantId && requestStop.generation === generation) { await stop('owner stopped'); return false }
+    let live
+    try { live = session.requireLive() } catch { await stop('tunnel ended'); return false }
+    if (live.id !== generation || !live.connected || live.peerKey !== allowKey) { await stop('authenticated peer disconnected or changed'); return false }
+    return true
+  }
   async function handle(row) {
     if (stopped || row.from !== allowKey) return
     const request = decodeTermRow(row)
@@ -247,19 +258,28 @@ export async function serveTerminal({ session, allowKey, shell, cwd, env = proce
   }
   try {
     executor = new PersistentTerminalShell({ shell, env, cwd })
-    await executor.ready
-    if (executor.closed) throw new Error('selected shell exited before owner terminal became ready')
     state.shell = executor.shell; state.shellPid = executor.child.pid; save()
-    audit({ type: 'owner-opt-in', allowKey, shell: executor.shell })
-    onReady?.({ ...state })
-    while (!stopped) {
+    // OS spawn does not mean a cold PowerShell interpreter is ready. Complete a
+    // local no-op through the real command framing before advertising the grant.
+    // This separate bounded allowance never extends a remote command deadline.
+    let initialized = false, startupResult, startupError
+    const startup = executor.run(executor.powerShell ? '$null' : ':', { timeoutMs: startupTimeoutMs })
+      .then(result => { startupResult = result; initialized = true }, error => { startupError = error; initialized = true })
+    while (!initialized && await ownerContinues()) { save(); await sleep(50) }
+    await startup
+    if (!stopped) {
+      if (startupError) throw startupError
+      if (executor.closed || startupResult.code !== 0 || startupResult.timedOut || startupResult.cancelled) {
+        throw new Error(startupResult.error || (startupResult.timedOut ? `selected shell did not initialize within ${startupTimeoutMs} ms` : 'selected shell exited before owner terminal became ready'))
+      }
+      if (await ownerContinues()) {
+        state.ready = true; save()
+        audit({ type: 'owner-opt-in', allowKey, shell: executor.shell })
+        onReady?.({ ...state })
+      }
+    }
+    while (await ownerContinues()) {
       if (executor.closed && !active) { await stop('persistent shell exited'); break }
-      if (signal?.aborted) { await stop('owner interrupted'); break }
-      const requestStop = read(stopPath)
-      if (requestStop?.grantId === grantId && requestStop.generation === generation) { await stop('owner stopped'); break }
-      let live
-      try { live = session.requireLive() } catch { await stop('tunnel ended'); break }
-      if (live.id !== generation || !live.connected || live.peerKey !== allowKey) { await stop('authenticated peer disconnected or changed'); break }
       const incoming = session.readRows(session.termInbox || join(session.dir, 'inbox.jsonl'), offset)
       offset = incoming.next
       for (const row of incoming.rows) {
@@ -272,12 +292,15 @@ export async function serveTerminal({ session, allowKey, shell, cwd, env = proce
       }
       save(); await sleep(50)
     }
+  } catch (error) {
+    if (!stopped) reason = secretFilter.redact(error.message)
+    throw error
   } finally {
     await stop(reason)
     await Promise.allSettled([...handlers])
     const cleanup = await executor?.kill()
     if (cleanup?.cleanupFailed) { reason = 'cleanup failed: ' + cleanup.cleanupError; io.stderr?.write(reason + '\n') }
-    state.active = false; state.stopped = Date.now(); state.reason = reason; state.cleanupFailed = !!cleanup?.cleanupFailed; save()
+    state.active = false; state.ready = false; state.stopped = Date.now(); state.reason = reason; state.cleanupFailed = !!cleanup?.cleanupFailed; save()
     audit({ type: 'owner-revoked', reason })
     signal?.removeEventListener('abort', abortSignal)
     try { unlinkSync(lockPath) } catch {}

@@ -345,7 +345,9 @@ export async function tunnelMain(argv) {
       for (const event of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(event, cancel)
       try {
         const { serveTerminal } = await import('../src/tunnel-terminal-server.js')
-        const result = await serveTerminal({ session, allowKey, shell: flags.shell, signal: controller.signal })
+        console.log('Starting the persistent shell…')
+        const result = await serveTerminal({ session, allowKey, shell: flags.shell, signal: controller.signal,
+          onReady: () => console.log('Terminal ready for the allowed peer. Keep this owner console open.') })
         return result.cleanupFailed ? 3 : 0
       } finally { for (const event of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.removeListener(event, cancel) }
     }

@@ -13,6 +13,8 @@ On macOS/Linux, omit `--shell` to use the owner's `$SHELL`, or select `--shell s
 Windows defaults to PowerShell 7 when found, otherwise Windows PowerShell 5.1.
 The `--allow` key must match the currently authenticated, connected peer. The command
 requires local interactive input/output and stays in the foreground with an owner banner.
+Wait for `Terminal ready` before sending commands. A cold shell has a separate,
+bounded 45-second startup allowance; it does not consume or extend command deadlines.
 An agent must not run this command on behalf of the owner or manufacture an interactive
 terminal to obtain consent. There is no remote message or `--yes` flag that grants consent.
 

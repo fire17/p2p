@@ -17,7 +17,8 @@ const program = (shell, script) => {
   // quotes. Keep this fixture's Node argument independent of that legacy parser;
   // the actual terminal command still traverses the real chosen shell.
   const encoded = Buffer.from(script).toString('base64')
-  const argument = `eval(Buffer.from('${encoded}','base64').toString('utf8'))`
+  // Bun's eval scope does not inherit its synthetic module-level require.
+  const argument = `Function('require',Buffer.from('${encoded}','base64').toString('utf8'))(require)`
   return (powerShell(shell) ? '& ' : '') + quote(process.execPath, shell) + ' -e ' + quote(argument, shell)
 }
 function available(shell) {
