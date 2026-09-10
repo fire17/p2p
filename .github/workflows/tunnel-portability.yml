@@ -28,16 +28,18 @@ jobs:
       - name: Bun independent Noise and invite vectors
         run: bun test test/noise.test.js test/invite.test.js --timeout 45000
       - name: Windows first install and generated launchers (PowerShell 7)
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
         shell: pwsh
         run: |
+          ./test/installer-cmd-exit.ps1
           ./test/installer-windows.ps1 -PowerShellCommand pwsh
           ./test/installer-downloads.ps1 -PowerShellCommand pwsh
           ./test/installer-bun-windows.ps1 -PowerShellCommand pwsh
       - name: Windows first install and generated launchers (Windows PowerShell 5.1)
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
         shell: powershell
         run: |
+          ./test/installer-cmd-exit.ps1
           ./test/installer-windows.ps1 -PowerShellCommand powershell.exe
           ./test/installer-downloads.ps1 -PowerShellCommand powershell.exe
           ./test/installer-bun-windows.ps1 -PowerShellCommand powershell.exe
