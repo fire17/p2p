@@ -63,12 +63,12 @@ function Verify-Shims {
     [IO.File]::WriteAllText($runtimePath, (Join-Path $testRoot 'missing selected runtime.exe'))
     foreach ($shim in $shims) {
         $missing = Run-Shim $shim @('probe')
-        if ($missing.Code -eq 0 -or $missing.Output -notmatch 'selected runtime is missing') { throw "Missing Bun silently fell back to Node through $shim : $($missing.Output)" }
+        if ($missing.Code -eq 0 -or $missing.Output -notmatch 'selected runtime is missing') { throw "Missing runtime refusal failed through $shim : $($missing | ConvertTo-Json -Compress)" }
     }
     Remove-Item -LiteralPath $runtimePath
     foreach ($shim in $shims) {
         $missing = Run-Shim $shim @('probe')
-        if ($missing.Code -eq 0 -or $missing.Output -notmatch 'selected runtime path is missing') { throw "Missing runtime metadata silently fell back to Node through $shim : $($missing.Output)" }
+        if ($missing.Code -eq 0 -or $missing.Output -notmatch 'selected runtime path is missing') { throw "Missing metadata refusal failed through $shim : $($missing | ConvertTo-Json -Compress)" }
     }
     Write-Output 'PASS: actual Bun cmd/ps1 launchers preserve spaces, override stale Node, and refuse missing runtime or metadata.'
 }
