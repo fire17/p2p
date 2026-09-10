@@ -19,6 +19,9 @@ jobs:
         with:
           bun-version: '1.4.2'
       - name: Tunnel unit and isolated process tests
+        env:
+          P2P_TEST_BUN: bun
+          P2P_REQUIRE_WINDOWS_SHELLS: ${{ runner.os == 'Windows' && '1' || '0' }}
         shell: bash
         run: node --test test/tunnel*.test.js
       - name: Node and Bun interoperability

@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync,
+import { mkdirSync, openSync, closeSync, readSync, fstatSync, readFileSync, writeFileSync,
   unlinkSync, appendFileSync, existsSync, statSync, chmodSync } from 'node:fs'
 import { loadOrCreateIdentity, mintInvite, parseShare, decodeKey, peerKey, isOwnKey } from './lib.js'
 import { newId, chunk, decodeMsg, createAssembler, tunnelDir } from '../src/tunnel.js'
@@ -28,7 +28,7 @@ async function bounded(promise, ms, message) {
   try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(fail(message, 3)), ms) })]) }
   finally { clearTimeout(timer) }
 }
-const VALUE_FLAGS = new Set(['name', 'profile', 'wait', 'say', 'reply-to', 'rendezvous-dir', 'out', 'connect-timeout', 'file'])
+const VALUE_FLAGS = new Set(['name', 'profile', 'wait', 'say', 'reply-to', 'rendezvous-dir', 'out', 'connect-timeout', 'file', 'allow', 'shell', 'timeout'])
 export function parseArgs(argv) {
   const flags = Object.create(null), pos = []
   let literal = false
@@ -53,10 +53,20 @@ function seconds(value, fallback) {
   return n * 1000
 }
 export function readRows(file, offset = 0) {
-  let data
-  try { data = readFileSync(file) } catch (e) { if (e.code === 'ENOENT') return { rows: [], next: offset }; throw e }
-  if (!Number.isSafeInteger(offset) || offset < 0 || offset > data.length) throw fail('invalid mailbox cursor', 3)
-  const tail = data.subarray(offset), end = tail.lastIndexOf(10)
+  let fd, tail
+  try {
+    fd = openSync(file, 'r')
+    const size = fstatSync(fd).size
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > size) throw fail('invalid mailbox cursor', 3)
+    // Bound each poll and seek directly to the cursor; terminal output must not
+    // make the daemon re-read an ever-growing history on every 150ms tick.
+    const maxBytes = 8 * 1024 * 1024
+    const data = Buffer.allocUnsafe(Math.min(maxBytes, size - offset))
+    tail = data.subarray(0, readSync(fd, data, 0, data.length, offset))
+    if (tail.length === maxBytes && tail.lastIndexOf(10) < 0) throw fail('mailbox row exceeds 8 MiB', 3)
+  } catch (e) { if (e.code === 'ENOENT') return { rows: [], next: offset }; throw e }
+  finally { if (fd !== undefined) closeSync(fd) }
+  const end = tail.lastIndexOf(10)
   if (end < 0) return { rows: [], next: offset }
   const rows = tail.subarray(0, end).toString('utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
   return { rows, next: offset + end + 1 }
@@ -191,11 +201,15 @@ async function serve(s) {
       const frame = decodeMsg(data.toString('utf8'))
       if (frame?.of > 4096) return
       if (!frame || typeof frame.id !== 'string' || !/^[a-f0-9]{16}$/.test(frame.id) || typeof frame.text !== 'string') return
-      let assembler = assemblers.get(peer)
-      if (!assembler) { assembler = createAssembler(); assemblers.set(peer, assembler) }
+      const channel = frame.channel === undefined ? 'chat' : frame.channel
+      if (!['chat', 'term'].includes(channel)) return
+      let channels = assemblers.get(peer)
+      if (!channels) { channels = new Map(); assemblers.set(peer, channels) }
+      let assembler = channels.get(channel)
+      if (!assembler) { assembler = createAssembler(); channels.set(channel, assembler) }
       const full = assembler.push({ ...frame, from: peerKey(peer) })
       if (!full) return
-      try { append(s.f.inbox, { ...full, rx: new Date().toISOString() }); if (s.session.out) append(s.session.out, full); state.recv++; save() }
+      try { append(s.f.inbox, { ...full, rx: new Date().toISOString() }); if (s.session.out && full.channel !== 'term') append(s.session.out, full); state.recv++; save() }
       catch (error) { state.error = 'inbox write failed: ' + error.message; save(); shutdown() }
     })
     state.ready = true; save()
@@ -245,6 +259,10 @@ const HELP = `p2p tunnel — durable messages between agents
   recv                   read new JSON messages; --wait N waits, --all reads history
   status                 print daemon and peer state
   stop                   request this session's daemon to stop
+  terminal --allow KEY   owner enables a visible local terminal for the authenticated peer
+  terminal stop          owner revokes the terminal; chat keeps working
+  exec <COMMAND>         execute in the owner's persistent shell; --timeout N (default: 60)
+  shell                  line-oriented remote shell (.exit returns locally; no PTY)
 
   --name LABEL           separate mailbox (default: default)
   --profile NAME         identity profile (default: tunnel-LABEL)
@@ -260,7 +278,7 @@ export async function tunnelMain(argv) {
     const { flags, pos } = parseArgs(argv), command = pos.shift(), name = flags.name || 'default'
     if (!command || flags.help) { console.log(HELP); return 0 }
     location(name) // validate before any I/O
-    if (flags.file !== undefined && command !== 'send') throw fail('--file is only valid with send')
+    if (flags.file !== undefined && !['send', 'exec'].includes(command)) throw fail('--file is only valid with send or exec')
     const wait = seconds(flags.wait, 0)
     if (['listen', 'invite', 'join'].includes(command)) {
       const share = command === 'join' ? pos[0] : undefined
@@ -288,13 +306,49 @@ export async function tunnelMain(argv) {
         append(s.f.outbox, row); print({ connected: state.peerKey, queued: true, id: row.id })
       } else console.log(prompt(read(s.f.session).share, command === 'invite'))
       if (!wait) return 0
-      const inbound = await until(() => { const r = readRows(s.f.inbox); return r.rows.length ? r : null }, wait)
+      let replyOffset = 0
+      const inbound = await until(() => { const r = readRows(s.f.inbox, replyOffset); r.rows = r.rows.filter(row => row.channel !== 'term'); if (!r.rows.length) replyOffset = r.next; return r.rows.length ? r : null }, wait)
       if (!inbound) return 4
       inbound.rows.forEach(print); atomic(s.f.cursor, { offset: inbound.next }); return 0
     }
     const s = current(name)
     if (command === 'serve') { await serve(s); return 0 }
     if (command === 'status') { const state = read(s.f.state, {}); const up = !!live(s); print({ ...state, alive: up, dir: s.dir }); return up ? 0 : 5 }
+    if (['terminal', 'exec', 'shell'].includes(command)) {
+      const state = command === 'terminal' && pos[0] === 'stop' ? read(s.f.state, {}) : requireLive(s)
+      const session = { dir: s.dir, id: s.session.id, self: state.self, peerKey: state.peerKey, termInbox: s.f.inbox,
+        requireLive: () => requireLive(s), readRows, appendOutbox: row => append(s.f.outbox, row) }
+      if (command !== 'terminal') {
+        const { terminalClient } = await import('./tunnel-terminal-client.js')
+        return await terminalClient({ verb: command, pos, flags, session })
+      }
+      const ownerPath = join(s.dir, 'term-owner.json')
+      if (pos[0] === 'stop' && pos.length === 1) {
+        const owner = read(ownerPath)
+        if (!owner?.active) { print({ terminal: 'stopped' }); return 0 }
+        atomic(join(s.dir, 'term-stop.json'), { grantId: owner.grantId, generation: owner.generation })
+        const stopped = await until(() => { const latest = read(ownerPath); return latest && !latest.active ? latest : null }, 10000)
+        if (!stopped) throw fail('terminal has not acknowledged revocation; inspect its owner console', 4)
+        print({ terminal: stopped.cleanupFailed ? 'revoked-cleanup-failed' : 'stopped', reason: stopped.reason }); return stopped.cleanupFailed ? 3 : 0
+      }
+      if (pos.length || !flags.allow) throw fail('owner usage: terminal --allow KEY [--shell pwsh], or terminal stop')
+      const allowKey = flags.allow.trim().toUpperCase().replace(/[IL]/g, '1').replace(/O/g, '0')
+      try { decodeKey(allowKey) } catch { throw fail('--allow requires a complete contact key') }
+      if (!process.stdin.isTTY || !process.stdout.isTTY) throw fail('the PC owner must run terminal --allow directly in a local interactive terminal; no piped or background consent')
+      if (!state.connected || state.peerKey !== allowKey) throw fail('--allow must match the currently authenticated connected peer')
+      console.log('AGENT TUNNEL TERMINAL — OWNER OPT-IN')
+      console.log('Allowed authenticated peer: ' + allowKey)
+      console.log('Commands run as your current OS user, with access to its files and environment.')
+      console.log('Known secret values are redacted best-effort; unknown or transformed secrets may appear.')
+      console.log('Keep this console visible. Ctrl+C or `p2p tunnel terminal stop` revokes access; chat continues.')
+      const controller = new AbortController(), cancel = () => controller.abort()
+      for (const event of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(event, cancel)
+      try {
+        const { serveTerminal } = await import('../src/tunnel-terminal-server.js')
+        const result = await serveTerminal({ session, allowKey, shell: flags.shell, signal: controller.signal })
+        return result.cleanupFailed ? 3 : 0
+      } finally { for (const event of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.removeListener(event, cancel) }
+    }
     if (command === 'stop') {
       if (!live(s)) { print({ stopped: true, name }); return 0 }
       atomic(s.f.stop, { id: s.session.id })
@@ -326,15 +380,40 @@ export async function tunnelMain(argv) {
       if (Buffer.byteLength(text) > 1024 * 1024) throw fail('message exceeds 1 MiB')
       const row = { v: 1, from: state.self, id: newId(), t: new Date().toISOString(), text }
       if (flags['reply-to']) row.reply_to = flags['reply-to']
+      let ackOffset = 0
+      try { ackOffset = statSync(s.f.acks).size } catch (error) { if (error.code !== 'ENOENT') throw error }
       append(s.f.outbox, row); print({ id: row.id, queued: true })
       if (!wait) return 0
-      const ack = await until(() => readRows(s.f.acks).rows.find(a => a.id === row.id), wait)
+      const ack = await until(() => { const rows = readRows(s.f.acks, ackOffset); ackOffset = rows.next; return rows.rows.find(a => a.id === row.id) }, wait)
       if (!ack) return 4
       print(ack); return ack.delivered ? 0 : 3
     }
     if (command === 'recv') {
-      const offset = flags.all ? 0 : read(s.f.cursor, { offset: 0 }).offset
-      const inbound = await until(() => { const r = readRows(s.f.inbox, offset); return r.rows.length ? r : null }, wait)
+      if (flags.all) {
+        let historyOffset = 0
+        const found = await until(() => {
+          let any = false
+          for (;;) {
+            const page = readRows(s.f.inbox, historyOffset)
+            if (page.next === historyOffset) break
+            historyOffset = page.next
+            const chat = page.rows.filter(row => row.channel !== 'term')
+            chat.forEach(print); any ||= chat.length > 0
+          }
+          return any
+        }, wait)
+        return found ? 0 : wait ? 4 : 0
+      }
+      let offset = read(s.f.cursor, { offset: 0 }).offset
+      const inbound = await until(() => {
+        for (;;) {
+          const r = readRows(s.f.inbox, offset)
+          r.rows = r.rows.filter(row => row.channel !== 'term')
+          if (r.rows.length) return r
+          if (r.next === offset) return null
+          offset = r.next; atomic(s.f.cursor, { offset })
+        }
+      }, wait)
       if (!inbound) return wait ? 4 : 0
       inbound.rows.forEach(print)
       if (!flags.all) atomic(s.f.cursor, { offset: inbound.next })

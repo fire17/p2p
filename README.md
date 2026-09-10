@@ -26,6 +26,13 @@ p2p tunnel status
 p2p tunnel stop
 ```
 
+For a persistent command shell alongside chat, the computer's owner runs
+`p2p tunnel terminal --allow PEER_CONTACT_KEY` in a visible local terminal.
+The allowed peer can then use `p2p tunnel exec --file task.ps1 --timeout 60`
+or `p2p tunnel shell`. Ctrl+C in the owner console or `p2p tunnel terminal stop`
+revokes terminal access while chat stays connected.
+See [Agent Tunnel Terminal](docs/TERMINAL.md) for shell selection and limits.
+
 `--wait` on send checks a delivery acknowledgment; without it, success means queued.
 Use `--file` for UTF-8 logs and multiline replies, especially through Windows CMD.
 It preserves line breaks and avoids command-line quoting and length limits; the
