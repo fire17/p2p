@@ -31,7 +31,7 @@ try {
 
     $readyPath = Join-Path $testRoot 'ready.json'
     $serverInfo = New-Object Diagnostics.ProcessStartInfo
-    $serverInfo.FileName = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+    $serverInfo.FileName = (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $serverInfo.Arguments = '"' + (Join-Path $PSScriptRoot 'fixtures/installer-http.cjs') + '"'
     $serverInfo.UseShellExecute = $false
     $serverInfo.CreateNoWindow = $true
@@ -66,7 +66,7 @@ try {
     }
 
     if (-not $ContractOnly) {
-        $shellExe = (Get-Command $PowerShellCommand -CommandType Application -ErrorAction Stop).Source
+        $shellExe = (Get-Command $PowerShellCommand -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         $archiveRoot = Join-Path $testRoot 'p2p-fixture'
         New-Item -ItemType Directory -Path $archiveRoot | Out-Null
         foreach ($entry in @('bin', 'src', 'package.json')) {
