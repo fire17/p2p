@@ -408,18 +408,12 @@ setlocal
 if "%P2P_HOME%"=="" set "P2P_HOME=%USERPROFILE%\.p2p"
 set "P2P_APP=%P2P_HOME%\app"
 set "P2P_NODE="
-if exist "%P2P_HOME%\runtime.kind" if not exist "%P2P_HOME%\runtime.path" (
-  echo p2p: selected runtime path is missing. Re-run the installer. 1>&2
-  exit /b 1
-)
-if exist "%P2P_HOME%\runtime.path" (
-  for /f "usebackq delims=" %%N in ("%P2P_HOME%\runtime.path") do if exist "%%~N" set "P2P_NODE=%%~N"
-  if not defined P2P_NODE (
-    echo p2p: selected runtime is missing. Re-run the installer. 1>&2
-    exit /b 1
-  )
-  goto runtime_ready
-)
+if exist "%P2P_HOME%\runtime.kind" if not exist "%P2P_HOME%\runtime.path" goto runtime_path_missing
+if not exist "%P2P_HOME%\runtime.path" goto legacy_runtime
+for /f "usebackq delims=" %%N in ("%P2P_HOME%\runtime.path") do if exist "%%~N" set "P2P_NODE=%%~N"
+if not defined P2P_NODE goto runtime_missing
+goto runtime_ready
+:legacy_runtime
 if exist "%P2P_HOME%\runtime\node.exe" (
   set "P2P_NODE=%P2P_HOME%\runtime\node.exe"
 ) else (
@@ -434,8 +428,15 @@ if not exist "%P2P_APP%\bin\p2p.js" (
   exit /b 1
 )
 "%P2P_NODE%" "%P2P_APP%\bin\p2p.js" %*
+exit /b %errorlevel%
+:runtime_missing
+echo p2p: selected runtime is missing. Re-run the installer. 1>&2
+exit /b 1
+:runtime_path_missing
+echo p2p: selected runtime path is missing. Re-run the installer. 1>&2
+exit /b 1
 '@
-  Set-Content -LiteralPath $cmdShim -Value $cmdBody -Encoding ASCII
+  [IO.File]::WriteAllText($cmdShim, ($cmdBody -replace "`r?`n", "`r`n") + "`r`n", [Text.Encoding]::ASCII)
 
   $ps1Shim = Join-Path $BinDir 'p2p.ps1'
   $ps1Body = @'

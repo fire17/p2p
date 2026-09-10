@@ -11,7 +11,7 @@ try {
     $body = [regex]::Match($source, '(?s)\$cmdBody = @''\r?\n(.*?)\r?\n''@').Groups[1].Value
     if (-not $body) { throw 'CMD template not found' }
     $shim = Join-Path $root 'p2p.cmd'
-    [IO.File]::WriteAllText($shim, $body, [Text.Encoding]::ASCII)
+    [IO.File]::WriteAllText($shim, ($body -replace "`r?`n", "`r`n") + "`r`n", [Text.Encoding]::ASCII)
     $ErrorActionPreference = 'Continue'
     $directOutput = & $shim probe 2>&1 | Out-String
     $directCode = $global:LASTEXITCODE
