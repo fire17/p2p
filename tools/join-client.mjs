@@ -1,7 +1,7 @@
 // Embedded by render-join.mjs after the SHA-pinned installer succeeds.
 // Only chat operations: local terminal permission is never requested or enabled here.
 import { spawnSync } from 'node:child_process'
-import { readdirSync, writeFileSync, unlinkSync } from 'node:fs'
+import { readdirSync, writeFileSync, unlinkSync, realpathSync, existsSync } from 'node:fs'
 import { hostname, userInfo, platform, arch } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -12,10 +12,15 @@ const fail = (message, code = 2) => { throw Object.assign(new Error(message), { 
 if (!/^0[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$/.test(key || '')) fail('invalid listener key')
 if (!home) fail('installation home is missing')
 if (!process.versions.bun) fail('the selected runtime is not Bun')
-const app = join(resolve(home), 'app')
+// Windows temp/home paths can contain 8.3 aliases. Resolve the actual installed
+// location before module loading and CLI launch, while preserving Unicode names.
+let app
+try { app = realpathSync(join(resolve(home), 'app')) }
+catch (error) { fail('cannot locate the installed application: ' + error.message) }
 let keyModule
-try { keyModule = await import(pathToFileURL(join(app, 'src', 'key.js')).href) }
-catch (error) { fail('cannot load the installed key validator: ' + error.message) }
+const keyFile = join(app, 'src', 'key.js')
+try { keyModule = await import(pathToFileURL(realpathSync(keyFile)).href) }
+catch (error) { fail('cannot load the installed key validator (file exists: ' + existsSync(keyFile) + '): ' + error.message) }
 try { keyModule.decodeKey(key) }
 catch (error) { fail('listener key checksum is invalid: ' + error.message) }
 const name = 'join-' + key

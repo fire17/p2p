@@ -27,8 +27,9 @@
     foreach ($joinName in $joinEnv.Keys) { [Environment]::SetEnvironmentVariable($joinName, $joinEnv[$joinName], 'Process') }
     # Isolate the installer's explicit exit statements from the interactive owner shell.
     $joinShell = (Get-Process -Id $PID).Path
+    $global:LASTEXITCODE = 0
     & $joinShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $joinInstaller
-    if ($LASTEXITCODE -ne 0) { throw "Verified installer failed (exit $LASTEXITCODE); see the p2p install.log" }
+    if ($global:LASTEXITCODE -ne 0) { throw "Verified installer failed (exit $global:LASTEXITCODE); see the p2p install.log" }
     $joinUserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
     $joinHome = if ($env:P2P_HOME) { $env:P2P_HOME } else { Join-Path $joinUserHome '.p2p' }
     if ((Get-Content -LiteralPath (Join-Path $joinHome 'runtime.kind') -Raw).Trim() -ne 'bun') { throw 'Installer did not select Bun' }
@@ -39,7 +40,7 @@
 // Embedded by render-join.mjs after the SHA-pinned installer succeeds.
 // Only chat operations: local terminal permission is never requested or enabled here.
 import { spawnSync } from 'node:child_process'
-import { readdirSync, writeFileSync, unlinkSync } from 'node:fs'
+import { readdirSync, writeFileSync, unlinkSync, realpathSync, existsSync } from 'node:fs'
 import { hostname, userInfo, platform, arch } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -50,10 +51,15 @@ const fail = (message, code = 2) => { throw Object.assign(new Error(message), { 
 if (!/^0[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$/.test(key || '')) fail('invalid listener key')
 if (!home) fail('installation home is missing')
 if (!process.versions.bun) fail('the selected runtime is not Bun')
-const app = join(resolve(home), 'app')
+// Windows temp/home paths can contain 8.3 aliases. Resolve the actual installed
+// location before module loading and CLI launch, while preserving Unicode names.
+let app
+try { app = realpathSync(join(resolve(home), 'app')) }
+catch (error) { fail('cannot locate the installed application: ' + error.message) }
 let keyModule
-try { keyModule = await import(pathToFileURL(join(app, 'src', 'key.js')).href) }
-catch (error) { fail('cannot load the installed key validator: ' + error.message) }
+const keyFile = join(app, 'src', 'key.js')
+try { keyModule = await import(pathToFileURL(realpathSync(keyFile)).href) }
+catch (error) { fail('cannot load the installed key validator (file exists: ' + existsSync(keyFile) + '): ' + error.message) }
 try { keyModule.decodeKey(key) }
 catch (error) { fail('listener key checksum is invalid: ' + error.message) }
 const name = 'join-' + key
@@ -121,8 +127,9 @@ console.log('Terminal activation is separate. This join line does not grant remo
 }
 try { await main() } catch (error) { console.error('Agent Tunnel: ' + error.message); process.exitCode = error.exitCode || 3 }
 '@, (New-Object Text.UTF8Encoding($false)))
+    $global:LASTEXITCODE = 0
     & $joinRuntime $joinHelper $joinKey $joinHome
-    if ($LASTEXITCODE -ne 0) { throw "Agent Tunnel join failed (exit $LASTEXITCODE)" }
+    if ($global:LASTEXITCODE -ne 0) { throw "Agent Tunnel join failed (exit $global:LASTEXITCODE)" }
     # Native failures from deliberate earlier attempts must not poison a successful rerun.
     $global:LASTEXITCODE = 0
   } finally {

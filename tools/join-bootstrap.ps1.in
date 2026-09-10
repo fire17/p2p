@@ -27,8 +27,9 @@
     foreach ($joinName in $joinEnv.Keys) { [Environment]::SetEnvironmentVariable($joinName, $joinEnv[$joinName], 'Process') }
     # Isolate the installer's explicit exit statements from the interactive owner shell.
     $joinShell = (Get-Process -Id $PID).Path
+    $global:LASTEXITCODE = 0
     & $joinShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $joinInstaller
-    if ($LASTEXITCODE -ne 0) { throw "Verified installer failed (exit $LASTEXITCODE); see the p2p install.log" }
+    if ($global:LASTEXITCODE -ne 0) { throw "Verified installer failed (exit $global:LASTEXITCODE); see the p2p install.log" }
     $joinUserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
     $joinHome = if ($env:P2P_HOME) { $env:P2P_HOME } else { Join-Path $joinUserHome '.p2p' }
     if ((Get-Content -LiteralPath (Join-Path $joinHome 'runtime.kind') -Raw).Trim() -ne 'bun') { throw 'Installer did not select Bun' }
@@ -38,8 +39,9 @@
     [IO.File]::WriteAllText($joinHelper, @'
 @@HELPER@@
 '@, (New-Object Text.UTF8Encoding($false)))
+    $global:LASTEXITCODE = 0
     & $joinRuntime $joinHelper $joinKey $joinHome
-    if ($LASTEXITCODE -ne 0) { throw "Agent Tunnel join failed (exit $LASTEXITCODE)" }
+    if ($global:LASTEXITCODE -ne 0) { throw "Agent Tunnel join failed (exit $global:LASTEXITCODE)" }
     # Native failures from deliberate earlier attempts must not poison a successful rerun.
     $global:LASTEXITCODE = 0
   } finally {

@@ -86,9 +86,17 @@ test('join fixture runtime is available when CI requires it', () => {
 })
 
 test('join helper: real encrypted connection, acknowledged identity, same-session rerun, stable restart, older default reuse', { skip: !bun, timeout: 90000 }, async () => {
-  await fixture(async ({ host, home, key, env }) => {
+  await fixture(async ({ temp, host, home, key, env }) => {
     const launch = () => run(bun, [helper, key, home], env)
     let result = await launch()
+    if (result.code !== 0 && process.platform === 'win32') {
+      // Capture loader-vs-filesystem evidence on the actual Windows runner. This
+      // is diagnostic only: neither production nor the test retries a failed join.
+      const probe = join(temp, 'module-diagnostic.mjs')
+      writeFileSync(probe, "import {readFileSync,realpathSync} from 'node:fs';import {pathToFileURL} from 'node:url';const r={};try{r.bytes=readFileSync(process.argv[2]).length;r.realpath=realpathSync(process.argv[2]);for(const [kind,spec] of [['fileURL',pathToFileURL(r.realpath).href],['filesystem',r.realpath]]){try{r[kind]=typeof(await import(spec)).decodeKey}catch(e){r[kind]=e.message}}}catch(e){r.fsError=e.message}console.log(JSON.stringify(r))\n")
+      const evidence = await run(bun, [probe, join(home, 'app', 'src', 'key.js')], env)
+      result.err += '\nWindows module diagnostics: ' + evidence.out + evidence.err
+    }
     assert.equal(result.code, 0, result.out + result.err)
     assert.match(result.out, /Terminal activation is separate/)
     const first = await status(home, 'join-' + key)
@@ -151,10 +159,13 @@ for (const shell of shells) test(`join bootstrap ${shell.label}: HTTP integrity 
     const sha256 = createHash('sha256').update(installer).digest('hex')
     const fixtureEnv = { ...env, P2P_TEST_BUN: bun, P2P_JOIN_FIXTURE_MARKER: marker, P2P_REF: 'fixture-original', TMPDIR: temp, TEMP: temp, TMP: temp }
     const entryUrl = 'http://127.0.0.1:' + server.address().port + '/join/' + key + (shell.platform === 'ps1' ? '.ps1' : '')
-    const invoke = async (script, extraEnv = {}) => {
+    const invoke = async (script, extraEnv = {}, callerExit = null) => {
       servedScript = script
+      const expression = "try { irm '" + entryUrl + "' | iex } finally { if($env:P2P_REF -ne 'fixture-original') { throw 'Caller environment was not restored' } }"
+      const psCommand = callerExit === null ? '$PSNativeCommandUseErrorActionPreference=$true; ' + expression
+        : 'function Invoke-JoinFixture { $LASTEXITCODE=' + callerExit + '; $PSNativeCommandUseErrorActionPreference=$false; try { ' + expression + ' } finally { Write-Output "CALLER_EXIT=$LASTEXITCODE GLOBAL_EXIT=$global:LASTEXITCODE" } }; Invoke-JoinFixture'
       const args = shell.platform === 'sh' ? ['-c', "curl -fsSL '" + entryUrl + "' | sh"]
-        : ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$PSNativeCommandUseErrorActionPreference=$true; try { irm '" + entryUrl + "' | iex } finally { if($env:P2P_REF -ne 'fixture-original') { throw 'Caller environment was not restored' } }"]
+        : ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psCommand]
       return run(shell.exe, args, { ...fixtureEnv, ...extraEnv })
     }
     try {
@@ -174,6 +185,24 @@ for (const shell of shells) test(`join bootstrap ${shell.label}: HTTP integrity 
       result = await invoke(good, { P2P_JOIN_FIXTURE_FAIL: '1' })
       assert.notEqual(result.code, 0, result.out + result.err)
       assert.equal((await status(home, 'join-' + key)).pid, first.pid, 'installer failure preserves the active daemon')
+      if (shell.platform === 'ps1') {
+        result = await invoke(good, { P2P_JOIN_FIXTURE_FAIL: '1' }, 0)
+        assert.notEqual(result.code, 0, result.out + result.err)
+        assert.match(result.err + result.out, /Verified installer failed \(exit 7\)/)
+        assert.match(result.out, /CALLER_EXIT=0 GLOBAL_EXIT=7/)
+        const validator = join(home, 'app', 'src', 'key.js'), original = readFileSync(validator)
+        try {
+          writeFileSync(validator, "throw new Error('fixture-helper-failure')\n")
+          result = await invoke(good, {}, 0)
+          assert.notEqual(result.code, 0, result.out + result.err)
+          assert.match(result.err + result.out, /Agent Tunnel join failed \(exit 2\)/)
+          assert.match(result.out, /CALLER_EXIT=0 GLOBAL_EXIT=2/)
+        } finally { writeFileSync(validator, original) }
+        result = await invoke(good, {}, 7)
+        assert.equal(result.code, 0, result.out + result.err)
+        assert.match(result.out, /CALLER_EXIT=7 GLOBAL_EXIT=0/)
+        assert.equal((await status(home, 'join-' + key)).pid, first.pid)
+      }
       assert.equal(readdirSync(temp).some(name => name.startsWith('p2p-join.')), false)
       assert.equal(readdirSync(temp).some(name => name.startsWith('p2p-join-')), false)
     } finally { await new Promise(resolve => server.close(resolve)) }

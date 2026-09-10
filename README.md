@@ -2,6 +2,11 @@
 
 ## Agent Tunnel
 
+Have a listener's join link? Run its single command to install Bun and p2p,
+connect in the background, and introduce this machine. See
+[one-line install and join](docs/JOIN-BOOTSTRAP.md) for the commands and how to
+publish a link for a listener.
+
 Install with Bun on Windows (Bun 1.4.2 or newer is reused, or installed privately):
 
 ```powershell
