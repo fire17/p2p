@@ -29,7 +29,9 @@ function Run-Shim([string]$shim, [string[]]$arguments) {
         $ErrorActionPreference = 'Continue'
         if ($shim.EndsWith('.ps1')) { $output = & $shellExe -NoProfile -NonInteractive -File $shim @arguments 2>&1 | Out-String }
         else { $output = & $shim @arguments 2>&1 | Out-String }
-        $code = $LASTEXITCODE
+        # A prior in-process .ps1 exit can leave a nearer-scope LASTEXITCODE that
+        # shadows the global variable updated by this native .cmd/.exe process.
+        $code = $global:LASTEXITCODE
         return [PSCustomObject]@{ Code = $code; Output = $output }
     } finally { $ErrorActionPreference = $priorPreference }
 }
@@ -128,7 +130,7 @@ try {
         $env:P2P_BUN_DIST = if ($case -eq 'bad') { "$baseUrl/bad" } elseif ($case -eq 'existing') { 'file:///bun-bootstrap-must-not-run' } else { "$baseUrl/good" }
         $outputFile = Join-Path $testRoot "$case.out"
         & $shellExe -NoProfile -NonInteractive -Command 'Get-Content -LiteralPath $env:P2P_INSTALLER_TEST_SOURCE -Raw -Encoding UTF8 | Invoke-Expression' *> $outputFile
-        $installCode = $LASTEXITCODE
+        $installCode = $global:LASTEXITCODE
         $output = Get-Content -LiteralPath $outputFile -Raw
         if ($case -eq 'bad') {
             if ($installCode -eq 0 -or $output -notmatch 'Bun checksum MISMATCH') { throw "Bad Bun checksum was not refused: $output" }
@@ -146,7 +148,7 @@ try {
         $env:P2P_FORCE_BUN_BOOTSTRAP = '0'
         $env:P2P_BUN_DIST = 'file:///update-must-reuse-selected-bun'
         & $shellExe -NoProfile -NonInteractive -Command 'Get-Content -LiteralPath $env:P2P_INSTALLER_TEST_SOURCE -Raw -Encoding UTF8 | Invoke-Expression' *> $outputFile
-        if ($LASTEXITCODE -ne 0) { throw "Plain update failed: $(Get-Content -LiteralPath $outputFile -Raw)" }
+        if ($global:LASTEXITCODE -ne 0) { throw "Plain update failed: $(Get-Content -LiteralPath $outputFile -Raw)" }
         Verify-Shims
         Write-Output "PASS: $case actual Bun 1.4.2 install under $PowerShellCommand."
     }
