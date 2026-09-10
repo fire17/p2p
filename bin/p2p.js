@@ -205,7 +205,7 @@ async function main() {
 
   switch (cmd) {
     case 'tunnel': {
-      const { tunnelMain } = await import(join(HERE, 'p2p-tunnel.js'))
+      const { tunnelMain } = await import('./p2p-tunnel.js')
       const args = [...argv]
       args.splice(args.indexOf('tunnel'), 1)
       process.exitCode = await tunnelMain(args)

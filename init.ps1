@@ -146,7 +146,7 @@ try {
   # ── 1. node >= 22 ─────────────────────────────────────────────────────────────
   Step 'find-node'
   function NodeMajor([string]$exe) {
-    try { $v = & $exe -e 'process.stdout.write(process.versions.node.split(".")[0])' 2>$null; return [int]$v } catch { return 0 }
+    try { $v = & $exe -e 'process.stdout.write(String(parseInt(process.versions.node)))' 2>$null; return [int]$v } catch { return 0 }
   }
   function NodeOk([string]$exe) {
     if (-not $exe) { return $false }
