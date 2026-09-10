@@ -181,6 +181,7 @@ const HELP = `${bold('p2p')} — MITM-proof, zero-dependency P2P chat
   ${bold('p2p chat')} [KEY]          line-mode chat (scriptable)
   ${bold('p2p listen')}              line-mode: go online, print your key, wait
   ${bold('p2p connect')} <KEY|SHARE|name>  line-mode: dial a key, an invite share string, or a friend
+  ${bold('p2p tunnel')}            durable agent messaging (listen/invite/join/send/recv)
   ${bold('p2p invite')}              mint a ONE-TIME private invite (S-…) and listen for it
   ${bold('p2p group new')} [KEY ...]  create an E2E group chat with those member keys -> prints a CODE
   ${bold('p2p group join')} <CODE>    join a group you were given the code for
@@ -199,10 +200,17 @@ async function main() {
   const cmd = positional[0]
   // `p2p group --help` must reach the GROUP help, not this one — so let a sub-command with its own
   // help surface claim the flag first.
-  if ((argv.includes('--help') || argv.includes('-h')) && cmd !== 'group' && cmd !== 'g') { console.log(HELP); return }
+  if ((argv.includes('--help') || argv.includes('-h')) && cmd !== 'group' && cmd !== 'g' && cmd !== 'tunnel') { console.log(HELP); return }
   if (argv.includes('--selftest')) return selftest()
 
   switch (cmd) {
+    case 'tunnel': {
+      const { tunnelMain } = await import(join(HERE, 'p2p-tunnel.js'))
+      const args = [...argv]
+      args.splice(args.indexOf('tunnel'), 1)
+      process.exitCode = await tunnelMain(args)
+      return
+    }
     case undefined:
       return launchTui(argv) // no command -> TUI listen
     case 'tui':

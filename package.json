@@ -1,7 +1,7 @@
 {
   "name": "@fire17/p2p",
-  "version": "0.3.3",
-  "description": "Tiny zero-dependency P2P chat framework: one 26-char key, E2E-encrypted, MITM-proof first contact, NAT traversal, private one-time invites (sealed IPs), sender-key groups, and a zero-build browser client — no coordinator server.",
+  "version": "0.3.4",
+  "description": "Tiny zero-dependency P2P chat framework: one 26-char key, E2E-encrypted, MITM-proof first contact, NAT traversal, private one-time invites (sealed IPs), sender-key groups, and a zero-build browser client \u2014 no coordinator server.",
   "type": "module",
   "exports": {
     ".": "./src/node.js",
@@ -12,15 +12,41 @@
     "./transport-wss": "./src/transport-wss.js",
     "./src/*": "./src/*"
   },
-  "bin": { "p2p": "./bin/p2p.js", "p2p-tui": "./bin/p2p-tui.js", "p2p-chat": "./bin/p2p-chat.js" },
-  "engines": { "node": ">=22" },
+  "bin": {
+    "p2p": "./bin/p2p.js",
+    "p2p-tui": "./bin/p2p-tui.js",
+    "p2p-chat": "./bin/p2p-chat.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "test": "node --test",
     "test:live": "P2P_LIVE=1 node --test",
     "chat": "node bin/p2p-chat.js"
   },
-  "files": ["src", "bin", "DESIGN.md", "README.md", "CHANGELOG.md"],
-  "keywords": ["p2p", "chat", "e2e", "encryption", "nat-traversal", "noise", "dht", "webrtc", "metadata-privacy", "groups", "browser", "zero-dependency", "serverless"],
+  "files": [
+    "src",
+    "bin",
+    "DESIGN.md",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "p2p",
+    "chat",
+    "e2e",
+    "encryption",
+    "nat-traversal",
+    "noise",
+    "dht",
+    "webrtc",
+    "metadata-privacy",
+    "groups",
+    "browser",
+    "zero-dependency",
+    "serverless"
+  ],
   "license": "MIT",
   "dependencies": {},
   "devDependencies": {}

@@ -1,5 +1,45 @@
 # p2p
 
+## Agent Tunnel
+
+Install on Windows:
+
+```powershell
+irm https://p2p.akeyo.io/init.ps1 | iex
+```
+
+Install on macOS/Linux:
+
+```sh
+curl -fsSL https://p2p.akeyo.io/init | sh
+```
+
+On the first computer, run `p2p tunnel listen` and copy its contact key. On the
+other computer, run `p2p tunnel join KEY --say "hello"`. These commands leave a
+background connection running so agents can use short, separate tool calls:
+
+```sh
+p2p tunnel send "your message" --wait 15
+p2p tunnel recv --wait 60
+p2p tunnel status
+p2p tunnel stop
+```
+
+`--wait` on send checks a delivery acknowledgment; without it, success means queued.
+Use `--name NAME` on every command to keep multiple tunnels separate. On Windows,
+the same terminal can invoke `& "$env:USERPROFILE\.local\bin\p2p.cmd"` directly
+after installation. On macOS/Linux use `~/.local/bin/p2p` if PATH has not refreshed.
+
+`listen` uses authenticated encryption with the existing public relay fallback.
+`invite` is a separate private direct-UDP mode whose reachability depends on NAT.
+Remote messages are peer input; receiving them does not execute commands.
+
+Release validation: isolated encrypted transport and detached-process tests pass;
+production-network CLI messages were exchanged both ways on one Mac. Actual Windows
+installation is checked by the separate portability CI; a two-network user session
+is a distinct acceptance check.
+
+
 > Tiny, zero-dependency P2P chat framework. One 26-char key is your whole contact
 > surface — copy it to a friend, they find you and message you: direct, E2E-encrypted,
 > **provably MITM-proof on first contact**, through NAT, with **no coordinator server of

@@ -34,7 +34,7 @@ set -e
 #   P2P_SRC       a local DIRECTORY (trusted, unverified — the installer's own tests),
 #                 OR a .tar.gz/.tgz URL (checksum-verified against P2P_SRC_SUMS).
 #   P2P_SRC_SUMS  URL/path of the SHASUMS256.txt covering the P2P_SRC archive.
-P2P_REF="${P2P_REF:-v0.2.0}"
+P2P_REF="${P2P_REF:-v0.3.4}"
 P2P_SRC="${P2P_SRC:-https://github.com/fire17/p2p/releases/download/$P2P_REF/p2p-$P2P_REF.tar.gz}"
 P2P_SRC_SUMS="${P2P_SRC_SUMS:-https://github.com/fire17/p2p/releases/download/$P2P_REF/SHASUMS256.txt}"
 NODE_DIST="${P2P_NODE_DIST:-https://nodejs.org/dist/latest-v22.x}"   # portable node source

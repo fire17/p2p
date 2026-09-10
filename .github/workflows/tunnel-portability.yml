@@ -1,0 +1,24 @@
+name: tunnel portability
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tunnel:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Tunnel unit and isolated process tests
+        shell: bash
+        run: node --test test/tunnel*.test.js
+      - name: Windows first install and generated launchers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./test/installer-windows.ps1
