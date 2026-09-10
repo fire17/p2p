@@ -18,7 +18,11 @@ jobs:
       - name: Tunnel unit and isolated process tests
         shell: bash
         run: node --test test/tunnel*.test.js
-      - name: Windows first install and generated launchers
+      - name: Windows first install and generated launchers (PowerShell 7)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./test/installer-windows.ps1
+        run: ./test/installer-windows.ps1 -PowerShellCommand pwsh
+      - name: Windows first install and generated launchers (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./test/installer-windows.ps1 -PowerShellCommand powershell.exe
