@@ -5,11 +5,12 @@ import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync, renameSync,
+import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync,
   unlinkSync, appendFileSync, existsSync, statSync, chmodSync } from 'node:fs'
 import { loadOrCreateIdentity, mintInvite, parseShare, decodeKey, peerKey, isOwnKey } from './lib.js'
 import { newId, chunk, decodeMsg, createAssembler, tunnelDir } from '../src/tunnel.js'
 import { createInvite } from '../src/invite.js'
+import { atomicJson as atomic } from '../src/atomic-json.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -18,11 +19,6 @@ const pidAlive = pid => { if (!Number.isInteger(pid) || pid < 1) return false; t
 const fail = (message, code = 2) => Object.assign(new Error(message), { exitCode: code })
 const print = value => console.log(JSON.stringify(value))
 const append = (p, value) => appendFileSync(p, JSON.stringify(value) + '\n', { mode: 0o600 })
-function atomic(p, value) {
-  const tmp = p + '.' + process.pid + '.' + randomBytes(4).toString('hex') + '.tmp'
-  writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 })
-  renameSync(tmp, p)
-}
 async function until(fn, ms) {
   const end = Date.now() + ms
   do { const value = fn(); if (value) return value; if (Date.now() >= end) return null; await sleep(Math.min(50, end - Date.now())) } while (true)
@@ -32,7 +28,7 @@ async function bounded(promise, ms, message) {
   try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(fail(message, 3)), ms) })]) }
   finally { clearTimeout(timer) }
 }
-const VALUE_FLAGS = new Set(['name', 'profile', 'wait', 'say', 'reply-to', 'rendezvous-dir', 'out', 'connect-timeout'])
+const VALUE_FLAGS = new Set(['name', 'profile', 'wait', 'say', 'reply-to', 'rendezvous-dir', 'out', 'connect-timeout', 'file'])
 export function parseArgs(argv) {
   const flags = Object.create(null), pos = []
   let literal = false
@@ -245,6 +241,7 @@ const HELP = `p2p tunnel — durable messages between agents
   invite                 start a private direct-UDP invite; print its contact prompt
   join <KEY|SHARE>        connect, send hello, then return (use --wait N to wait for a reply)
   send <TEXT>             queue text; --wait N waits for its delivery acknowledgment
+  send --file PATH        queue a UTF-8 file, preserving multiline text without shell quoting
   recv                   read new JSON messages; --wait N waits, --all reads history
   status                 print daemon and peer state
   stop                   request this session's daemon to stop
@@ -263,6 +260,7 @@ export async function tunnelMain(argv) {
     const { flags, pos } = parseArgs(argv), command = pos.shift(), name = flags.name || 'default'
     if (!command || flags.help) { console.log(HELP); return 0 }
     location(name) // validate before any I/O
+    if (flags.file !== undefined && command !== 'send') throw fail('--file is only valid with send')
     const wait = seconds(flags.wait, 0)
     if (['listen', 'invite', 'join'].includes(command)) {
       const share = command === 'join' ? pos[0] : undefined
@@ -307,9 +305,26 @@ export async function tunnelMain(argv) {
     if (command === 'send') {
       const state = requireLive(s)
       if (!state.connected) throw fail('peer is not connected', 3)
-      if (pos.length !== 1) throw fail('send needs one quoted text argument (use -- before text starting with --)')
-      if (Buffer.byteLength(pos[0]) > 1024 * 1024) throw fail('message exceeds 1 MiB')
-      const row = { v: 1, from: state.self, id: newId(), t: new Date().toISOString(), text: pos[0] }
+      let text
+      if (flags.file !== undefined) {
+        if (pos.length) throw fail('send accepts either one text argument or --file PATH, not both')
+        try {
+          const info = statSync(flags.file)
+          if (!info.isFile()) throw fail('--file must name a regular UTF-8 file')
+          if (info.size > 1024 * 1024) throw fail('message exceeds 1 MiB')
+          const bytes = readFileSync(flags.file)
+          if (bytes.length > 1024 * 1024) throw fail('message exceeds 1 MiB')
+          text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+        } catch (error) {
+          if (error.exitCode) throw error
+          throw fail('cannot read UTF-8 message file: ' + error.message)
+        }
+      } else {
+        if (pos.length !== 1) throw fail('send needs one quoted text argument or --file PATH (use -- before text starting with --)')
+        text = pos[0]
+      }
+      if (Buffer.byteLength(text) > 1024 * 1024) throw fail('message exceeds 1 MiB')
+      const row = { v: 1, from: state.self, id: newId(), t: new Date().toISOString(), text }
       if (flags['reply-to']) row.reply_to = flags['reply-to']
       append(s.f.outbox, row); print({ id: row.id, queued: true })
       if (!wait) return 0

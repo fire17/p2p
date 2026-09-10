@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, readFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -53,6 +53,24 @@ test('tunnel: detached CLI, real private handshake, exact long UTF-8, isolation,
     assert.equal(rows(received.out)[0].from, state(a).self)
     assert.equal((await run(b, ['recv'])).out, '', 'cursor consumes message once')
     assert.equal(rows((await run(b, ['recv', '--all'])).out).length, 1, 'history stays readable')
+    const messagePath = join(dir, 'multiline message.txt')
+    const fileText = 'RESULT: first line\r\nשלום 🌻 "quoted" %PATH% & | $()\n'.repeat(1500)
+    writeFileSync(messagePath, fileText, 'utf8')
+    const fileSent = await run(b, ['send', '--file', messagePath, '--wait', '5'])
+    assert.equal(fileSent.code, 0, fileSent.err)
+    assert.equal(rows(fileSent.out).at(-1).delivered, true)
+    const fileReceived = await run(a, ['recv', '--wait', '3'])
+    assert.equal(fileReceived.code, 0, fileReceived.err)
+    assert.equal(rows(fileReceived.out)[0].text, fileText, 'file exceeds Windows argv limit and preserves exact multiline content')
+    assert.equal(rows(fileReceived.out)[0].from, state(b).self)
+    const beforeRejected = readFileSync(join(state(b).dir, 'outbox.jsonl'), 'utf8')
+    assert.equal((await run(b, ['send', 'ambiguous', '--file', messagePath])).code, 2)
+    assert.equal((await run(b, ['send', '--file', join(dir, 'missing.txt')])).code, 2)
+    writeFileSync(messagePath, Buffer.from([0xff, 0xfe, 0, 0]))
+    assert.equal((await run(b, ['send', '--file', messagePath])).code, 2, 'invalid UTF-8 is refused, never silently replaced')
+    writeFileSync(messagePath, Buffer.alloc(1024 * 1024 + 1, 65))
+    assert.equal((await run(b, ['send', '--file', messagePath])).code, 2, 'oversized file is refused')
+    assert.equal(readFileSync(join(state(b).dir, 'outbox.jsonl'), 'utf8'), beforeRejected, 'rejected inputs never enter the outbox')
     assert.equal((await run(b, ['stop'])).code, 0)
     assert.equal((await run(b, ['status'])).code, 5)
     assert.equal((await run(b, ['send', 'must not queue'])).code, 5)
