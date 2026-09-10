@@ -26,6 +26,18 @@ one created by the older two-command prompt. It reuses that daemon. Otherwise it
 creates `join-<KEY>` with the same named persistent identity profile. Rerunning
 after stopping preserves that identity. It does not stop another connection.
 
+The genuine older prompt did not supply `--profile`, so its identity lives only
+in the running daemon. Reusing that live session prints this limitation. Once it
+stops or the machine reboots, the bootstrap refuses to invent a replacement
+identity for the already-paired listener; ask the listener owner for a fresh
+listener. Historical sessions are preserved. If an older session used a named
+persistent profile, restart reuses that exact profile after checking that its
+saved public identity matches the previous session. A missing, unreadable, or
+mismatched identity is refused rather than recreated.
+Automatic lookup inspects each mailbox's current session generation. Older
+generations remain on disk and require manual inspection if a newer session has
+replaced that mailbox's current pointer.
+
 The banner explains that hostname, username, OS, architecture and Bun version are
 sent to the requested peer. `AGENT=bootstrap` describes this bootstrap, without
 claiming that an AI agent is running. Data is serialized as JSON inside a UTF-8
@@ -92,7 +104,7 @@ purchase or DNS change has been made for this implementation.
 
 ```sh
 P2P_TEST_BUN=/absolute/path/to/bun P2P_REQUIRE_JOIN_BUN=1 \
-  node --test test/join-bootstrap.test.js
+  node --test test/join-bootstrap.test.js test/join-legacy.test.js
 ```
 
 On actual Windows, also set `P2P_REQUIRE_WINDOWS_SHELLS=1`; this requires both
