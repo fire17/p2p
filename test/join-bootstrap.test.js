@@ -5,16 +5,33 @@ import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { mkdtempSync, mkdirSync, cpSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { generateIdentity } from '../src/key.js'
 import { renderJoin, INSTALLERS } from '../tools/render-join.mjs'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const cli = join(root, 'bin', 'p2p.js'), helper = join(root, 'tools', 'join-client.mjs')
-const bun = process.env.P2P_TEST_BUN || (process.versions.bun ? process.execPath : null)
+const requestedBun = process.env.P2P_TEST_BUN || (process.versions.bun ? process.execPath : null)
+// CI may supply the PATH command `bun`. runtime.path is the real installer's
+// absolute executable pin, so the minimal installer fixture must write one too.
+let bun = null
+if (requestedBun) {
+  const probe = spawnSync(requestedBun, ['-e', 'process.stdout.write(JSON.stringify({bun:process.versions.bun,path:process.execPath}))'], { encoding: 'utf8', timeout: 15000 })
+  assert.equal(probe.status, 0, 'Cannot resolve the requested Bun executable: ' + (probe.error || probe.stderr))
+  const info = JSON.parse(probe.stdout)
+  assert.ok(info.bun && isAbsolute(info.path) && existsSync(info.path), 'The fixture requires an actual Bun executable with an absolute path')
+  bun = info.path
+}
 const run = (exe, args, env = {}, stdin = '', timeout = 55000) => new Promise((resolve, reject) => {
-  const child = spawn(exe, args, { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  const childEnv = { ...process.env, ...env }
+  // PowerShell sanitizes module paths for direct PS5 children, but that does not
+  // survive CI's pwsh -> Node -> PS5 chain (PowerShell/PowerShell#27774). Let this
+  // isolated PS5 child construct its native defaults; never alter the caller.
+  if (process.platform === 'win32' && /(?:^|[\\/])powershell\.exe$/i.test(exe)) {
+    for (const key of Object.keys(childEnv)) if (key.toUpperCase() === 'PSMODULEPATH') delete childEnv[key]
+  }
+  const child = spawn(exe, args, { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
   let out = '', err = ''
   const timer = setTimeout(() => { child.kill(); reject(new Error('join fixture timed out: ' + out + err)) }, timeout)
   child.stdout.on('data', chunk => { out += chunk }); child.stderr.on('data', chunk => { err += chunk })

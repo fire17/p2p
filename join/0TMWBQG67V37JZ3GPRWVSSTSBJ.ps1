@@ -51,8 +51,11 @@ if (!/^0[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$/.test(key || '')) fail('invalid 
 if (!home) fail('installation home is missing')
 if (!process.versions.bun) fail('the selected runtime is not Bun')
 const app = join(resolve(home), 'app')
-try { (await import(pathToFileURL(join(app, 'src', 'key.js')))).decodeKey(key) }
-catch { fail('listener key checksum is invalid or the installed application is incomplete') }
+let keyModule
+try { keyModule = await import(pathToFileURL(join(app, 'src', 'key.js')).href) }
+catch (error) { fail('cannot load the installed key validator: ' + error.message) }
+try { keyModule.decodeKey(key) }
+catch (error) { fail('listener key checksum is invalid: ' + error.message) }
 const name = 'join-' + key
 const bin = join(app, 'bin', 'p2p.js')
 const env = { ...process.env, P2P_HOME: resolve(home) }
