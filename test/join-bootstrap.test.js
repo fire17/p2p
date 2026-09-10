@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { mkdtempSync, mkdirSync, cpSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync, realpathSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, cpSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync, realpathSync, openSync, closeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,7 +23,7 @@ if (requestedBun) {
   assert.ok(info.bun && isAbsolute(info.path) && existsSync(info.path), 'The fixture requires an actual Bun executable with an absolute path')
   bun = info.path
 }
-const run = (exe, args, env = {}, stdin = '', timeout = 55000) => new Promise((resolve, reject) => {
+const run = (exe, args, env = {}, stdin = '', timeout = 55000, outputFiles = null) => new Promise((resolve, reject) => {
   const childEnv = { ...process.env, ...env }
   // PowerShell sanitizes module paths for direct PS5 children, but that does not
   // survive CI's pwsh -> Node -> PS5 chain (PowerShell/PowerShell#27774). Let this
@@ -31,16 +31,29 @@ const run = (exe, args, env = {}, stdin = '', timeout = 55000) => new Promise((r
   if (process.platform === 'win32' && /(?:^|[\\/])powershell\.exe$/i.test(exe)) {
     for (const key of Object.keys(childEnv)) if (key.toUpperCase() === 'PSMODULEPATH') delete childEnv[key]
   }
-  const child = spawn(exe, args, { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  // PS5's .NET child launch may leave the parent's stdout handle inherited by
+  // a detached daemon, even after PS5 has returned and exited successfully.
+  // Capture this invocation in owned files: command completion still requires
+  // the actual child exit, while output never depends on the daemon's pipe EOF.
+  let child
+  const handles = []
+  try {
+    if (outputFiles) for (const file of outputFiles) handles.push(openSync(file, 'wx'))
+    child = spawn(exe, args, { env: childEnv, stdio: outputFiles ? ['pipe', ...handles] : ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  } finally { for (const fd of handles) closeSync(fd) }
+  const captured = () => outputFiles
+    ? { out: readFileSync(outputFiles[0], 'utf8'), err: readFileSync(outputFiles[1], 'utf8') }
+    : { out, err }
   let out = '', err = '', processExit = null
   child.once('exit', (code, signal) => { processExit = { code, signal } })
   const timer = setTimeout(() => {
-    const state = { processExit, stdoutEnded: child.stdout.readableEnded, stderrEnded: child.stderr.readableEnded }
-    child.kill(); reject(new Error('join fixture timed out ' + JSON.stringify(state) + ': ' + out + err))
+    const state = { processExit, stdoutEnded: child.stdout?.readableEnded, stderrEnded: child.stderr?.readableEnded }
+    const output = captured()
+    child.kill(); reject(new Error('join fixture timed out ' + JSON.stringify(state) + ': ' + output.out + output.err))
   }, timeout)
-  child.stdout.on('data', chunk => { out += chunk }); child.stderr.on('data', chunk => { err += chunk })
+  child.stdout?.on('data', chunk => { out += chunk }); child.stderr?.on('data', chunk => { err += chunk })
   child.once('error', error => { clearTimeout(timer); reject(error) })
-  child.once('close', code => { clearTimeout(timer); resolve({ code, out, err }) })
+  child.once('close', code => { clearTimeout(timer); resolve({ code, ...captured() }) })
   child.stdin.end(stdin)
 })
 const command = (home, args, env = {}) => run(process.execPath, [cli, 'tunnel', ...args], { P2P_HOME: home, P2P_RENDEZVOUS_DIR: '', ...env })
@@ -174,6 +187,7 @@ for (const shell of shells) test(`join bootstrap ${shell.label}: HTTP integrity 
     const sha256 = createHash('sha256').update(installer).digest('hex')
     const fixtureEnv = { ...env, P2P_TEST_BUN: bun, P2P_JOIN_FIXTURE_MARKER: marker, P2P_REF: 'fixture-original', TMPDIR: temp, TEMP: temp, TMP: temp }
     const entryUrl = 'http://127.0.0.1:' + server.address().port + '/join/' + key + (shell.platform === 'ps1' ? '.ps1' : '')
+    let invocation = 0
     const invoke = async (script, extraEnv = {}, callerExit = null) => {
       servedScript = script
       const expression = "try { irm '" + entryUrl + "' | iex; Write-Output 'JOIN_FIXTURE_RETURNED' } finally { if($env:P2P_REF -ne 'fixture-original') { throw 'Caller environment was not restored' } }"
@@ -181,7 +195,10 @@ for (const shell of shells) test(`join bootstrap ${shell.label}: HTTP integrity 
         : 'function Invoke-JoinFixture { $LASTEXITCODE=' + callerExit + '; $PSNativeCommandUseErrorActionPreference=$false; try { ' + expression + ' } finally { Write-Output "CALLER_EXIT=$LASTEXITCODE GLOBAL_EXIT=$global:LASTEXITCODE" } }; Invoke-JoinFixture'
       const args = shell.platform === 'sh' ? ['-c', "curl -fsSL '" + entryUrl + "' | sh"]
         : ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psCommand]
-      return run(shell.exe, args, { ...fixtureEnv, ...extraEnv })
+      const capture = shell.platform === 'ps1'
+        ? ['stdout', 'stderr'].map(stream => join(temp, 'ps-' + invocation + '-' + stream + '.txt')) : null
+      invocation++
+      return run(shell.exe, args, { ...fixtureEnv, ...extraEnv }, '', 55000, capture)
     }
     try {
       const bad = renderJoin(key, shell.platform, { url, sha256: '0'.repeat(64) })
@@ -193,6 +210,7 @@ for (const shell of shells) test(`join bootstrap ${shell.label}: HTTP integrity 
       result = await invoke(good)
       assert.equal(result.code, 0, result.out + result.err)
       assert.ok(existsSync(marker))
+      if (shell.platform === 'ps1') assert.match(result.out, /JOIN_FIXTURE_RETURNED/, 'The owner shell must return from the bootstrap')
       const first = await status(home, 'join-' + key)
       result = await invoke(good)
       assert.equal(result.code, 0, result.out + result.err)

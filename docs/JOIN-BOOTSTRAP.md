@@ -119,6 +119,14 @@ restart and reuse of older default sessions. The minimal installer fixture does
 not independently prove clean-machine runtime download; that is covered by the
 separate installer portability suite.
 
+PowerShell fixtures capture stdout and stderr in owned temporary files and still
+require the invoked shell to exit with the expected code. Actual Windows CI
+showed PowerShell 5.1 returning from `irm | iex` and exiting 0 while its detached
+daemon retained a captured stdout pipe handle. Waiting for that pipe's EOF would
+wait for the daemon rather than the completed bootstrap. The tests preserve full
+output, error, environment and daemon-reuse assertions; they do not claim that
+arbitrary outer pipe-capture tools receive EOF while the daemon remains alive.
+
 Local macOS Node/Bun/PowerShell checks are fixture evidence. Public route behavior
 and Windows/Linux results still require publication/CI verification before those
 platforms or URLs are reported as proven.
