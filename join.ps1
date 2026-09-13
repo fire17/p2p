@@ -1,3 +1,47 @@
+# p2p.akeyo.io/join.ps1 — ONE static script for every Windows machine; the listener key is a PARAMETER, never a file on this site:
+#   & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <LISTENER_KEY>
+# (share it as https://p2p.akeyo.io/#/join/<LISTENER_KEY> — the page renders this line client-side)
+# Installs verified Bun + p2p v0.3.6, joins the listener's chat, identifies the machine. Never enables terminal access.
+# Rendered from tools/join-bootstrap.ps1.in + tools/join-client.mjs by tools/render-generic.py. PowerShell 5.1 and 7.
+param([Parameter(Position = 0)][string]$Key = '')
+& {
+  $ErrorActionPreference = 'Stop'
+  Set-StrictMode -Version 2.0
+  $joinKey = $Key
+  if (-not $joinKey) { throw 'usage: & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <LISTENER_KEY>' }
+  if ($joinKey -cnotmatch '^0[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$') { throw 'Invalid listener key' }
+  Write-Host "Agent Tunnel: install verified Bun + p2p v0.3.6; connect chat to $joinKey."
+  Write-Host 'Your machine name, username, OS and architecture will be sent to this peer.'
+  Write-Host 'The chat daemon continues after this command exits. This join line does not enable remote terminal access.'
+  $joinTemp = Join-Path ([IO.Path]::GetTempPath()) ('p2p-join-' + [Guid]::NewGuid().ToString('N'))
+  $joinSaved = @{}
+  $joinEnv = @{
+    P2P_RUNTIME = 'bun'; P2P_REF = 'v0.3.6'
+    P2P_SRC = 'https://github.com/fire17/p2p/releases/download/v0.3.6/p2p-v0.3.6.zip'
+    P2P_SRC_SUMS = 'https://github.com/fire17/p2p/releases/download/v0.3.6/SHASUMS256.txt'
+  }
+  foreach ($joinName in $joinEnv.Keys) { $joinSaved[$joinName] = [Environment]::GetEnvironmentVariable($joinName, 'Process') }
+  try {
+    New-Item -ItemType Directory -Path $joinTemp | Out-Null
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol } catch {}
+    $joinInstaller = Join-Path $joinTemp 'init.ps1'
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri 'https://raw.githubusercontent.com/fire17/p2p/c26fde63ea01164bcbdb470e3c6a6f69682f748b/init.ps1' -OutFile $joinInstaller
+    $joinHash = (Get-FileHash -LiteralPath $joinInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($joinHash -ne 'd57e40fb2784c5780295a8cd6f10daa68c987aa7f04d720406fe1face4a077e9') { throw 'Installer SHA256 mismatch; nothing was executed' }
+    foreach ($joinName in $joinEnv.Keys) { [Environment]::SetEnvironmentVariable($joinName, $joinEnv[$joinName], 'Process') }
+    # Isolate the installer's explicit exit statements from the interactive owner shell.
+    $joinShell = (Get-Process -Id $PID).Path
+    $global:LASTEXITCODE = 0
+    & $joinShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $joinInstaller
+    if ($global:LASTEXITCODE -ne 0) { throw "Verified installer failed (exit $global:LASTEXITCODE); see the p2p install.log" }
+    $joinUserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+    $joinHome = if ($env:P2P_HOME) { $env:P2P_HOME } else { Join-Path $joinUserHome '.p2p' }
+    if ((Get-Content -LiteralPath (Join-Path $joinHome 'runtime.kind') -Raw).Trim() -ne 'bun') { throw 'Installer did not select Bun' }
+    $joinRuntime = (Get-Content -LiteralPath (Join-Path $joinHome 'runtime.path') -Raw -Encoding UTF8).Trim()
+    if (-not (Test-Path -LiteralPath $joinRuntime -PathType Leaf)) { throw 'The installed Bun runtime is missing' }
+    $joinHelper = Join-Path $joinTemp 'join.mjs'
+    [IO.File]::WriteAllText($joinHelper, @'
 // Embedded by render-join.mjs after the SHA-pinned installer succeeds.
 // Only chat operations: local terminal permission is never requested or enabled here.
 import { spawnSync, spawn } from 'node:child_process'
@@ -157,3 +201,14 @@ console.log('Stop: p2p tunnel stop --name ' + selected.name)
 console.log('Terminal activation is separate. This join line does not grant remote command execution.')
 }
 try { await main() } catch (error) { console.error('Agent Tunnel: ' + error.message); process.exitCode = error.exitCode || 3 }
+'@, (New-Object Text.UTF8Encoding($false)))
+    $global:LASTEXITCODE = 0
+    & $joinRuntime $joinHelper $joinKey $joinHome
+    if ($global:LASTEXITCODE -ne 0) { throw "Agent Tunnel join failed (exit $global:LASTEXITCODE)" }
+    # Native failures from deliberate earlier attempts must not poison a successful rerun.
+    $global:LASTEXITCODE = 0
+  } finally {
+    foreach ($joinName in $joinSaved.Keys) { [Environment]::SetEnvironmentVariable($joinName, $joinSaved[$joinName], 'Process') }
+    if (Test-Path -LiteralPath $joinTemp) { Remove-Item -LiteralPath $joinTemp -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+}

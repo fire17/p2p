@@ -30,7 +30,7 @@
       // Agent Tunnel join: ONE static script, the key is a parameter — never a per-key file on this site.
       return {
         unix: 'curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- ' + key,
-        win: '& ([scriptblock]::Create((irm https://p2p.akeyo.io/init.ps1))) ' + key,
+        win: '& ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) ' + key,
         already: 'p2p tunnel join ' + key + ' --profile join-' + key
       }
     }
