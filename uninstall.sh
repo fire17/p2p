@@ -37,7 +37,8 @@ if [ -x "$P2P" ] && [ -d "$P2P_HOME/tunnel" ]; then
   done
 fi
 if command -v pkill >/dev/null 2>&1; then pkill -u "$(id -u)" -f "$P2P_HOME/app/bin/p2p.js tunnel serve" 2>/dev/null && say '✓ leftover daemon processes killed' || true; fi
-# 4. the install + identity (keys live under P2P_HOME — a fresh join gets a NEW peer identity; the listener owner must mint a new key)
+# 4. the install + identity (keys live under P2P_HOME — a fresh join gets a NEW peer identity; a listener pins its FIRST peer,
+#    so the listener owner relaunches the listener (same key) or mints a new one before the rejoin)
 if [ -d "$P2P_HOME" ]; then rm -rf "$P2P_HOME"; say "✓ $P2P_HOME removed (runtime, app, sessions, identities)"; else say "- $P2P_HOME: absent"; fi
 [ -e "$P2P" ] && { rm -f "$P2P"; say "✓ $P2P removed"; }
 [ -e "$HOME/.local/bin/p2p.cmd" ] && rm -f "$HOME/.local/bin/p2p.cmd"
@@ -51,5 +52,6 @@ done
 if [ "$PURGE_APT" -eq 1 ] && command -v apt-get >/dev/null 2>&1; then
   DEBIAN_FRONTEND=noninteractive $SUDO apt-get remove -y -qq unzip tmux >/dev/null 2>&1 && say '✓ apt: unzip tmux removed' || say '! apt remove failed (run it by hand)'
 else say '- apt packages (unzip, tmux) left in place; add --purge-apt to remove them'; fi
-echo 'done — this machine is fresh. Rejoin with a NEW key from the listener owner:'
-echo '  curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <NEW_KEY>'
+echo 'done — this machine is fresh. Rejoin with the key the listener owner gives you (the SAME key works once the owner'
+echo 'has relaunched the listener — a listener pins its first peer, and this machine now has a new identity):'
+echo '  curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <KEY>'
