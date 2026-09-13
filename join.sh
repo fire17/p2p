@@ -11,7 +11,7 @@ p2p_join_main() {
   JOIN_KEY="${P2P_JOIN_KEY:-}"
   case "$JOIN_KEY" in *[!0123456789ABCDEFGHJKMNPQRSTVWXYZ]*|'') echo 'Invalid listener key' >&2; return 2;; esac
   [ "${#JOIN_KEY}" -eq 26 ] || { echo 'Invalid listener key length' >&2; return 2; }
-  echo "Agent Tunnel: install verified Bun + p2p v0.3.7; connect chat to $JOIN_KEY."
+  echo "Agent Tunnel: install verified Bun + p2p v0.3.8; connect chat to $JOIN_KEY."
   echo 'Your machine name, username, OS and architecture will be sent to this peer.'
   if [ "${JOIN_MODE:-}" = --server ]; then echo 'SERVER MODE (owner command): the chat daemon is kept alive across reboots and the listener owner gets terminal access on this machine.'; else echo 'The chat daemon continues after this command exits. This join line does not enable remote terminal access.'; fi
   JOIN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/p2p-join.XXXXXX")"
@@ -30,9 +30,9 @@ p2p_join_main() {
   [ "$JOIN_HASH" = '71833d1f4b1d305f8fc551151182c113ea93ca5c02b3f5dc4a0c89ad0a0826cd' ] || { echo 'Installer SHA256 mismatch; nothing was executed' >&2; return 1; }
   P2P_HOME="${P2P_HOME:-$HOME/.p2p}"
   export P2P_HOME
-  P2P_RUNTIME=bun P2P_REF=v0.3.7 \
-    P2P_SRC=https://github.com/fire17/p2p/releases/download/v0.3.7/p2p-v0.3.7.tar.gz \
-    P2P_SRC_SUMS=https://github.com/fire17/p2p/releases/download/v0.3.7/SHASUMS256.txt \
+  P2P_RUNTIME=bun P2P_REF=v0.3.8 \
+    P2P_SRC=https://github.com/fire17/p2p/releases/download/v0.3.8/p2p-v0.3.8.tar.gz \
+    P2P_SRC_SUMS=https://github.com/fire17/p2p/releases/download/v0.3.8/SHASUMS256.txt \
     sh "$JOIN_TMP/init" </dev/null
   [ "$(cat "$P2P_HOME/runtime.kind")" = bun ] || { echo 'Installer did not select Bun' >&2; return 1; }
   JOIN_RUNTIME="$(cat "$P2P_HOME/runtime.path")"
