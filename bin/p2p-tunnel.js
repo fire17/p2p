@@ -158,9 +158,11 @@ async function serve(s) {
     state.stopped = Date.now(); state.connected = false; save(); release(s)
     try { unlinkSync(pidFile) } catch {}
   }
-  process.once('SIGINT', () => { shutdown(); process.exitCode = 130 })
-  process.once('SIGTERM', () => { shutdown(); process.exitCode = 143 })
-  process.once('SIGHUP', () => { shutdown(); process.exitCode = 129 })
+  // shutdown() is synchronous (state + owner release land on disk before it returns); exit explicitly, exactly as
+  // the `stop` verb path does — setting exitCode alone left the daemon alive on the relay WebSocket (v0.3.7).
+  process.once('SIGINT', () => { shutdown(); process.exit(130) })
+  process.once('SIGTERM', () => { shutdown(); process.exit(143) })
+  process.once('SIGHUP', () => { shutdown(); process.exit(129) })
   save()
   try {
     const id = loadOrCreateIdentity({ profile: s.session.profile, ephemeral: !!s.session.ephemeral })

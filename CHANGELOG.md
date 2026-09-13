@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.8] — 2026-09-13
+
+- `tunnel serve` now exits on SIGTERM/SIGINT/SIGHUP. On 0.3.7 the handlers wrote `state.stopped`, released the owner lock and set the exit code, then the process lingered on the relay's open WebSocket (close handshake never completed) — `systemctl stop` of the server keeper ran into its 90 s TimeoutStopSec and a relaunch needed SIGKILL. Signals now exit explicitly, as the `stop` verb always did (test/tunnel-signal-exit.test.js: red on 0.3.7 for all three signals, green here).
+
 ## [0.3.7] — 2026-09-13
 
 - UDP endpoint sockets now survive a dgram `error` (Bun 1.4.2 surfaced the kernel's pending `recvmsg ENETUNREACH` as one and the join daemon died at startup on a Debian VPS, 2026-09-13): the affected address family is dropped with a logged reason and dialing continues on the other family or over the relay; send errors are counted and logged instead of vanishing.
