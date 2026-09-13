@@ -195,7 +195,59 @@ class Endpoint extends EventEmitter {
     this._acceptRefill = this._now();
     this._probeBuckets = new Map(); // srcIP -> {tokens,last} (LRU-bounded)
     this._probeAuthCb = null; // META-1: invite-mode probe authenticator (see probeAuth())
+    // SOCKERR-1: a post-bind dgram 'error' used to be an UNHANDLED EventEmitter event and killed
+    // the process (Bun surfaces the kernel's pending socket error as one: `recvmsg ENETUNREACH`).
+    this._sendErrs = { 4: 0, 6: 0 }; // per-family send-error counters (observability only)
+    this._udpDown = false;           // both families gone -> 'udpdown' emitted once
   }
+
+  // ---- SOCKERR-1: survive a dgram socket 'error' ----------------------------
+
+  /** Arm the per-socket 'error' handler. Called for EACH family the moment its bind resolves —
+   * not in _attach(), because there is an await between the udp6 and udp4 binds and an error in
+   * that window must not crash either. */
+  _armSockError(sock, family) {
+    if (!sock) return;
+    sock.on('error', (err) => { try { this._onSockError(family, err, sock); } catch { /* never throw from an error handler */ } });
+  }
+
+  /** One UDP family died. Log it (this is what the daemon's serve.log shows), drop that family,
+   * kill the peers bound to it so they fall to wire liveness instead of a silent black hole, and
+   * keep dialing on the other family / the relay. NEVER throws, NEVER swallows silently. */
+  _onSockError(family, err, sock) {
+    const code = (err && err.code) || 'unknown';
+    const msg = (err && err.message) || String(err);
+    console.error('[p2p] transport: udp' + family + ' socket error (' + code + '): ' + msg
+      + ' \u2014 dropping the udp' + family + ' socket, continuing on the other family / the relay');
+    const s = sock || (family === 6 ? this.sock6 : this.sock4);
+    try { s && s.close(); } catch { /* Bun may have closed it already */ }
+    if (family === 6) { this.sock6 = null; this.port6 = 0; } else { this.sock4 = null; this.port4 = 0; }
+    this.port = this.port4 || this.port6; // keep `port` truthful for the TCP fallback + announcers
+    const dead = family === 6 ? 'udp6' : 'udp4';
+    const victims = new Set();
+    for (const sl of this._peers.values()) { try { if (sl && sl.proto === dead) victims.add(sl); } catch { /* getter threw */ } }
+    for (const sl of this._accepted.values()) { try { if (sl && sl.proto === dead) victims.add(sl); } catch { /* getter threw */ } }
+    for (const sl of victims) { try { sl.close(); } catch { /* already gone */ } } // close() sets closed + purges _peers/_accepted
+    this.emit('socketerror', { family, error: err });
+    if (!this.sock4 && !this.sock6 && !this._udpDown) {
+      this._udpDown = true;
+      console.error('[p2p] transport: no UDP socket left \u2014 UDP disabled, relay only');
+      this.emit('udpdown', { error: err });
+    }
+  }
+
+  /** A send error is ONE unreachable destination, never a dead family — count and log, never
+   * close. First occurrence per family, then every 100th. */
+  _onSendError(family, err, ip, port) {
+    const n = (this._sendErrs[family] = (this._sendErrs[family] || 0) + 1);
+    if (n === 1 || n % 100 === 0) {
+      console.error('[p2p] transport: udp' + family + ' send error (' + ((err && err.code) || 'unknown') + ') to '
+        + ip + ':' + port + ' \u2014 ' + n + ' so far');
+    }
+  }
+
+  /** Observability for owners/tests: which families are alive and how many sends failed. */
+  stats() { return { sendErrs: { ...this._sendErrs }, sock4: !!this.sock4, sock6: !!this.sock6 }; }
 
   // ---- DOS-1: rate limits ----------------------------------------------------
 
@@ -323,7 +375,9 @@ class Endpoint extends EventEmitter {
 
   _sendRaw(buf, ip, port, v6) {
     const s = v6 ? this.sock6 : this.sock4;
-    if (s) try { s.send(buf, port, ip); } catch { /* transient send error — punch retries */ }
+    // The callback is what makes a send failure VISIBLE: without it node's dgram drops send
+    // errors on the floor, which is exactly why a VPS with no IPv6 route looked healthy here.
+    if (s) try { s.send(buf, port, ip, (e) => { if (e) this._onSendError(v6 ? 6 : 4, e, ip, port); }); } catch { /* transient send error — punch retries */ }
   }
 
   /** Host + LAN candidates from local interfaces, plus cached srflx if stun() ran. */
@@ -668,6 +722,7 @@ export async function createEndpoint({ port = 0, ...opts } = {}) {
   try {
     const s6 = dgram.createSocket({ type: 'udp6', reuseAddr: true, ipv6Only: true });
     await bindSock(s6, port);
+    ep._armSockError(s6, 6); // before the assignment AND before the udp4 await: no uncovered window
     ep.sock6 = s6; ep.port6 = s6.address().port;
   } catch { ep.sock6 = null; }
   // udp4 on the same port as udp6 when we can, else ephemeral.
@@ -676,6 +731,7 @@ export async function createEndpoint({ port = 0, ...opts } = {}) {
     try {
       const s4 = dgram.createSocket({ type: 'udp4', reuseAddr: true });
       await bindSock(s4, p);
+      ep._armSockError(s4, 4);
       ep.sock4 = s4; ep.port4 = s4.address().port;
       break;
     } catch { ep.sock4 = null; }
