@@ -40,7 +40,7 @@ p2p_join_main() {
   cat >"$JOIN_TMP/join.mjs" <<'P2P_JOIN_HELPER'
 // Embedded by render-join.mjs after the SHA-pinned installer succeeds.
 // Only chat operations: local terminal permission is never requested or enabled here.
-import { spawnSync } from 'node:child_process'
+import { spawnSync, spawn } from 'node:child_process'
 import { readdirSync, writeFileSync, unlinkSync, realpathSync, existsSync } from 'node:fs'
 import { readFileSync } from 'node:fs'
 import { hostname, userInfo, platform, arch } from 'node:os'
@@ -74,6 +74,20 @@ function cli(args, timeout = 45000) {
   })
   if (result.error) fail('CLI failed: ' + result.error.message, 3)
   return { code: result.status ?? 3, out: result.stdout || '', err: result.stderr || '' }
+}
+// Async variant for the connect step so a spinner can run while it dials (his ask: "connecting to <key> with a spinner").
+function cliSpin(args, label, timeout = 45000) {
+  return new Promise(resolvePromise => {
+    const child = spawn(process.execPath, [bin, 'tunnel', ...args], { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = '', err = '', i = 0
+    const frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
+    const tick = setInterval(() => { process.stdout.write('\r  ' + frames[i++ % frames.length] + ' ' + label + ' '); }, 90)
+    const killer = setTimeout(() => { try { child.kill() } catch {} }, timeout)
+    child.stdout.on('data', d => { out += d })
+    child.stderr.on('data', d => { err += d })
+    child.on('close', code => { clearInterval(tick); clearTimeout(killer); process.stdout.write('\r' + ' '.repeat(label.length + 6) + '\r'); resolvePromise({ code: code ?? 3, out, err }) })
+    child.on('error', e => { clearInterval(tick); clearTimeout(killer); resolvePromise({ code: 3, out, err: err + e.message }) })
+  })
 }
 function status(sessionName) {
   const result = cli(['status', '--name', sessionName], 15000)
@@ -150,20 +164,30 @@ const identity = 'connected: ' + clean(hostname()) + ' ' + clean(username) + '\n
 if (!selected) {
   // --profile is essential: the CLI otherwise creates an ephemeral identity on
   // each fresh session, which an already-bound host would correctly reject.
-  const result = cli(['join', key, '--name', name, '--profile', restartProfile,
-    '--say', 'Agent Tunnel connected; machine identification follows.', '--connect-timeout', '30'])
+  console.log('')
+  const result = await cliSpin(['join', key, '--name', name, '--profile', restartProfile,
+    '--say', 'Agent Tunnel connected; machine identification follows.', '--connect-timeout', '30'], 'connecting to ' + key)
   if (result.code !== 0) fail(result.err.trim() || result.out.trim() || 'connection failed; the listener may be offline or already paired with another machine', result.code)
   const state = status(name)
   if (!state?.alive || !state.connected || state.peerKey !== key) fail('the requested peer did not become connected', 3)
   selected = { name, state }
+  console.log('  ✓ connected to ' + key)
 }
 // --file avoids PowerShell native argv quoting and never treats machine metadata
 // or remote messages as shell syntax. Wait for a delivery acknowledgment.
 const messageFile = join(resolve(home), '.join-' + process.pid + '-' + Date.now() + '.txt')
 try {
   writeFileSync(messageFile, identity, { mode: 0o600, flag: 'wx' })
-  const result = cli(['send', '--file', messageFile, '--name', selected.name, '--wait', '10'], 15000)
-  if (result.code !== 0) fail('connected, but machine identification was not acknowledged; rerun to retry. ' + result.err.trim(), result.code)
+  // Three tries, 20 s each: over the public relay the delivery ack can lag well past 10 s while the message
+  // itself has already landed (seen live 2026-09-13 on a Debian VPS: listener recv=2, joiner "not acknowledged").
+  let acked = false, lastErr = ''
+  for (let attempt = 1; attempt <= 3 && !acked; attempt++) {
+    const result = await cliSpin(['send', '--file', messageFile, '--name', selected.name, '--wait', '20'], 'sending machine identification (try ' + attempt + '/3)', 30000)
+    if (result.code === 0) acked = true
+    else { lastErr = result.err.trim(); const st = status(selected.name); if (!st?.alive || !st.connected) fail('the connection dropped while sending machine identification: ' + lastErr, 3) }
+  }
+  if (!acked) console.log('  ! machine identification sent, delivery not acknowledged in 60 s (' + lastErr + ') — the link is up; continuing.')
+  else console.log('  ✓ machine identification acknowledged')
 } finally { try { unlinkSync(messageFile) } catch {} }
 console.log('Agent Tunnel connected to ' + key + ' as ' + selected.state.self + '.')
 console.log('Chat daemon is running in the background (PID ' + selected.state.pid + '). It does not start automatically after a reboot.')
@@ -204,9 +228,13 @@ livemind_server_setup() {
 export HOME='$HOMEDIR' P2P_HOME='$HOMEDIR/.p2p' PATH="$HOMEDIR/.local/bin:\$PATH"
 KEY='$KEY'; NAME='$NAME'; P2P='$P2P'
 while :; do
-  if ! "\$P2P" tunnel status --name "\$NAME" 2>/dev/null | grep -q '"alive":true'; then
-    "\$P2P" tunnel join "\$KEY" --name "\$NAME" --profile "\$NAME" --say "livemind-server rejoined \$(hostname)" --connect-timeout 30 || true
-  fi
+  ST="\$("\$P2P" tunnel status --name "\$NAME" 2>/dev/null || true)"
+  case "\$ST" in
+    *'"alive":true'*'"connected":true'*|*'"connected":true'*'"alive":true'*) : ;;   # up
+    *'"alive":true'*) "\$P2P" tunnel stop --name "\$NAME" >/dev/null 2>&1 || true; sleep 2
+                       "\$P2P" tunnel join "\$KEY" --name "\$NAME" --profile "\$NAME" --say "livemind-server rejoined \$(hostname)" --connect-timeout 30 || true ;;   # alive but the peer dropped: a join daemon dials once, never re-dials
+    *) "\$P2P" tunnel join "\$KEY" --name "\$NAME" --profile "\$NAME" --say "livemind-server rejoined \$(hostname)" --connect-timeout 30 || true ;;
+  esac
   if ! tmux has-session -t livemind-terminal 2>/dev/null; then
     tmux new-session -d -s livemind-terminal "'\$P2P' tunnel terminal --allow '\$KEY' --name '\$NAME' --shell bash; sleep 10"
   fi
@@ -248,4 +276,13 @@ if [ -z "$JOIN_MODE" ]; then
   if [ "$(uname -s 2>/dev/null)" = Linux ] && command -v systemctl >/dev/null 2>&1 && { [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; }; then JOIN_MODE=--server; else JOIN_MODE=--chat-only; fi
 fi
 export P2P_JOIN_KEY JOIN_MODE
-if [ "$JOIN_MODE" = --server ]; then livemind_server_prereqs && p2p_join_main && livemind_server_setup; else p2p_join_main; fi
+if [ "$JOIN_MODE" = --server ]; then
+  livemind_server_prereqs || exit 1
+  p2p_join_main; JOIN_RC=$?
+  if [ "$JOIN_RC" -ne 0 ] && "$HOME/.local/bin/p2p" tunnel status --name "join-$P2P_JOIN_KEY" 2>/dev/null | grep -q '"connected":true'; then
+    echo 'join reported an error but the chat daemon is connected — installing the keeper anyway (it re-dials on every drop).'; JOIN_RC=0
+  fi
+  [ "$JOIN_RC" -eq 0 ] || exit "$JOIN_RC"
+  livemind_server_setup
+  echo 'Undo everything this line did:  curl -fsSL https://p2p.akeyo.io/uninstall.sh | sh'
+else p2p_join_main; fi
