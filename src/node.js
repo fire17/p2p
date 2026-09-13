@@ -872,6 +872,7 @@ export async function listen(id, opts = {}) {
     S: id.S ?? id.key,
     wss: opts.wss !== false && !invite,
     relays: opts.relays,
+    transport: opts.transport,
     now: opts.now,
   })
   const node = createNode(id, { ...opts, _invite: invite }, deps, ep)

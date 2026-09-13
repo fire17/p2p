@@ -7,8 +7,8 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const bin = fileURLToPath(new URL('../bin/p2p.js', import.meta.url))
-const run = (home, args, timeout = 12000) => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, [bin, 'tunnel', ...args], { env: { ...process.env, P2P_HOME: home, P2P_RENDEZVOUS_DIR: '' }, stdio: ['ignore', 'pipe', 'pipe'] })
+const run = (home, args, timeout = 12000, extraEnv = {}) => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [bin, 'tunnel', ...args], { env: { ...process.env, P2P_HOME: home, P2P_RENDEZVOUS_DIR: '', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] })
   let out = '', err = ''
   child.stdout.on('data', data => { out += data }); child.stderr.on('data', data => { err += data })
   const timer = setTimeout(() => { child.kill(); reject(new Error('CLI timeout: ' + args.join(' ') + '\n' + out + err)) }, timeout)
@@ -103,4 +103,64 @@ test('tunnel: invalid names/shares fail before session writes; absent host is bo
     assert.ok(st.stopped)
     assert.equal(existsSync(join(home, 'tunnel', 'default', 'owner.json')), false)
   } finally { await run(home, ['stop']); rmSync(dir, { recursive: true, force: true }) }
+})
+
+// ── --relay-only / P2P_TRANSPORT ────────────────────────────────────────────────────────────────
+//
+// The knob the 2026-09-13 VPS joins needed and did not have: dial over the public relay ALONE, so
+// "is it the UDP leg?" becomes a question you can answer instead of a guess. These legs stay OFFLINE
+// (--rendezvous-dir, a loopback board) — the relay-only DIAL itself is proven in
+// test/transport-node-relay-only.test.js against the mock broker.
+
+const session = (home, name = 'default') => {
+  const root = join(home, 'tunnel', name), { id } = JSON.parse(readFileSync(join(root, 'current.json')))
+  return JSON.parse(readFileSync(join(root, id, 'session.json'), 'utf8'))
+}
+
+test('tunnel: --relay-only persists transport before the dial, and a bad value writes nothing at all', { timeout: 30000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'p2p-tunnel-relayonly-'))
+  const home = join(dir, 'home'), bogusHome = join(dir, 'bogus'), inviteHome = join(dir, 'invite')
+  const board = join(dir, 'board')
+  try {
+    const { generateIdentity } = await import('../src/key.js')
+    const { mintInvite } = await import('../bin/lib.js')
+    const absent = generateIdentity().S                       // a well-formed contact key nobody answers
+
+    // The session config is written by reserve() BEFORE the daemon launches, so the choice survives
+    // even a dial that never connects. Offline here (--rendezvous-dir disables the relay leg), so the
+    // daemon rejects LOUDLY instead of silently dialing UDP — which is the whole point of the knob.
+    const relayOnly = await run(home, ['join', absent, '--relay-only', '--rendezvous-dir', board, '--connect-timeout', '2'], 20000)
+    assert.equal(session(home).transport, 'relay', 'the dialer recorded relay-only in session.json')
+    assert.notEqual(relayOnly.code, 0, relayOnly.out + relayOnly.err)
+    assert.match(relayOnly.err + relayOnly.out, /relay-only needs the WSS relay/,
+      'relay-only without a relay leg fails loud — it never quietly falls back to the UDP dial')
+
+    // A bad value is refused BEFORE reserve(): no home, no session dir, no owner lock.
+    const bogus = await run(bogusHome, ['join', absent], 12000, { P2P_TRANSPORT: 'bogus' })
+    assert.equal(bogus.code, 2, bogus.out + bogus.err)
+    assert.match(bogus.err, /P2P_TRANSPORT must be relay or auto \(got "bogus"\)/)
+    assert.equal(existsSync(bogusHome), false, 'a rejected transport value leaves no session dir behind')
+
+    // A private invite has no relay topic by design — relay-only there is refused on both verbs.
+    const share = mintInvite(generateIdentity()).share
+    const privateJoin = await run(inviteHome, ['join', share, '--relay-only'], 12000)
+    assert.equal(privateJoin.code, 2, privateJoin.out + privateJoin.err)
+    assert.match(privateJoin.err, /relay-only is not available for private invites/)
+    assert.equal(existsSync(inviteHome), false)
+    const privateInvite = await run(inviteHome, ['invite', '--relay-only', '--ephemeral'], 12000)
+    assert.equal(privateInvite.code, 2, privateInvite.out + privateInvite.err)
+    assert.match(privateInvite.err, /relay-only is not available for private invites/)
+    assert.equal(existsSync(inviteHome), false)
+
+    // Clean case: no flag, no env => transport 'auto', the path every existing test exercises.
+    const plain = await run(home, ['join', absent, '--name', 'plain', '--rendezvous-dir', board, '--connect-timeout', '2'], 20000)
+    assert.equal(session(home, 'plain').transport, 'auto')
+    assert.notEqual(plain.code, 0, 'an absent peer still times out — unchanged')
+    assert.doesNotMatch(plain.err + plain.out, /relay-only/, 'the default path never mentions the knob')
+
+    assert.match((await run(home, ['--help'])).out, /--relay-only/, 'the flag is documented in help')
+  } finally {
+    await Promise.all([run(home, ['stop']), run(home, ['stop', '--name', 'plain'])])
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

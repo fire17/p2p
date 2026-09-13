@@ -66,19 +66,37 @@ const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?
  * @param {string[]} [opts.relays]  relay URLs (default transport-wss RELAYS)
  * @param {*} [opts.WebSocket]      WebSocket ctor (default: global) — injectable for tests
  * @param {number} [opts.wssDelayMs] UDP head start before the relay leg dials (default 700ms)
+ * @param {'auto'|'relay'} [opts.transport] 'relay' = RELAY-ONLY: never punch the UDP leg on a dial
+ *   (`--relay-only` / P2P_TRANSPORT=relay). The UDP socket stays BOUND — other peers may still reach
+ *   us on it — we simply never dial over it. Default 'auto' (the raced ladder) is byte-identical to
+ *   every earlier release.
  * @returns {Promise<object>} endpoint
  */
 export async function createEndpoint({
   port = 0, S = null, wss = true, relays = RELAYS, WebSocket, now = () => Date.now(),
-  wssDelayMs = WSS_DELAY_MS, relayGraceMs = RELAY_GRACE_MS, ...opts
+  wssDelayMs = WSS_DELAY_MS, relayGraceMs = RELAY_GRACE_MS,
+  transport = process.env.P2P_TRANSPORT || 'auto', ...opts
 } = {}) {
+  // Validate BEFORE binding anything: a typo must never silently fall back to the raced ladder.
+  if (transport !== 'auto' && transport !== 'relay') {
+    throw new Error('P2P_TRANSPORT must be relay or auto (got ' + JSON.stringify(transport) + ')')
+  }
+  const relayOnly = transport === 'relay'
+  // Relay-only without a relay leg would be a SILENT UDP dial — exactly the thing the knob exists to
+  // forbid. Fail loud instead. (Invite mode passes wss:false, and its topic is UDP-only by design.)
+  if (relayOnly && (!wss || !S)) {
+    throw new Error('relay-only needs the WSS relay (no S / wss disabled: private invites are UDP-only)')
+  }
   const udp = await createUdpEndpoint({ port, now, ...opts })
   if (!wss || !S) return udp                       // plain UDP — unchanged from v0.1.0
 
   let wssEp = null
   try {
     wssEp = createWssEndpoint({ S, relays, WebSocket, now })
-  } catch {
+  } catch (e) {
+    // Degrading to UDP is right for 'auto' (Node < 22 has no global WebSocket). Under relay-only it
+    // would be the silent UDP dial again — so there it throws.
+    if (relayOnly) { try { udp.close() } catch { /* */ } throw e }
     return udp                                     // no WebSocket (Node < 22) ⇒ degrade to UDP, never throw
   }
 
@@ -89,11 +107,17 @@ export async function createEndpoint({
     // reach the peer with NO rendezvous at all (the relay topic is HKDF(S,…)). An endpoint without
     // this property — the browser's, a test's, invite mode's plain-UDP one — keeps blocking as before.
     relayGraceMs: relayGraceMs,
+    /** 'auto' (raced ladder) or 'relay' (relay-only dials). Diagnostics + `tunnel status`. */
+    get transport() { return transport },
     get port() { return udp.port },
     get port4() { return udp.port4 },
     get port6() { return udp.port6 },
-    /** Only UDP has addressable candidates. The relay's address IS the topic, derived from S. */
-    candidates() { return udp.candidates() },
+    /**
+     * Only UDP has addressable candidates. The relay's address IS the topic, derived from S.
+     * Relay-only advertises NONE: we will not dial over UDP, so publishing a UDP path would invite
+     * peers onto a leg this node has opted out of.
+     */
+    candidates() { return relayOnly ? [] : udp.candidates() },
     stun(o) { return udp.stun(o) },
     probeAuth(fn) { return udp.probeAuth(fn) },    // META-1 — UDP-only (invite mode never gets a relay leg)
     on(...a) { return udp.on(...a) },              // 'netchange' — the relay redials itself, nothing to re-announce
@@ -114,7 +138,12 @@ export async function createEndpoint({
      */
     punch(cands, popts = {}) {
       const all = cands || []
-      const udpCands = all.filter((c) => c && (c.proto === 'udp4' || c.proto === 'udp6' || c.proto === 'tcp'))
+      // RELAY-ONLY: drop every punchable UDP candidate on the floor. Downstream this makes the relay
+      // leg dial IMMEDIATELY (the `udpCands.length ? sleep(...) : ...` branch below), so relay-only
+      // also pays no head start.
+      const udpCands = relayOnly
+        ? []
+        : all.filter((c) => c && (c.proto === 'udp4' || c.proto === 'udp6' || c.proto === 'tcp'))
       let wssCands = all.filter((c) => c && c.proto === 'wss')
       if (!wssCands.length && popts.S) {
         wssCands = [{ proto: 'wss', topic: topicFor(popts.S, epochStr(now())), relays }]
@@ -134,7 +163,12 @@ export async function createEndpoint({
           })
           : wssEp.punch(wssCands, popts))
       }
-      if (!attempts.length) attempts.push(udp.punch(all, popts))   // no usable candidate: keep UDP's own error
+      if (!attempts.length) {
+        // Relay-only with nothing to knock on: reject rather than fall through to udp.punch — the one
+        // line that would turn this knob back into a UDP dial.
+        if (relayOnly) return Promise.reject(new Error('relay-only: no wss candidate and no peer S to derive one from'))
+        attempts.push(udp.punch(all, popts))       // no usable candidate: keep UDP's own error
+      }
       const p = composePunch(attempts)
       p.then((c) => { composite = c }, () => { /* all legs failed — nothing to skip */ })
 
@@ -142,7 +176,7 @@ export async function createEndpoint({
       // the stream kept running. If it turns up a UDP path after all, enter it into the SAME race — so
       // bounding that wait never costs us the direct route. If the relay has already won by then,
       // composePunch closes the newcomer and nothing changes.
-      if (popts.late && !udpCands.length) {
+      if (popts.late && !udpCands.length && !relayOnly) {
         Promise.resolve(popts.late).then((more) => {
           const lateUdp = (more || []).filter((c) => c && (c.proto === 'udp4' || c.proto === 'udp6' || c.proto === 'tcp'))
           if (!lateUdp.length || !composite || composite.winner || composite.closed) return

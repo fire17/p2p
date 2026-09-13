@@ -40,7 +40,7 @@ export function parseArgs(argv) {
       if (VALUE_FLAGS.has(name)) {
         if (argv[i + 1] === undefined) throw fail('--' + name + ' needs a value')
         flags[name] = argv[++i]
-      } else if (['ephemeral', 'all', 'help', 'foreground'].includes(name)) flags[name] = true
+      } else if (['ephemeral', 'all', 'help', 'foreground', 'relay-only'].includes(name)) flags[name] = true
       else throw fail('unknown flag: ' + a)
     } else if (a === '-h' && !literal) flags.help = true
     else pos.push(a)
@@ -186,13 +186,16 @@ async function serve(s) {
     if (joinOnly && !deps) deps = { publishAll: () => ({ stop() {} }) }
     const privateDial = joinOnly && !!parseShare(s.session.share).secret
     node = await listen(id, { invite: secret || undefined, wss: !s.session.rendezvousDir && !privateDial,
+      transport: s.session.transport || 'auto',
       ...(deps ? { deps } : {}) })
     if (stopped) { node.close(); return }
     const assemblers = new WeakMap()
     const onPeer = peer => {
       const key = peerKey(peer)
       if (state.peerKey && state.peerKey !== key) { peer.close(); return }
-      state.peerKey = key; state.connected = true; state.connectedAt ||= Date.now(); save()
+      state.peerKey = key; state.connected = true; state.connectedAt ||= Date.now()
+      state.transport = peer.transport ?? null     // the committed leg, once the peer record exposes it
+      save()
     }
     node.on('peer', onPeer)
     node.on('disconnect', () => { state.connected = node.peers().some(p => p.connected && peerKey(p) === state.peerKey); save() })
@@ -269,6 +272,7 @@ const HELP = `p2p tunnel — durable messages between agents
   --ephemeral            fresh identity (default unless --profile is explicitly supplied)
   --rendezvous-dir DIR    offline loopback acceptance carrier
   --connect-timeout N     connection deadline in seconds (default: 30)
+  --relay-only            dial over the public relay only (skip UDP/ICE); also P2P_TRANSPORT=relay|auto
   --out PATH             append a copy of inbound messages
   exit: 0 success, 2 usage/conflict, 3 connection/delivery failure, 4 wait timeout, 5 daemon absent
 `
@@ -288,7 +292,15 @@ export async function tunnelMain(argv) {
       }
       const profile = flags.profile || 'tunnel-' + name
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(profile)) throw fail('invalid identity profile')
-      const s = reserve(name, { role: command, profile, share, ephemeral: !!flags.ephemeral || !flags.profile,
+      // Transport choice is validated BEFORE reserve(): a bad value must leave no session dir behind.
+      const transport = flags['relay-only'] ? 'relay' : (process.env.P2P_TRANSPORT || 'auto')
+      if (transport !== 'auto' && transport !== 'relay') throw fail('P2P_TRANSPORT must be relay or auto (got ' + JSON.stringify(transport) + ')')
+      // A private invite derives no relay topic (see transport-node.js's INVITE MODE note): offering
+      // relay-only there would be a knob that silently does nothing, or a UDP dial wearing its name.
+      if (transport === 'relay' && (command === 'invite' || (share && parseShare(share).secret))) {
+        throw fail('relay-only is not available for private invites')
+      }
+      const s = reserve(name, { role: command, profile, share, transport, ephemeral: !!flags.ephemeral || !flags.profile,
         rendezvousDir: flags['rendezvous-dir'] || process.env.P2P_RENDEZVOUS_DIR || null,
         out: flags.out || null, connectTimeout: seconds(flags['connect-timeout'], 30) })
       const child = launch(s)
