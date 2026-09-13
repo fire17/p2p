@@ -38,6 +38,7 @@ const VER = 1
 const ENV_HDR = 1 + 16 + 8 // [1B ver][16B senderId][8B msgId]
 const NS = 'p2p1/'
 const DAY_MS = 86400000
+const EPOCH_ROLL_MS = 3_600_000 // re-derive the listener inbox topics hourly (see the EPOCH ROLL note below)
 
 // DOS-1-WSS: the relay is a GUARANTEED on-path attacker — it can inject unlimited PUBLISHes with
 // fresh attacker-chosen 16-byte senderIds, each spawning a socketLike + (via onConnCb) a node
@@ -169,11 +170,12 @@ function relayConn(url, WS, onPublish) {
  * @param {string[]} [opts.relays] relay URLs (default RELAYS); all are used, inbound is deduped.
  * @param {*} [opts.WebSocket]     WebSocket ctor (default: global). Injectable for tests.
  * @param {()=>number} [opts.now]  clock
+ * @param {number} [opts.epochRollMs] how often the listener re-derives its inbox topics (see EPOCH ROLL)
  */
 export function createEndpoint({
   S = null, relays = RELAYS, WebSocket: WS = globalThis.WebSocket, now = () => Date.now(),
   maxAccepted = MAX_ACCEPTED, acceptIdleMs = ACCEPT_IDLE_MS, acceptRate = ACCEPT_RATE,
-  acceptBurst = ACCEPT_BURST, idleSweepMs = IDLE_SWEEP_MS,
+  acceptBurst = ACCEPT_BURST, idleSweepMs = IDLE_SWEEP_MS, epochRollMs = EPOCH_ROLL_MS,
 } = {}) {
   if (!WS) throw new Error('transport-wss: no WebSocket (need Node >= 22 or a browser)')
 
@@ -247,12 +249,26 @@ export function createEndpoint({
   const pubAll = (t, b) => conns.forEach((c) => c.pub(t, b))
 
   const topics = []
-  if (S) {                                                     // listener inbox: prev/cur/next UTC day
+  const subEpochs = () => {                                    // listener inbox: prev/cur/next UTC day
     const t = now()
     for (const e of [epochStr(t - DAY_MS), epochStr(t), epochStr(t + DAY_MS)]) {
       const top = topicFor(S, e)
       if (!topics.includes(top)) { subAll(top); topics.push(top) }
     }
+  }
+
+  // EPOCH ROLL (fixed 2026-09-13): these topics used to be derived ONCE, at endpoint creation. A
+  // dialer always knocks topicFor(S, epochStr(now)) — so a `tunnel listen` daemon still alive two
+  // UTC midnights later held NO subscription for the day being knocked on, and was unreachable over
+  // the relay by any NEW dial (the MIND's listeners run for days). Re-derive prev/cur/next on a
+  // timer and SUBSCRIBE whatever is new. Old topics stay subscribed on purpose: this MQTT client
+  // implements no UNSUBSCRIBE packet, and the growth is one 20-byte topic per UTC day per listener.
+  // Wire format is untouched — SUBSCRIBE packets only, so a v0.3.6 dialer is unaffected.
+  let roll = null
+  if (S) {
+    subEpochs()
+    roll = setInterval(() => { try { subEpochs() } catch { /* never throw from a timer */ } }, epochRollMs)
+    roll.unref?.()
   }
 
   /**
@@ -289,7 +305,7 @@ export function createEndpoint({
 
   return {
     topics,
-    _debug: { acceptedCount: () => accepted.size, dialsCount: () => dials.size }, // DOS-1-WSS leak-monitor hook
+    _debug: { acceptedCount: () => accepted.size, dialsCount: () => dials.size, rollActive: () => roll !== null }, // DOS-1-WSS leak-monitor hook + epoch-roll probe
     candidates() { return S ? [{ proto: 'wss', topic: topicFor(S, epochStr(now())), relays }] : [] },
     async stun() { return { ip: 'wss', port: 0 } },             // the relay IS the reflexive address
     onConnection(cb) { onConnCb = cb },
@@ -338,6 +354,7 @@ export function createEndpoint({
 
     close() {
       clearInterval(sweep)
+      if (roll) { clearInterval(roll); roll = null }            // EPOCH ROLL: stop re-subscribing
       for (const c of conns) c.close()
       for (const s of [...accepted.values(), ...dials.values()]) s.close()
     },

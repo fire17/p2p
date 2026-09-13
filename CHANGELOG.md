@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.7] — 2026-09-13
+
+- UDP endpoint sockets now survive a dgram `error` (Bun 1.4.2 surfaced the kernel's pending `recvmsg ENETUNREACH` as one and the join daemon died at startup on a Debian VPS, 2026-09-13): the affected address family is dropped with a logged reason and dialing continues on the other family or over the relay; send errors are counted and logged instead of vanishing.
+- `P2P_DEBUG=1` now names the committed transport leg on both ends (`composite: committed leg=…`, `attach: proto=…`) and the disconnect reason; `tunnel status` reports `transport`.
+- `tunnel join --relay-only` and `P2P_TRANSPORT=relay|auto`: dial over the public relay only, skipping the UDP/ICE leg.
+- A listener's relay inbox now rolls with the UTC day — a `tunnel listen` daemon older than two days was unreachable over the relay by any new dialer.
+
+No wire-format change; 0.3.6 peers interoperate.
+
 ## [0.3.6] — 2026-09-11
 
 - Persistent Agent Tunnel Terminal alongside encrypted chat, with foreground local owner activation bound to one authenticated peer.
