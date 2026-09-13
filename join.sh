@@ -1,7 +1,9 @@
 #!/bin/sh
 # p2p.akeyo.io/join.sh — ONE static script for every machine. The listener key is a PARAMETER, never a file on this site:
-#   curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <LISTENER_KEY>            # join chat only (never enables terminal)
-#   curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <LISTENER_KEY> --server   # owner's own server: + keeper service + terminal grant
+#   curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <LISTENER_KEY>
+# The key is the only argument (share it as https://p2p.akeyo.io/#/join/<LISTENER_KEY> — the page renders this line client-side).
+# On a Linux server (systemd present, run as root or with passwordless sudo) it also installs the keeper service (rejoin after
+# reboot) and enables the owner terminal grant for the listener — the owner running it IS the consent. Add --chat-only to skip that.
 # Derived from tools/render-join.mjs (same SHA-pinned installer, same join helper). Inspect before running.
 p2p_join_main() {
   set -eu
@@ -237,9 +239,13 @@ UNIT
   "$P2P" tunnel send --name "$NAME" "MIND-READY $ME@$(hostname) $(uname -m) $OSNAME terminal=$TERM_STATE keeper=$($SUDO systemctl is-active livemind-tunnel.service 2>/dev/null || echo unknown)" --wait 10 >/dev/null 2>&1 || true
 }
 JOIN_MODE=''
-for a in "$@"; do case "$a" in --server) JOIN_MODE=--server;; -*) echo "unknown option: $a" >&2; exit 2;; *) [ -n "${P2P_JOIN_KEY:-}" ] || P2P_JOIN_KEY="$a";; esac; done
+for a in "$@"; do case "$a" in --chat-only) JOIN_MODE=--chat-only;; --server) JOIN_MODE=--server;; -*) echo "unknown option: $a" >&2; exit 2;; *) [ -n "${P2P_JOIN_KEY:-}" ] || P2P_JOIN_KEY="$a";; esac; done
 if [ -z "${P2P_JOIN_KEY:-}" ]; then
-  echo 'usage: curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <LISTENER_KEY> [--server]' >&2; exit 2
+  echo 'usage: curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <LISTENER_KEY> [--chat-only]' >&2; exit 2
+fi
+if [ -z "$JOIN_MODE" ]; then
+  # default: full server setup wherever it can be done (Linux + systemd + root or passwordless sudo); chat-only elsewhere
+  if [ "$(uname -s 2>/dev/null)" = Linux ] && command -v systemctl >/dev/null 2>&1 && { [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; }; then JOIN_MODE=--server; else JOIN_MODE=--chat-only; fi
 fi
 export P2P_JOIN_KEY JOIN_MODE
 if [ "$JOIN_MODE" = --server ]; then livemind_server_prereqs && p2p_join_main && livemind_server_setup; else p2p_join_main; fi

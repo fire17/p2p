@@ -25,7 +25,15 @@
   }
 
   /** The install/connect command strings. key === null → plain install. */
-  function commands(key) {
+  function commands(key, kind) {
+    if (key && kind === 'join') {
+      // Agent Tunnel join: ONE static script, the key is a parameter — never a per-key file on this site.
+      return {
+        unix: 'curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- ' + key,
+        win: '& ([scriptblock]::Create((irm https://p2p.akeyo.io/init.ps1))) ' + key,
+        already: 'p2p tunnel join ' + key + ' --profile join-' + key
+      }
+    }
     if (key) {
       return {
         unix: 'curl -fsSL https://p2p.akeyo.io/init | sh -s -- ' + key,
@@ -49,12 +57,16 @@
     return loc.pathname || '/'
   }
 
-  /** Route a path → { key, bad }. bad = "looked like a deep link but the key was invalid". */
-  function route(path) {
-    var m = /^\/?init\/([^/?#]+)\/?$/i.exec(path || '')
-    if (!m) return { key: null, bad: false }
-    var key = normalizeKey(decodeURIComponent(m[1]))
-    return key ? { key: key, bad: false } : { key: null, bad: true }
+  /** Route a path or a hash → { key, bad, kind }. kind = 'init' (chat key) | 'join' (Agent Tunnel listener).
+      Hash routing is the GitHub Pages form: `#/join/KEY` and `#/init/KEY` need no 404 shim and never
+      touch the server — the key stays in the browser. bad = "looked like a deep link but the key was invalid". */
+  function route(path, hash) {
+    var src = (hash && /^#\/?(join|init)\//i.test(hash)) ? hash.replace(/^#/, '') : (path || '')
+    var m = /^\/?(join|init)\/([^/?#]+)\/?$/i.exec(src)
+    if (!m) return { key: null, bad: false, kind: null }
+    var kind = m[1].toLowerCase()
+    var key = normalizeKey(decodeURIComponent(m[2]))
+    return key ? { key: key, bad: false, kind: kind } : { key: null, bad: true, kind: kind }
   }
 
   function isWindows(nav) {
@@ -77,8 +89,8 @@
 
   function boot() {
     var path = intendedPath(window.location)
-    var r = route(path)
-    var cmds = commands(r.key)
+    var r = route(path, window.location.hash)
+    var cmds = commands(r.key, r.kind)
     var win = isWindows(navigator)
 
     // clean the ?p= redirect out of the address bar, keeping the pretty URL
@@ -92,7 +104,7 @@
       $('fullkey').textContent = r.key
       $('cmd-already').textContent = cmds.already
       $('alt-already').hidden = false
-      document.title = 'p2p — ' + r.key.slice(0, 6) + ' shared their key with you'
+      document.title = r.kind === 'join' ? 'p2p — join Agent Tunnel ' + r.key.slice(0, 6) : 'p2p — ' + r.key.slice(0, 6) + ' shared their key with you'
     }
     if (r.bad) $('badkey').hidden = false
 
@@ -156,4 +168,5 @@
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot)
   else boot()
+  window.addEventListener('hashchange', function () { $('invite').hidden = true; $('badkey').hidden = true; boot() })
 })(typeof globalThis !== 'undefined' ? globalThis : this)
