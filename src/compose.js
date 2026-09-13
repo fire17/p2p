@@ -29,20 +29,36 @@
 import { decodeFrame } from './wire.js'
 
 /**
+ * Opt-in trace (P2P_DEBUG=1), same shape as src/node.js's DBG. Off by default, stderr when on.
+ * WHY: when a live link half-works, the ONE fact nobody could read from either end was which leg
+ * each side actually committed to. These lines name it on both ends of a real dial.
+ */
+const DBG = process.env.P2P_DEBUG ? (...a) => { try { console.error('[p2p]', ...a) } catch { /* */ } } : () => {}
+
+/** The transport name of a leg, for traces/diagnostics only. Never used for routing. */
+const legProto = (s) => (s && (s.proto || (s.rinfo && s.rinfo.address))) || 'unknown'
+
+/**
  * @param {Array<Promise<object>>} attempts punch promises (each resolves to a socketLike, or rejects)
  * @returns {Promise<object>} the composite socket (resolves once ≥1 leg is up; rejects if all fail)
  */
 export function composePunch(attempts) {
   if (!attempts.length) return Promise.reject(new Error('raced transport: no usable candidate'))
+  const t0 = Date.now()
   const wrapped = attempts.map((a) => a.then((s) => ({ s })).catch((e) => ({ e })))
   const subs = []
   let nodeHandler = null
   let outbound = null
+  let committedAt = 0
   const composite = {
     closed: false,
     rinfo: { address: 'raced', port: 0 },
     /** The leg that won the race — for tests/diagnostics; null until first peer contact. */
     get winner() { return outbound },
+    /** Transport name of the committed leg ('udp4'|'udp6'|'wss'|…); null until commit. Diagnostics only. */
+    get winnerProto() { return outbound ? legProto(outbound) : null },
+    /** Date.now() of the commit; 0 until then. Diagnostics only. */
+    get committedAt() { return committedAt },
     set onMessage(fn) { nodeHandler = typeof fn === 'function' ? fn : null },
     get onMessage() { return nodeHandler },
     send(frame) {
@@ -75,13 +91,16 @@ export function composePunch(attempts) {
   /** Commit: this leg carries the session. Every other leg is dead weight — tear it down. */
   const commit = (winner) => {
     outbound = winner
-    for (const s of subs) if (s !== winner) { try { s.close() } catch { /* already gone */ } }
+    committedAt = Date.now()
+    let losers = 0
+    for (const s of subs) if (s !== winner) { losers++; try { s.close() } catch { /* already gone */ } }
+    DBG('composite: committed leg=' + legProto(winner) + ' after ' + (committedAt - t0) + ' ms; losers closed=' + losers)
   }
   const wire = (s) => {
     if (subs.includes(s)) return
     // A leg that comes up AFTER the race is already won is never spoken on and would only mint a
     // duplicate accept on the listener. Close it on arrival instead of wiring it in.
-    if (outbound) { try { s.close() } catch { /* */ } return }
+    if (outbound) { DBG('composite: late leg ' + legProto(s) + ' closed on arrival (race already won)'); try { s.close() } catch { /* */ } return }
     subs.push(s)
     s.onMessage = (buf, ri) => {
       // BRW-1: lock outbound only on a WELL-FORMED wire frame. The peer's real first contact is a full

@@ -158,6 +158,7 @@ function makePeer(node, { S = null } = {}) {
   let peerInstance = null         // remote's per-process nonce; a change => peer restarted
   let ch = null, tx = null, rx = null, socket = null
   let connected = false, established = false
+  let transportName = null   // the leg this peer is actually riding ('udp4'|'udp6'|'wss'|'tcp'|…), null before attach
 
   const peer = {
     S,
@@ -165,6 +166,9 @@ function makePeer(node, { S = null } = {}) {
     remoteStatic: null,     // remote X25519 pubkey
     remoteEd: null,         // remote Ed25519 pubkey
     get connected() { return connected },
+    /** Which transport leg this peer rides — the dialer's committed leg, the accepter's inbound socket.
+     *  null until attach. Diagnostics: `tunnel status` and the P2P_DEBUG traces read the same string. */
+    get transport() { return transportName },
     /** Largest app payload that still fits the wire budget (mtu - wire header - wire MAC - Noise tag - app header). */
     get maxMessage() { return node._mtu - HEADER_LEN - MAC_LEN - AEAD_TAG - APP_HDR },
     /** @param {Buffer|string} data @returns {Promise<number>} resolves with appSeq on ack, REJECTS on a permanent send error */
@@ -233,7 +237,7 @@ function makePeer(node, { S = null } = {}) {
    * `mac` = the directional control-plane keys (wireMacKeys) — REQUIRED by createChannel:
    * a channel is never built without an authenticated control plane (WIRE-1/2/3).
    */
-  function attach({ socket: sock, tx: txN, rx: rxN, connId, instance, mac }) {
+  function attach({ socket: sock, tx: txN, rx: rxN, connId, instance, mac, role = null }) {
     // Peer RESTART detection: a different per-process instance nonce means the remote is a
     // fresh process with its outbound appSeq reset to 0. Its new low seqs would collide with
     // the dead session's entries in `delivered` and be dropped as dups — so reset inbound
@@ -244,9 +248,19 @@ function makePeer(node, { S = null } = {}) {
     }
     if (instance && instance.length) peerInstance = instance
     socket = sock; tx = txN; rx = rxN
+    // Name the leg we landed on. The dialer's socket is the COMPOSITE (winnerProto = the committed
+    // leg); the accepter's is the raw inbound sub-socket (proto). One string, both ends.
+    transportName = (sock && (sock.winnerProto || sock.proto)) || 'unknown'
+    DBG('attach: proto=' + transportName
+      + ' connId=' + (connId ? Buffer.from(connId).toString('hex') : '-')
+      + ' instance=' + (instance && instance.length ? Buffer.from(instance).toString('hex') : '-')
+      + ' (' + (role || 'unknown') + ')')
     ch = createChannel({ connId, mac, mtu: node._mtu, keepaliveMs: node._keepaliveMs, now: node._now, send: (frame) => socket.send(frame) })
     ch.onReliable(onAppCipher)
-    ch.onClose(() => { if (connected) { connected = false; node.emit('disconnect', peer) } })
+    ch.onClose((reason) => {
+      DBG('disconnect: reason=' + (reason || 'unknown') + ' peer=' + (peer.S || peer.key || 'static:' + (peer.remoteStatic ? Buffer.from(peer.remoteStatic).toString('hex').slice(0, 16) : '?')) + ' proto=' + transportName)
+      if (connected) { connected = false; node.emit('disconnect', peer) }
+    })
     connected = true
     for (const seq of [...outbox.keys()].sort((a, b) => a - b)) wireSend(APP.MSG, seq, outbox.get(seq))
     if (!established) { established = true; node.emit('peer', peer) }
@@ -570,7 +584,7 @@ function initiatorHandshake(node, deps, S, dec, ctx = {}) {
           const { tx, rx, handshakeHash } = hs.split()
           // Control-plane keys ride out of the SAME handshake that proves the peer (D4) —
           // so the ARQ/ack/close plane is authenticated from the very first channel frame.
-          rec.attach({ socket, tx, rx, connId: myConnId, instance: peerInstance, mac: wireMacKeys(handshakeHash, 'initiator') })
+          rec.attach({ socket, tx, rx, connId: myConnId, instance: peerInstance, mac: wireMacKeys(handshakeHash, 'initiator'), role: 'initiator' })
           if (!settled) { settled = true; resolve(rec.peer) }
         } else if (rec.channel()) {
           rec.channel().onDatagram(buf, socket.rinfo)
@@ -702,7 +716,7 @@ function acceptConnection(node, deps, socket) {
       // safe order either way.)
       const hs2 = hs.writeMessage(encodeIntro(id.edPub, id.xPub, node._instance))
       const { tx, rx, handshakeHash } = hs.split()
-      rec.attach({ socket, tx, rx, connId, instance, mac: wireMacKeys(handshakeHash, 'responder') })
+      rec.attach({ socket, tx, rx, connId, instance, mac: wireMacKeys(handshakeHash, 'responder'), role: 'responder' })
       socket.send(encodeFrame(TYPE.HS2, connId, 0, 0, hs2))
       // v2 BURN: a valid invite-mode msg1 (the correct K_inv-derived prologue made hs.readMessage
       // succeed) just completed and we answered — the one-time invite has done its single job. Retire
