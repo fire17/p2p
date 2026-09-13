@@ -104,6 +104,7 @@
       $('fullkey').textContent = r.key
       $('cmd-already').textContent = cmds.already
       $('alt-already').hidden = false
+      $('alt-undo').hidden = r.kind !== 'join'
       document.title = r.kind === 'join' ? 'p2p — join Agent Tunnel ' + r.key.slice(0, 6) : 'p2p — ' + r.key.slice(0, 6) + ' shared their key with you'
     }
     if (r.bad) $('badkey').hidden = false
