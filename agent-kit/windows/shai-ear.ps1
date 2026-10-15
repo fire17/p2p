@@ -88,13 +88,15 @@ function Short([string]$s, [int]$n) {
   return $s.Substring(0, $n) + '...'
 }
 
-# Strip terminal-control characters (C0 except TAB/LF, DEL, C1 incl. ESC sequences' lead bytes)
-# and bidi overrides/isolates (they can visually reorder a line). Unicode line breaks become LF.
+# Strip terminal-control characters (C0 except TAB/LF, DEL, C1 incl. ESC sequences' lead bytes),
+# bidi marks/overrides/isolates (they can visually reorder a line) and invisible characters a model
+# reads but a person cannot see (zero-width, word joiner, BOM, TAG block U+E0000-E007F as its UTF-16
+# surrogate pair, variation selectors U+FE00-FE0F and U+E0100-E01EF). Unicode line breaks become LF.
 function Clean([string]$s) {
   if ($null -eq $s) { return '' }
   $s = $s -replace "`r`n", "`n"
   $s = $s -replace '[\r\u0085\u2028\u2029]', "`n"
-  return ($s -replace '[\x00-\x08\x0B-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]', '')
+  return ($s -replace '\uDB40[\uDC00-\uDC7F\uDD00-\uDDEF]|[\x00-\x08\x0B-\x1F\x7F-\x9F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\uFFF9-\uFFFB]', '')
 }
 
 # ---------- run p2p (Process API: UTF-8 decode, separate stderr, hard timeout) ----------

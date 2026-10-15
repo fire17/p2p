@@ -26,4 +26,14 @@ $PY read wsl-codex | grep -F "hi all" >/dev/null; ok $? "ps broadcast reaches py
 PS send ghost "x" -From win-claude >/dev/null 2>&1; [ $? != 0 ]; ok $? "ps refuses unknown target"
 PS ear win-claude -Once | grep -E '^up +wsl-codex ' >/dev/null; ok $? "ps ear -Once prints roster"
 PS bye win-claude >/dev/null; $PY who | grep -F win-claude >/dev/null; [ $? != 0 ]; ok $? "ps bye removes presence"
+
+# guards shared by both twins (docs/MESH-THREATS.md #3, #7, #8)
+$PY here esc-agent --harness "$(printf '\033[2J\033]0;x\007codex')" --note "$(printf 'n\342\200\256ote')" >/dev/null
+PS who | grep -F esc-agent | LC_ALL=C grep -q "$(printf '[\033\007]')"; [ $? != 0 ]; ok $? "ps who prints no ESC/BEL from fields python wrote"
+$PY send esc-agent "$(printf 'ok\342\200\213\363\240\201\211\357\273\277')" --from wsl-codex >/dev/null
+PS read esc-agent | grep -F ':: ok  (' | grep -F 'hidden/control chars removed' >/dev/null; ok $? "ps read strips zero-width, BOM and TAG chars and says so"
+python3 -c "import json,sys,time; json.dump({'name':'laptop','remote':True,'beat':time.time(),'machine':'link','harness':'link','link':'peer-changed'}, open(sys.argv[1]+'/agents/laptop.json','w'))" "$T"
+PS who | grep -E '^peer-changed +laptop ' >/dev/null; ok $? "ps who shows a held link as peer-changed"
+PS here laptop >/dev/null 2>&1; [ $? != 0 ]; ok $? "ps refuses a link's name for a local agent"
+$PY here laptop >/dev/null 2>&1; [ $? != 0 ]; ok $? "py refuses a link's name for a local agent"
 echo "$pass passed, $fail failed"; [ "$fail" = 0 ]

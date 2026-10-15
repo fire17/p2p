@@ -26,6 +26,12 @@ $Agents = Join-Path $Root 'agents'
 [void][IO.Directory]::CreateDirectory($Agents)
 
 function Now { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 }
+# Text from other agents and machines is data: drop C0/C1 controls, bidi marks/overrides/isolates and invisible
+# characters (zero-width, word joiner, BOM, TAG block U+E0000-E007F as its UTF-16 pair, variation selectors
+# U+FE00-FE0F and U+E0100-E01EF, the latter also as a UTF-16 pair) before printing anything.
+$Ctrl = '\uDB40[\uDC00-\uDC7F\uDD00-\uDDEF]|[\x00-\x08\x0B-\x1F\x7F-\x9F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\uFFF9-\uFFFB]'
+function Clean([string]$s) { $s -replace $Ctrl, '' }
+function One([string]$s, [int]$n) { $t = Clean (($s -split '\s+' | Where-Object { $_ }) -join ' '); if ($t.Length -gt $n) { $t.Substring(0, $n) } else { $t } }
 function Check-Name([string]$n) {
   if ($n -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw "bad name '$n': letters, digits, . _ - (e.g. win-claude)" }
   $n
@@ -39,6 +45,8 @@ function Write-Atomic([string]$path, $obj) {
 function Read-Json([string]$path) { try { [IO.File]::ReadAllText($path, $Utf8) | ConvertFrom-Json } catch { $null } }
 function Heartbeat([string]$me, [double]$started) {
   $p = Join-Path $Agents "$me.json"; $old = Read-Json $p
+  # A local agent may not take a tunnel link's name: that link would ship its messages off this PC.
+  if ($old -and $old.remote -and ((Now) - [double]$old.beat) -lt $Forget) { throw "'$me' is the name of a tunnel link on this hub; pick another name (or hub.ps1 bye $me if that link is gone)" }
   $h = $Harness; if (-not $h -and $old) { $h = [string]$old.harness }
   $n = $Note; if (-not $n -and $old) { $n = [string]$old.note }
   if (-not $started) { $started = if ($old -and $old.started) { [double]$old.started } else { Now } }
@@ -54,12 +62,13 @@ function Roster([switch]$All) {
     if ($age -gt $Forget -and -not $All) { continue }
     $state = if ($age -le $Stale) { 'up' } else { 'stale' }
     if ($r.remote -and $r.link -eq 'down') { $state = 'link-down' }
+    if ($r.remote -and $r.link -eq 'peer-changed') { $state = 'peer-changed' }
     [pscustomobject]@{ state = $state; name = [string]$r.name; machine = [string]$r.machine; harness = [string]$r.harness
       age = $age; note = [string]$r.note; remote = [bool]$r.remote }
   }
 }
 function Show-Roster { $rows = @(Roster); if (-not $rows) { 'nobody here' } else {
-  $rows | ForEach-Object { '{0,-9} {1,-22} {2,-20} {3,-10} age {4}s{5}' -f $_.state, $_.name, $_.machine, $_.harness, $_.age, $(if ($_.note) { '  ' + $_.note } else { '' }) } } }
+  $rows | ForEach-Object { '{0,-9} {1,-22} {2,-20} {3,-10} age {4}s{5}' -f $_.state, (One $_.name 64), (One $_.machine 128), (One $_.harness 128), $_.age, $(if ($_.note) { '  ' + (One $_.note 300) } else { '' }) } } }
 function Deliver([string]$to, [string]$from, [string]$body) {
   if ($Utf8.GetByteCount($body) -gt 1MB) { throw 'message exceeds 1 MiB' }
   $ts = Now; $id = [Guid]::NewGuid().ToString('N').Substring(0, 12)
@@ -68,22 +77,48 @@ function Deliver([string]$to, [string]$from, [string]$body) {
     v = 1; id = $id; from = $from; to = $to; t = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); ts = $ts; text = $body; via = '' })
   $id
 }
+# Claiming is hub.py's protocol (see its header): exclusively create inbox/<me>/claims/<file>.claim (a dead claimer's
+# marker older than $ClaimStale s is taken over as .claim.1, .claim.2, ...); only that creator moves and prints the
+# message. A bare rename is not enough: on Windows two readers' renames of one file can both succeed.
+$ClaimStale = 120   # = hub.py CLAIM_STALE_S
+function Win32-Code($err) { $e = $err.Exception; while ($e.InnerException) { $e = $e.InnerException }; $e.HResult -band 0xFFFF }
+function Claim-Marker([string]$claims, [string]$fn) {
+  $k = 0
+  while ($true) {
+    $mk = Join-Path $claims ($fn + '.claim' + $(if ($k) { ".$k" } else { '' }))
+    try { [IO.File]::Open($mk, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose(); return $mk }
+    catch { $c = Win32-Code $_; if ($c -eq 5) { return $null }; if ($c -ne 80) { throw } }   # 5: being deleted; 80: exists
+    $fi = New-Object IO.FileInfo $mk
+    if (-not $fi.Exists) { continue }                                                  # released just now: same generation
+    if (([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds -lt $ClaimStale) { return $null }   # another reader holds it
+    $k++                                                                               # its claimer died: take over
+  }
+}
 function Claim([string]$me) {
   $d = Join-Path (Join-Path $Root 'inbox') $me
   if (-not (Test-Path -LiteralPath $d)) { return }
   $done = Join-Path $d 'read'; [void][IO.Directory]::CreateDirectory($done)
+  $claims = Join-Path $d 'claims'; [void][IO.Directory]::CreateDirectory($claims)
   $rows = foreach ($f in (Get-ChildItem -LiteralPath $d -Filter '*.json' -File)) {
     if ($f.Name.StartsWith('.')) { continue }
     $m = Read-Json $f.FullName; if ($m) { [pscustomobject]@{ ts = [double]$m.ts; name = $f.Name; m = $m; path = $f.FullName } } }
   foreach ($r in ($rows | Sort-Object ts, name)) {
-    $dst = Join-Path $done $r.name
-    try { [IO.File]::Move($r.path, $dst) } catch { continue }   # another reader claimed it
+    $mk = Claim-Marker $claims $r.name; if (-not $mk) { continue }
+    $dst = Join-Path $done $r.name; $moved = $false
+    for ($i = 0; $i -lt 40; $i++) {
+      try { [IO.File]::Move($r.path, $dst); $moved = $true; break }
+      catch { $c = Win32-Code $_; if ($c -eq 2) { break }; if ($c -ne 32 -and $c -ne 5) { throw }; Start-Sleep -Milliseconds 50 }
+    }   # 2: gone (a reader took over a stale marker); 32/5: another reader has it open right now
+    if (-not $moved) {
+      if ([IO.File]::Exists($r.path)) { [IO.File]::Delete($mk); Write-Warning "$($r.path) stayed in use for 2 s; left in the inbox" }
+      continue
+    }
     $lines = @(([string]$r.m.text) -split '\r?\n|[\r\u000B\u000C\u0085\u2028\u2029]')
-    # Remote text is data: drop terminal-control and bidi-override characters before printing it.
-    $first = $lines[0] -replace '[\x00-\x08\x0B-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]', ''
+    $first = Clean $lines[0]; $hidden = $lines[0].Length - $first.Length
     $body = if ($lines.Count -le 1) { $first } else { $first + "  (+$($lines.Count - 1) more lines: $dst)" }
-    $via = if ($r.m.via) { " via=$($r.m.via)" } else { '' }
-    "MSG from=$($r.m.from) to=$($r.m.to) id=$($r.m.id)$via :: $body"
+    if ($hidden) { $body += "  ($hidden hidden/control chars removed)" }
+    $via = if ($r.m.via) { ' via=' + (One $r.m.via 64) } else { '' }
+    "MSG from=$(One $r.m.from 130) to=$(One $r.m.to 64) id=$(One $r.m.id 32)$via :: $body"
   }
 }
 
@@ -121,7 +156,7 @@ switch ($Verb) {
           $now = @{}; foreach ($r in @(Roster)) { $now[$r.name] = $r }
           foreach ($n in ($now.Keys | Sort-Object)) {
             if ($n -eq $me) { continue }
-            if ($now[$n].state -eq 'up' -and $seen[$n] -ne 'up') { "JOIN $n ($($now[$n].machine) $($now[$n].harness))" }
+            if ($now[$n].state -eq 'up' -and $seen[$n] -ne 'up') { "JOIN $(One $n 64) ($(One $now[$n].machine 128) $(One $now[$n].harness 128))" }
             if ($now[$n].state -ne 'up' -and $seen[$n] -eq 'up') { "LEAVE $n ($($now[$n].state))" }
           }
           foreach ($n in @($seen.Keys)) { if (-not $now.ContainsKey($n) -and $n -ne $me -and $seen[$n] -eq 'up') { "LEAVE $n (bye)" } }

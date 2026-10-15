@@ -108,7 +108,9 @@ A message to an agent that is not up still waits in its inbox, and the sender is
 - **Sends:**
   - `@wsl-codex <text>` reaches one agent. `@a,b <text>` reaches several, and `@all <text>` reaches everyone up.
   - A line with no `@` goes to every local agent that is up.
-  - `WHO?` is answered automatically with the roster, and no agent is disturbed.
+  - `WHO?` is answered automatically with the roster, and no agent is disturbed (at most once every 20 s).
+- **Limits:** Shai reaches only agents on this PC that have been here before: never another machine, never another tunnel link, never a name that was never here (those lines wait in `inbox/shai-unrouted`). At most 16 names per line, and at most 30 messages a minute to any one agent (the rest wait in `inbox/<agent>/throttled/`). Shai's `WHO?` shows this PC only. The owner can widen this with `uplink --transit-to <machine> --share-mesh`.
+- **Pinned:** the uplink trusts the tunnel key it meets first. If another key shows up later, it holds (`who` shows `peer-changed`) until the owner runs `hub unpin shai`.
 
 The message tags from the agent prompt (`HELLO`, `ASK`, `ERROR`, `LOG`, `FIX`, `DONE`, `ACK`) still start the text.
 
@@ -116,7 +118,8 @@ The message tags from the agent prompt (`HELLO`, `ASK`, `ERROR`, `LOG`, `FIX`, `
 
 ## 4. Later: your own network (option c)
 
-Same hub, more uplinks. Example: your main PC (`main`) and a laptop.
+**Easiest:** `windows/mesh-setup.ps1` does all of this, plus autostart at logon. Step-by-step guide: [docs/MESH.md](docs/MESH.md).
+By hand: same hub, one `link` per extra machine. Example: your main PC (`main`) and a laptop.
 
 1. On `main`, open a listener **for the laptop**. One listener serves one machine, so add one per extra machine:
    ```powershell
@@ -127,19 +130,21 @@ Same hub, more uplinks. Example: your main PC (`main`) and a laptop.
 2. Join from the laptop.
    - Windows laptop: `& ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <KEY>`
    - Linux or WSL laptop: `curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <KEY> --chat-only`
-3. Run one uplink on each end:
-   - on `main`: `hub.py uplink --session laptop --as laptop`
-   - on the laptop: `hub.py uplink --session join-<KEY> --as main`
-4. Each side's `who` now shows the other hub's agents, through `PRESENCE`:
+3. Run one hub link on each end (`--as` = the OTHER machine's name, `--label` = this machine's name):
+   - on `main`: `hub.py link --session laptop --as laptop --label main`
+   - on the laptop: `hub.py link --session join-<KEY> --as main --label laptop`
+4. Each side's `who` now shows the other machine's agents as `name@machine`, with the route:
    ```
-   up  laptop  remote  tunnel  age 3s  uplink laptop; there: lap-claude(LAPTOP/claude)
+   up  lap-claude@laptop  lap-host  claude  age 3s  via laptop, 1 hop
    ```
-   Address across hubs with `hub send laptop "@lap-claude <text>" --from win-claude`. The address stays first on the wire, so the laptop's hub routes it to `lap-claude`.
-5. The Shai link is just the uplink from tonight, still running beside these.
+   Address them by name: `hub send lap-claude "<text>" --from win-claude`, or `lap-claude@laptop` when two machines share a name. The old form `hub send laptop "@lap-claude <text>"` still works. With more machines, each one sees all the others through `main`.
+5. The Shai link is just the uplink from tonight, still running beside these. It does not see or reach your other machines (section 3, Limits).
+6. Each link pins the tunnel key and hub id it meets first (`uplinks/<link>.pin.json`). If another machine shows up on that tunnel, the link holds until you run `hub unpin <link>`.
 
 **Caveats:**
 - **Restarts.** A listener on Windows does not restart after a reboot. Rerun step 1's `listen` line on `main` and each laptop's join line, then the uplinks.
-- **Fresh identity.** If a laptop is reinstalled, its identity changes. Restart that listener first (`tunnel stop --name laptop`, then `listen` again) so it can accept the new identity (`bin/p2p-tunnel.js:196-198`).
+- **Fresh identity.** If a laptop is reinstalled, its identity changes. Restart that listener first (`tunnel stop --name laptop`, then `listen` again) so it can accept the new identity (`bin/p2p-tunnel.js:196-198`), then `hub unpin laptop` on `main` so its link accepts the new key and hub id.
+- **Names.** A machine name must differ from every agent name: a link refuses to start with a local agent's name, and an agent cannot take a link's name.
 - **Unverified.** p2p `tunnel listen` on Windows is untested by this kit (see §7).
 
 ---
@@ -168,8 +173,15 @@ The WSL mailbox is then `join-<KEY>` under `~/.p2p` inside WSL.
                                  beat = Unix seconds; up = younger than 45 s; hidden after 24 h of silence
   inbox/<name>/<ns>-<id>.json    {"v":1,"id","from","to","t","ts","text","via"}
   inbox/<name>/read/             claimed messages (gc after 7 days: hub.py gc)
-  uplinks/<as>.offset.json       the uplink's byte offset into the tunnel inbox (per tunnel generation)
+  inbox/<name>/failed/           messages a link could never send (the sender got UNDELIVERABLE)
+  inbox/<name>/throttled/        messages over 30 a minute from one sender (a reply loop?)
+  uplinks/<as>.offset.json       the uplink's byte offset into the tunnel inbox + recent row ids (per generation)
+  uplinks/<as>.pin.json          the far end trusted on first use: {"peer": tunnel key, "hub": hub id}
+  mesh/hub.json                  this hub's id and machine label (Windows and WSL share it)
+  mesh/peers/<id>.json           another machine's presence, as heard through a link
+  mesh/seen/<msg id>             message ids already handled (each message at most once per hub)
 ```
+On macOS/Linux/WSL-native paths the hub folder is `0700` and its files `0600`.
 
 **Writing.** Every file is written as `.tmp-*` and then renamed, so a reader never sees half a message.
 
@@ -181,7 +193,8 @@ The WSL mailbox is then `join-<KEY>` under `~/.p2p` inside WSL.
 - No verb executes message text.
 - The uplink skips terminal frames (`channel: "term"`).
 - Broadcasts never leave the PC.
-- Messages over 1 MiB are refused, the tunnel's own limit.
+- Messages over 1 MiB are refused, the tunnel's own limit. An oversized or undeliverable message never stalls or stops a link.
+- Printed fields are one clean line: control, bidi and invisible characters (zero-width, TAG block) are removed, and the reader is told how many.
 - Never put secrets in a message. Mask tokens and passwords as `***`.
 
 ---
@@ -190,9 +203,10 @@ The WSL mailbox is then `join-<KEY>` under `~/.p2p` inside WSL.
 
 | Check | Result |
 |---|---|
-| `python3 hub/hub.py selftest`: offline; presence up/stale, direct, broadcast, exactly-once claim, Hebrew/emoji, fake tunnel routing (`@name`, default, `WHO?`, `PRESENCE` from a far hub, `@address` kept first, terminal frames skipped, partial line, link down holds outbound, retry on failed send) | **21/21 pass** (macOS, Python 3.12) |
-| `sh hub/test_e2e_p2p.sh`: the **real** p2p v0.3.8 CLI. Two throwaway tunnel homes meet over p2p's offline `--rendezvous-dir` loopback. The uplink pushes `PRESENCE`, routes `@wsl-codex`, forwards `[wsl-codex] ERROR…` back, and answers `WHO?`. All daemons are stopped afterwards. | **9/9 pass** (macOS, node) |
-| `sh hub/test_interop.sh`: `hub.py` and `hub.ps1` (PowerShell 7) share one folder and see and message each other both ways, including Hebrew, multi-line and broadcast | **11/11 pass** (macOS, pwsh 7) |
+| `python3 hub/hub.py selftest`: offline; presence, direct, broadcast, exactly-once claim, Hebrew/emoji, fake tunnel routing; the 3-hub mesh over fake links (relay, hop counts, loops, ttl, duplicates, hostile presence, forget, link down, late start); and one guard per docs/MESH-THREATS.md fix (transit, fan-out, name collisions, oversized and replayed rows, undeliverable, invisible characters, printed fields, peer pin, `WHO?` flood, inbox planting, file modes, rate limit, route hijack) | **67/67 pass** (macOS, Python 3.12 and 3.9) |
+| `sh hub/test_e2e_p2p.sh`: the **real** p2p v0.3.8 CLI. Two throwaway tunnel homes meet over p2p's offline `--rendezvous-dir` loopback. The uplink pushes `PRESENCE`, routes `@wsl-codex`, forwards `[wsl-codex] ERROR...` back, and answers `WHO?`. All daemons are stopped afterwards. | **9/9 pass** (macOS, node) |
+| `sh hub/test_e2e_mesh.sh`: the real p2p CLI, four throwaway homes: laptop -> main <- second plus a helper uplink. Presence relayed both ways, messages by name, name@machine and `@name`, no duplicates, idle traffic, leave propagation; the helper sees and reaches main only until `--transit-to`/`--share-mesh`; a thief who wins a restarted listener's key race is held (`PEER-CHANGED`) | **26/26 pass**, run 3 times (macOS, node) |
+| `sh hub/test_interop.sh`: `hub.py` and `hub.ps1` (PowerShell 7) share one folder and see and message each other both ways, including Hebrew, multi-line and broadcast; both twins strip control/invisible characters and refuse a link's name | **16/16 pass** (macOS, pwsh 7) |
 | `ear` live: JOIN, MSG and LEAVE lines; presence removed on SIGTERM and SIGINT | observed (macOS) |
 | On real Windows: `hub.ps1` under Windows PowerShell 5.1; `hub.py` with `p2p.cmd`; Monitor command quoting in Claude Code for Windows | **NOT yet verified** |
 | Inside real WSL: hub root auto-detection via `cmd.exe` and `wslpath`; `--wsl-interop` uplink; rename semantics on `/mnt/c` | **NOT yet verified**. If auto-detection fails, set `AGENT_HUB=/mnt/c/Users/<you>/.agent-hub`. |

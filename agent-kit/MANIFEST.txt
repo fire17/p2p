@@ -27,8 +27,11 @@ codex-bridge/selftest.py
 codex-bridge/selftest.sh
 codex-bridge/uninstall.sh
 codex-bridge/xtest.py
+docs/MESH-THREATS.md
+docs/MESH.md
 hub/hub.ps1
 hub/hub.py
+windows/mesh-setup.ps1
 windows/shai-ear.ps1
 windows/shai-send.ps1
 wsl/shai-ear.sh
