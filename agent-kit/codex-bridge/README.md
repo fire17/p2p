@@ -24,6 +24,7 @@ Codex shell: pb send <claude-or-codex-peer> "text" ──► target's CC socket 
 | v0.1 | `cxsend`: inject a message into a live Codex thread via the daemon | STABLE (macOS). Windows untested. Shipped to Shai 22:28. |
 | v0.2 | hub + per-thread stubs + `pb`: Codex in ListAgents, native SendMessage both ways, CC-convention receipts, opt-in policy + kill switch | Claude→Codex STABLE. Codex→Claude only in unsandboxed Codex. |
 | v0.2.1 | sandbox-proof `pb send` (rollout channel, HMAC + dedupe), `codex-unsandboxed` opt-in launcher, default-sandbox selftest leg | macOS: 29/29 PASS (evidence/selftest-20261015-225433.json) |
+| v0.2.2 | `pb doctor`, `codex-unsandboxed.cmd` | macOS doctor verified; .cmd untested |
 | v0.3 (planned) | native-Windows Claude⇄Codex via named pipes | not started |
 
 ## Two modes (both validated by selftest, 29/29 PASS)
@@ -63,8 +64,8 @@ Claude to Codex works the same in both modes: it wakes an idle session or steers
 - Windows: see docs/WINDOWS.md.
 - Design and dead ends: docs/DESIGN.md.
 
-## Status in agent-kit (v0.2.1)
-- Claude->Codex: stable (both modes). Codex->Claude: stable from an unsandboxed Codex (mode b); stable from a default-sandbox Codex (mode a) to prompting-mode Claude receivers; HELD for the human's approval when the receiving Claude runs in bypass mode (Claude Code's permission-parity rule). macOS stable; Linux/WSL experimental; native Windows = cxsend only (v0.3 for named pipes).
+## Status in agent-kit (v0.2.2)
+- Claude->Codex: stable (both modes). Codex->Claude: stable from an unsandboxed Codex (mode b); stable from a default-sandbox Codex (mode a) to prompting-mode Claude receivers; HELD for the human's approval when the receiving Claude runs in bypass mode (Claude Code's permission-parity rule). macOS stable; Linux/WSL experimental; native Windows = cxsend + `pb doctor` (v0.3 for named pipes). Diagnose any machine with `python bin/pb doctor` (read-only).
 - Default policy is **optin**: no Codex session is reachable until the machine's owner runs `pb expose ...` locally. `pb off` is the kill switch.
-- Mode (b) `bin/codex-unsandboxed` runs Codex with NO sandbox and NO approvals. It is an explicit opt-in the machine's owner chooses per machine; never the default, never enabled silently.
+- Mode (b) `bin/codex-unsandboxed` (`bin\codex-unsandboxed.cmd` on native Windows, untested live) runs Codex with NO sandbox and NO approvals. It is an explicit opt-in the machine's owner chooses per machine; never the default, never enabled silently.
 - Windows: never run codex or cxsend from an Administrator terminal; launch codex without -c/--enable/--disable flags. See docs/WINDOWS.md.
