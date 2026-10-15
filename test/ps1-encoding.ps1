@@ -28,8 +28,9 @@ if (@(Get-ParseErrors ([Text.Encoding]::GetEncoding(1252).GetString($canary))).C
     throw 'Canary failed: a UTF-8 em dash inside a double-quoted string must not parse as cp1252'
 }
 
-$files = @(Get-ChildItem -LiteralPath $repoPath -Recurse -File -Include '*.ps1', '*.ps1.in' |
-    Where-Object { $_.FullName -notmatch '[\\/](\.git|node_modules)[\\/]' } | Sort-Object FullName)
+# Filter by name: Windows PowerShell 5.1 ignores -Include together with -LiteralPath.
+$files = @(Get-ChildItem -LiteralPath $repoPath -Recurse -File |
+    Where-Object { $_.Name -match '\.ps1(\.in)?$' -and $_.FullName -notmatch '[\\/](\.git|node_modules)[\\/]' } | Sort-Object FullName)
 if ($files.Count -lt 3) { throw "Expected the repository PowerShell scripts, found $($files.Count)" }
 $failures = New-Object Collections.Generic.List[string]
 $desktop = $PSVersionTable.PSEdition -eq 'Desktop'
