@@ -10,6 +10,7 @@ codex-bridge/bin/pb
 codex-bridge/codex-skill/SKILL.md
 codex-bridge/docs/CODEX-TO-CODEX.md
 codex-bridge/docs/DESIGN.md
+codex-bridge/docs/HOLD-OPTIONS.md
 codex-bridge/docs/INSTALL.md
 codex-bridge/docs/ROADMAP-v0.3.md
 codex-bridge/docs/WINDOWS.md
