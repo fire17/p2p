@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""cxsend — message a LIVE Codex session through Codex's own app-server daemon (peerbridge v0.1).
+
+  cxsend list                                   live (loaded) Codex threads: id, status, cwd, name
+  cxsend send <thread-id|name|cwd-basename> <text...> [--from NAME] [--raw] [--file PATH]
+                                                inject as a user turn: wakes an idle thread (new turn),
+                                                steers a busy one (folded into the running turn)
+Works wherever `codex` 0.162+ runs: direct to ~/.codex/app-server-control/app-server-control.sock when it
+exists, else through `codex app-server proxy` (Codex picks the OS transport; set
+PEERBRIDGE_CODEX_TRANSPORT=proxy to force). Python 3.9+, stdlib only.
+"""
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+for cand in (os.path.join(HERE, "..", "peerbridge"), os.path.join(HERE, "..", "lib", "peerbridge"), HERE):
+    if os.path.exists(os.path.join(cand, "cxrpc.py")):
+        sys.path.insert(0, os.path.abspath(cand))
+        break
+from cxrpc import CodexRPC, RPCError  # noqa: E402
+
+
+def threads(rpc):
+    out = []
+    for tid in rpc.call("thread/loaded/list", {}).get("data", []):
+        try:
+            t = rpc.call("thread/read", {"threadId": tid})["thread"]
+        except Exception:
+            continue
+        if t.get("ephemeral"):
+            continue
+        out.append(t)
+    return out
+
+
+def status(t):
+    s = t.get("status") or {}
+    return s.get("type", "?") + ("(" + ",".join(s["activeFlags"]) + ")" if s.get("activeFlags") else "")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    rpc = CodexRPC(client_name="cxsend", version="0.1.0")
+    if a[0] == "list":
+        for t in threads(rpc):
+            print(f"{t['id']}  {status(t):<10} {t.get('cwd', '')}  {t.get('name') or ''}")
+        return
+    if a[0] != "send" or len(a) < 2:
+        sys.exit(__doc__)
+    frm, raw, text = os.environ.get("CXSEND_FROM") or "", False, None
+    args = a[2:]
+    if "--from" in args:
+        i = args.index("--from"); frm = args[i + 1]; del args[i:i + 2]
+    if "--raw" in args:
+        args.remove("--raw"); raw = True
+    if "--file" in args:
+        i = args.index("--file"); text = open(args[i + 1], encoding="utf-8").read(); del args[i:i + 2]
+    if text is None:
+        text = sys.stdin.read() if args in ([], ["-"]) else " ".join(args)
+    if not text.strip():
+        sys.exit("cxsend: empty message")
+    target = a[1]
+    ts = threads(rpc)
+    m = [t for t in ts if t["id"] == target] or [t for t in ts if (t.get("name") or "") == target] \
+        or [t for t in ts if os.path.basename((t.get("cwd") or "").rstrip("/")) == target]
+    if len(m) != 1:
+        sys.exit(f"cxsend: expected one live thread for '{target}', found {len(m)}. Try `cxsend list`.")
+    t = m[0]
+    if not raw:
+        who = frm or os.environ.get("USER", "agent")
+        text = (f'<cross-session-message from-name="{who}" via="cxsend">\n{text}\n</cross-session-message>\n'
+                f"(Sent by another agent session, not typed by your user.)")
+    before = status(t)
+    t0 = time.time()
+    try:
+        r = rpc.call("turn/start", {"threadId": t["id"], "input": [{"type": "text", "text": text}]})
+    except RPCError as e:
+        sys.exit(f"cxsend: Codex refused: {e}")
+    dt = (time.time() - t0) * 1000
+    how = "steered into running turn" if before.startswith("active") else "started new turn"
+    print(f"injected into {t['id']} ({t.get('cwd')}): {how}, turn {r['turn']['id']}, {dt:.0f} ms, transport={rpc.mode}")
+
+
+if __name__ == "__main__":
+    main()
