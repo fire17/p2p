@@ -8,7 +8,10 @@ receipts / idle notices honestly. Control socket ~/.peerbridge/hub.sock serves t
 from __future__ import annotations
 
 import base64
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
 import hashlib
 import hmac
 import re
@@ -28,7 +31,7 @@ import ccpeer  # noqa: E402
 import policy  # noqa: E402
 from cxrpc import CodexRPC, RPCError  # noqa: E402
 
-VERSION = "0.2.1"
+VERSION = "0.3.0-rc1"
 HOME = ccpeer.STATE_DIR
 THREADS_DIR = os.path.join(HOME, "threads")
 LOG = os.path.join(HOME, "hub.log")
@@ -36,6 +39,8 @@ EVENTS = os.path.join(HOME, "events.jsonl")
 RECEIPTS = os.path.join(HOME, "receipts.jsonl")
 NAMES = os.path.join(HOME, "names.json")
 CTL = os.path.join(HOME, "hub.sock")
+CTL_PIPE = "\\\\.\\pipe\\LOCAL\\peerbridge-hub-" + "".join(
+    c for c in (os.environ.get("USERNAME") or os.environ.get("USER") or "user").lower() if c.isalnum())
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stub.py")
 INCLUDE_SUBAGENTS = os.environ.get("PEERBRIDGE_INCLUDE_SUBAGENTS") == "1"
 IDLE_SETTLE = 0.75
@@ -49,6 +54,13 @@ OUTBOX_MAX_AGE = 300
 
 os.makedirs(THREADS_DIR, exist_ok=True)
 
+
+
+def _replace(tmp: str, path: str) -> None:
+    if os.name == "nt":
+        import winpipe
+        return winpipe.replace_retry(tmp, path)
+    os.replace(tmp, path)
 
 def log(msg: str) -> None:
     with open(LOG, "a") as f:
@@ -66,7 +78,7 @@ def atomic_json(path: str, obj) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    _replace(tmp, path)
 
 
 def map_status(st: dict | None) -> str | None:
@@ -432,6 +444,17 @@ class Hub:
 
     # ---- control socket (pb) -------------------------------------------------------------
     def ctl_serve(self) -> None:
+        if ccpeer.WINDOWS:
+            def on_conn(chunks, reply):
+                data = b""
+                for c in chunks:
+                    data += c
+                    if b"\n" in data:
+                        break
+                reply((json.dumps(self.ctl_request(data)) + "\n").encode())
+            srv = ccpeer.winpipe.PipeServer(CTL_PIPE, on_conn)
+            srv.start()
+            threading.Event().wait()
         try:
             os.unlink(CTL)
         except OSError:
@@ -444,6 +467,15 @@ class Hub:
         while True:
             conn, _ = srv.accept()
             threading.Thread(target=self.ctl_conn, args=(conn,), daemon=True).start()
+
+    def ctl_request(self, data: bytes) -> dict:
+        try:
+            req = json.loads(data.split(b"\n")[0] or b"{}")
+            box: queue.Queue = queue.Queue(1)
+            self.q.put(("ctl", req, box))
+            return box.get(timeout=20)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def ctl_conn(self, conn: socket.socket) -> None:
         try:
@@ -707,14 +739,22 @@ def main() -> None:
     os.makedirs(HOME, exist_ok=True)
     lock = open(os.path.join(HOME, "hub.lock"), "a+")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
         print("peerbridge hub already running", file=sys.stderr)
         sys.exit(0)
-    lock.seek(0)
-    lock.truncate()
-    lock.write(str(os.getpid()))
-    lock.flush()
+    if fcntl:
+        lock.seek(0)
+        lock.truncate()
+        lock.write(str(os.getpid()))
+        lock.flush()
+    with open(os.path.join(HOME, "hub.pid"), "w") as pf:
+        pf.write(str(os.getpid()))
     hub = Hub()
     import signal
     signal.signal(signal.SIGTERM, hub.shutdown)

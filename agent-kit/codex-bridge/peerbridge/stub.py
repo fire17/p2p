@@ -33,7 +33,8 @@ except Exception:
     pass
 PID = os.getpid()
 SOCKS = ccpeer.socks_dir()
-SOCK = os.path.join(SOCKS, f"{PID}.sock")
+WINDOWS = ccpeer.WINDOWS
+SOCK = ccpeer.winpipe.new_inbox_name() if WINDOWS else os.path.join(SOCKS, f"{PID}.sock")
 REC = os.path.join(ccpeer.SESSIONS_DIR, f"{PID}.json")
 KEY = ccpeer.key_path(PID, SOCK)
 REQUIRE_AUTH = os.environ.get("PEERBRIDGE_REQUIRE_AUTH", "1") != "0"
@@ -41,6 +42,13 @@ TOKEN = secrets.token_hex(16)
 out_lock = threading.Lock()
 rec_lock = threading.Lock()
 
+
+
+def _replace(tmp: str, path: str) -> None:
+    if os.name == "nt":
+        import winpipe
+        return winpipe.replace_retry(tmp, path)
+    os.replace(tmp, path)
 
 def emit(obj: dict) -> None:
     with out_lock:
@@ -53,7 +61,7 @@ def atomic_write(path: str, data: str, mode: int = 0o600) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w") as f:
         f.write(data)
-    os.replace(tmp, path)
+    _replace(tmp, path)
 
 
 now_ms = lambda: int(time.time() * 1000)  # noqa: E731
@@ -61,7 +69,7 @@ started = now_ms()
 procstart = ccpeer.proc_start(PID)
 record = {
     "pid": PID, "sessionId": cfg["threadId"], "cwd": cfg.get("cwd") or "", "startedAt": cfg.get("startedAt") or started,
-    "procStart": procstart, "version": f"peerbridge/{cfg.get('version', '0.1.0')} codex/{cfg.get('codexVersion', '?')}",
+    ccpeer.start_field(): procstart, "version": f"peerbridge/{cfg.get('version', '0.1.0')} codex/{cfg.get('codexVersion', '?')}",
     "peerProtocol": 1, "peerFeatures": ["notify_idle", "reply_across_default_dirs"], "kind": "interactive", "entrypoint": "codex",
     "pidDomain": ccpeer.pid_domain(),
     "messagingSocketPath": SOCK, "name": cfg["name"], "nameSource": cfg.get("nameSource", "derived"),
@@ -78,23 +86,38 @@ def write_record() -> None:
 
 
 def cleanup() -> None:
-    for p in (REC, KEY, SOCK):
+    for p in (REC, KEY) if WINDOWS else (REC, KEY, SOCK):
         try:
             os.unlink(p)
         except OSError:
             pass
 
 
-def handle_conn(conn: socket.socket) -> None:
-    buf = b""
-    authed = not REQUIRE_AUTH
-    first = True
+def socket_chunks(conn: socket.socket):
     conn.settimeout(30)
     try:
         while True:
             chunk = conn.recv(65536)
             if not chunk:
-                break
+                return
+            yield chunk
+    except (socket.timeout, OSError):
+        return
+    finally:
+        conn.close()
+
+
+def handle_conn(conn: socket.socket) -> None:
+    handle_stream(socket_chunks(conn))
+
+
+def handle_stream(chunks) -> None:
+    """Shared by Unix sockets and Windows pipes: NDJSON, optional/required auth on the first line."""
+    buf = b""
+    authed = not REQUIRE_AUTH
+    first = True
+    try:
+        for chunk in chunks:
             buf += chunk
             if len(buf) > MAX_LINE:
                 emit({"ev": "oversize"})
@@ -124,10 +147,8 @@ def handle_conn(conn: socket.socket) -> None:
                     emit({"ev": "auth_fail"})
                     return
                 emit({"ev": "frame", "frame": frame})
-    except (socket.timeout, OSError):
+    except OSError:
         pass
-    finally:
-        conn.close()
 
 
 def do_send(cmd: dict) -> None:
@@ -148,21 +169,25 @@ def serve(srv: socket.socket) -> None:
 
 
 def main() -> None:
-    os.makedirs(SOCKS, mode=0o700, exist_ok=True)
     os.makedirs(ccpeer.SESSIONS_DIR, exist_ok=True)
-    try:
-        os.unlink(SOCK)
-    except OSError:
-        pass
-    old = os.umask(0o077)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(SOCK)
-    os.umask(old)
-    os.chmod(SOCK, 0o600)
-    srv.listen(64)
-    atomic_write(KEY, json.dumps({"peerToken": TOKEN, "procStart": procstart, "pidDomain": record["pidDomain"]}), 0o600)
+    if WINDOWS:
+        srv = ccpeer.winpipe.PipeServer(SOCK, lambda chunks, reply: handle_stream(chunks))
+        srv.start()  # the first instance exists before the record is published
+    else:
+        os.makedirs(SOCKS, mode=0o700, exist_ok=True)
+        try:
+            os.unlink(SOCK)
+        except OSError:
+            pass
+        old = os.umask(0o077)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SOCK)
+        os.umask(old)
+        os.chmod(SOCK, 0o600)
+        srv.listen(64)
+        threading.Thread(target=serve, args=(srv,), daemon=True).start()
+    atomic_write(KEY, json.dumps({"peerToken": TOKEN, ccpeer.start_field(): procstart, "pidDomain": record["pidDomain"]}), 0o600)
     write_record()
-    threading.Thread(target=serve, args=(srv,), daemon=True).start()
     emit({"ev": "ready", "pid": PID, "address": f"uds:{SOCK}", "ref": ccpeer.full_ref(SOCK), "procStart": procstart})
     try:
         for line in sys.stdin:
@@ -185,7 +210,7 @@ def main() -> None:
                 write_record()
     finally:
         try:
-            srv.close()
+            srv.stop() if WINDOWS else srv.close()
         except OSError:
             pass
         cleanup()
@@ -194,7 +219,8 @@ def main() -> None:
 if __name__ == "__main__":
     import signal
     signal.signal(signal.SIGTERM, lambda *_: (cleanup(), os._exit(0)))
-    signal.signal(signal.SIGHUP, lambda *_: (cleanup(), os._exit(0)))
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, lambda *_: (cleanup(), os._exit(0)))
     try:
         main()
     finally:

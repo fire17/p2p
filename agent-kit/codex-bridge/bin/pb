@@ -34,8 +34,16 @@ else:
 import ccpeer  # noqa: E402
 import policy  # noqa: E402
 
+for _s in (sys.stdout, sys.stderr):  # Windows consoles (cp1252) must never crash on a peer name
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 HOME = ccpeer.STATE_DIR
 CTL = os.path.join(HOME, "hub.sock")
+CTL_PIPE = "\\\\.\\pipe\\LOCAL\\peerbridge-hub-" + "".join(
+    c for c in (os.environ.get("USERNAME") or os.environ.get("USER") or "user").lower() if c.isalnum())
 RECEIPTS = os.path.join(HOME, "receipts.jsonl")
 
 
@@ -49,6 +57,14 @@ class Sandboxed(Exception):
 
 
 def ctl(req: dict, timeout: float = 20.0) -> dict | None:
+    if ccpeer.WINDOWS:
+        try:
+            out = ccpeer.winpipe.request(CTL_PIPE, (json.dumps(req) + "\n").encode(), timeout)
+            return json.loads(out.split(b"\n")[0])
+        except PermissionError:
+            raise Sandboxed()
+        except Exception:
+            return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -78,8 +94,12 @@ def ensure(quiet: bool = False) -> dict:
         return r
     os.makedirs(HOME, exist_ok=True)
     log = open(os.path.join(HOME, "hub.out"), "a")
-    subprocess.Popen([sys.executable, os.path.join(PKG, "hub.py")], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                     start_new_session=True, close_fds=True)
+    if ccpeer.WINDOWS:  # detached, no console window, survives this shell (DETACHED_PROCESS|NEW_PROCESS_GROUP|NO_WINDOW)
+        subprocess.Popen([sys.executable, os.path.join(PKG, "hub.py")], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         creationflags=0x00000008 | 0x00000200 | 0x08000000, close_fds=True)
+    else:
+        subprocess.Popen([sys.executable, os.path.join(PKG, "hub.py")], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, close_fds=True)
     for _ in range(50):
         time.sleep(0.1)
         r = ctl({"cmd": "ping"}, 2)
@@ -253,7 +273,8 @@ def cmd_status(args):
 
 def cmd_stop(args):
     try:
-        pid = int(open(os.path.join(HOME, "hub.lock")).read().strip())
+        pidfile = os.path.join(HOME, "hub.pid")
+        pid = int(open(pidfile if os.path.exists(pidfile) else os.path.join(HOME, "hub.lock")).read().strip())
         os.kill(pid, signal.SIGTERM)
         print(f"stopped hub pid={pid}")
     except Exception as e:

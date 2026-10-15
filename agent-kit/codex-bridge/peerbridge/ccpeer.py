@@ -22,12 +22,20 @@ HOME = os.path.expanduser("~")
 SESSIONS_DIR = os.environ.get("PEERBRIDGE_SESSIONS_DIR", os.path.join(HOME, ".claude", "sessions"))
 STATE_DIR = os.environ.get("PEERBRIDGE_HOME", os.path.join(HOME, ".peerbridge"))
 TAG = "cross-session-message"
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import winpipe  # noqa: E402
+else:
+    winpipe = None
 
 
 def socks_dir() -> str:
     """Where CC on this machine puts peer sockets: follow the live registry, else CC's defaults."""
     if os.environ.get("PEERBRIDGE_SOCKS_DIR"):
         return os.environ["PEERBRIDGE_SOCKS_DIR"]
+    if WINDOWS:
+        return "\\\\.\\pipe\\LOCAL"
     seen: dict[str, int] = {}
     try:
         for f in os.listdir(SESSIONS_DIR):
@@ -50,7 +58,19 @@ def socks_dir() -> str:
 
 
 def key_path(pid: int, sock: str) -> str:
-    return os.path.join(SESSIONS_DIR, f"{pid}.{hashlib.sha256(sock.encode()).hexdigest()}.key")
+    canon = winpipe.canonical(sock) if (WINDOWS and winpipe.is_pipe(sock)) else sock
+    return os.path.join(SESSIONS_DIR, f"{pid}.{hashlib.sha256(canon.encode()).hexdigest()}.key")
+
+
+def start_field() -> str:
+    """Record/key field CC uses for process start: procStartFt (FILETIME) on Windows, procStart elsewhere."""
+    return "procStartFt" if WINDOWS else "procStart"
+
+
+def sock_exists(path: str) -> bool:
+    if WINDOWS and winpipe.is_pipe(path):
+        return winpipe.pipe_exists(path)
+    return os.path.exists(path)
 
 
 def full_ref(sock: str) -> str:
@@ -58,6 +78,12 @@ def full_ref(sock: str) -> str:
 
 
 def proc_start(pid: int) -> str:
+    if WINDOWS:
+        return winpipe.proc_start_ft(pid)
+    return _proc_start_unix(pid)
+
+
+def _proc_start_unix(pid: int) -> str:
     """Same string CC stores and re-checks: `LC_ALL=C TZ=UTC ps -o lstart=`. Local time here hides the row
     (CC 2.1.281 treats a procStart mismatch as a recycled pid and drops the record from ListAgents)."""
     try:
@@ -93,6 +119,9 @@ def pid_domain() -> str:
     """CC's pvo(): "darwin" on macOS, "<linux|wsl>:<machine-id>:<pid-ns>" on Linux/WSL."""
     if sys.platform == "darwin":
         return "darwin"
+    if WINDOWS:
+        import socket as _s
+        return f"win32:{_s.gethostname().lower()}"
     if sys.platform.startswith("linux"):
         try:
             wsl = "microsoft" in open("/proc/version").read().lower()
@@ -119,7 +148,7 @@ def attr(v: str) -> str:
     return v[:64] + "\u2026" if len(v) > 64 else v
 
 
-FROM_RE = re.compile(r"^[A-Za-z0-9%:_/.\-]{1,300}$")
+FROM_RE = re.compile(r"^[A-Za-z0-9%:_/.\\\-]{1,300}$")  # CC's charset incl. backslash (Windows pipe addresses)
 NEST_RE = re.compile(r"<(?=/?cross-session-message)", re.I)
 
 
@@ -179,7 +208,7 @@ def records() -> list[dict]:
         except Exception:
             continue
         sock = r.get("messagingSocketPath")
-        if not isinstance(sock, str) or not os.path.exists(sock):
+        if not isinstance(sock, str) or not sock_exists(sock):
             continue
         r["pid"] = pid
         r["address"] = f"uds:{sock}"
@@ -223,12 +252,13 @@ def read_token(rec: dict) -> str | None:
             for f in os.listdir(SESSIONS_DIR):
                 if f.startswith(f"{rec['pid']}.") and f.endswith(".key"):
                     c = json.load(open(os.path.join(SESSIONS_DIR, f)))
-                    if c.get("procStart") == rec.get("procStart"):
+                    if c.get(start_field()) == rec.get(start_field()):
                         k = c
                         break
         except Exception:
             pass
-    if not k or k.get("procStart") != rec.get("procStart"):
+    f = "procStartFt" if (k or {}).get("procStartFt") is not None else "procStart"
+    if not k or k.get(f) != rec.get(f):
         return None
     t = k.get("peerToken")
     return t if isinstance(t, str) else None
@@ -240,6 +270,8 @@ def write_frames(sock_path: str, frames: list[dict], token: str | None, timeout:
     if token:
         data += json.dumps({"type": "auth", "token": token}) + "\n"
     data += "".join(json.dumps(f, ensure_ascii=False) + "\n" for f in frames)
+    if WINDOWS and winpipe.is_pipe(sock_path):
+        return winpipe.write(sock_path, data.encode("utf-8"), timeout)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:

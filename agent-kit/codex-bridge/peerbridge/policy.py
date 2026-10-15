@@ -17,6 +17,13 @@ PATH = os.path.join(HOME, "policy.json")
 DEFAULT = {"expose": os.environ.get("PEERBRIDGE_DEFAULT_EXPOSE", "optin"), "threads": [], "cwds": [], "off": False}
 
 
+
+def _replace(tmp: str, path: str) -> None:
+    if os.name == "nt":
+        import winpipe
+        return winpipe.replace_retry(tmp, path)
+    os.replace(tmp, path)
+
 def load() -> dict:
     try:
         with open(PATH) as f:
@@ -34,7 +41,7 @@ def save(p: dict) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump({k: p[k] for k in ("expose", "threads", "cwds", "off") if k in p}, f, indent=1)
-    os.replace(tmp, PATH)
+    _replace(tmp, PATH)
 
 
 def mtime() -> float:

@@ -13,6 +13,7 @@ codex-bridge/docs/DESIGN.md
 codex-bridge/docs/HOLD-OPTIONS.md
 codex-bridge/docs/INSTALL.md
 codex-bridge/docs/ROADMAP-v0.3.md
+codex-bridge/docs/WINDOWS-V03-TEST.md
 codex-bridge/docs/WINDOWS.md
 codex-bridge/evidence/selftest-20261015-225433.json
 codex-bridge/install.sh
@@ -21,9 +22,11 @@ codex-bridge/peerbridge/cxrpc.py
 codex-bridge/peerbridge/hub.py
 codex-bridge/peerbridge/policy.py
 codex-bridge/peerbridge/stub.py
+codex-bridge/peerbridge/winpipe.py
 codex-bridge/selftest.py
 codex-bridge/selftest.sh
 codex-bridge/uninstall.sh
+codex-bridge/xtest.py
 hub/hub.ps1
 hub/hub.py
 windows/shai-ear.ps1
