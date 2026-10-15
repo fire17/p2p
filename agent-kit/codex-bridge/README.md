@@ -56,3 +56,4 @@ Codex shell: pb send <claude-or-codex-peer> "text" ──► target's CC socket 
 - macOS: stable. Linux/WSL: experimental. Native Windows: `cxsend` only (proxy transport); Claude<->Codex on native Windows needs v0.3 (named pipes).
 - Default policy is **optin**: no Codex session is reachable until the machine's owner runs `pb expose ...` locally. `pb off` is the kill switch.
 - Windows: never run codex or cxsend from an Administrator terminal; launch codex without -c/--enable/--disable flags. See docs/WINDOWS.md.
+- **Known limit (2026-10-15):** Claude->Codex is stable. Codex->Claude (`pb send`) is experimental and is BLOCKED under Codex's default sandbox (the sandbox blocks the peerbridge socket). A fix is in progress. Do NOT disable the Codex sandbox as a workaround.
