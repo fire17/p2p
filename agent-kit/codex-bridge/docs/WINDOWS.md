@@ -91,3 +91,25 @@ The questions from that run, answered:
 - `codex "hello"` (initial prompt argument) starts a turn at once, which creates the thread.
 - `codex resume <id>` attaches a TUI to an existing thread, including one made by `thread/start`. (A TUI attaching is a subscriber, so the thread then stays loaded while it is open.)
 - `thread/start` over RPC creates a thread with no TUI at all. That is what `cxsend probe` does.
+
+
+## Leftover `pid-update-loop` after `codex app-server daemon stop` (Windows)
+
+`daemon stop` can leave `codex.exe app-server daemon pid-update-loop` running. This is Codex behaviour, seen 3 times on Windows 11, and harmless. `pb doctor` notes it when the daemon is down. To end it (non-elevated PowerShell):
+
+```
+Get-CimInstance Win32_Process -Filter "Name='codex.exe'" | Where-Object { $_.CommandLine -like '*pid-update-loop*' } | ForEach-Object { Stop-Process -Id $_.ProcessId }
+```
+
+## v0.3.0: native Windows status
+
+EXPERIMENTAL, live-proven. xtest passed 14/14 on a Windows 11 test desktop twice: rc1, and rc2 on the first run with no manual wait.
+
+| Leg | Time |
+|---|---|
+| peer row published | 0.6 s |
+| Claude to Codex, turn start | 0.145 s |
+| Codex reply | 4.0 s |
+| Codex to Claude, authenticated | 8 ms |
+
+The real-Claude `ListAgents` look on Windows was not done. xtest proves that the record is live (procStartFt matches) and authenticated.

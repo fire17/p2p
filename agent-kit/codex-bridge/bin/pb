@@ -311,7 +311,7 @@ def _target(args):
     die("say what to expose: --thread ID | --cwd PATH | --all (or run inside a Codex session)")
 
 
-def private_app_servers() -> int:
+def private_app_servers(pattern: str = "") -> int:
     """Count Codex app-server processes that are NOT the shared managed daemon (desktop app, IDE extension)."""
     try:
         if os.name == "nt":
@@ -322,6 +322,8 @@ def private_app_servers() -> int:
         out = subprocess.run(argv, capture_output=True, text=True, timeout=15).stdout.splitlines()
     except Exception:
         return 0
+    if pattern:
+        return sum(1 for c in out if pattern in c)
     return sum(1 for c in out if " app-server" in c and "--managed-daemon" not in c and " proxy" not in c
                and "daemon " not in c and "--listen" not in c)
 
@@ -366,6 +368,9 @@ def cmd_doctor(args):
                 row("other app-servers", f"{priv} private (desktop app, IDE extension or a tool; their threads are NOT reachable"
                     + ("; on Windows the desktop app never uses the shared daemon)" if os.name == "nt" else
                        "; launch the app with CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 to share the daemon)"))
+            if not daemon_up and private_app_servers(pattern="pid-update-loop"):
+                row("NOTE", "a leftover `app-server daemon pid-update-loop` process is running after `daemon stop` "
+                    "(Codex behaviour, harmless); see docs/WINDOWS.md for the one-liner that ends it")
             if not daemon_up:
                 row("FIX", "open one CLI `codex` session (non-elevated, no -c/--enable/--disable flags) "
                     "or run `codex app-server daemon start`; then `pb doctor` again")
