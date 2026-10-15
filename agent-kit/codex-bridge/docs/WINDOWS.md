@@ -93,12 +93,18 @@ The questions from that run, answered:
 - `thread/start` over RPC creates a thread with no TUI at all. That is what `cxsend probe` does.
 
 
-## Leftover `pid-update-loop` after `codex app-server daemon stop` (Windows)
+## Leftover `pid-update-loop` after `codex app-server daemon stop` (all platforms)
 
-`daemon stop` can leave `codex.exe app-server daemon pid-update-loop` running. This is Codex behaviour, seen 3 times on Windows 11, and harmless. `pb doctor` notes it when the daemon is down. To end it (non-elevated PowerShell):
+`daemon stop` can leave `codex app-server daemon pid-update-loop` running. This is Codex behaviour, seen on Windows 11, WSL and macOS, and harmless. `pb doctor` notes it when the daemon is down. To end it (non-elevated PowerShell):
 
 ```
 Get-CimInstance Win32_Process -Filter "Name='codex.exe'" | Where-Object { $_.CommandLine -like '*pid-update-loop*' } | ForEach-Object { Stop-Process -Id $_.ProcessId }
+```
+
+macOS / Linux / WSL:
+
+```
+pkill -f 'app-server daemon pid-update-loop'
 ```
 
 ## v0.3.0: native Windows status
@@ -113,3 +119,10 @@ EXPERIMENTAL, live-proven. xtest passed 14/14 on a Windows 11 test desktop twice
 | Codex to Claude, authenticated | 8 ms |
 
 The real-Claude `ListAgents` look on Windows was not done. xtest proves that the record is live (procStartFt matches) and authenticated.
+
+
+## v0.3.1: WSL fixes
+
+- **The hub re-attaches when the daemon appears later.** It always retried, but in proxy mode `codex app-server proxy` with no daemon could hang the WebSocket handshake forever (seen in WSL), which wedged the retry loop. The handshake now has a 10 s deadline (`PEERBRIDGE_HANDSHAKE_TIMEOUT`) that kills the proxy and retries. Tested with a fake hanging proxy, and live on macOS with a daemon started 30 s after the hub.
+- **selftest names the cause** when a TUI never registers. It reads the tmux pane and reports the first-run trust screen, or a daemon-skipping launch, instead of a bare 60 s timeout.
+- **WSL with no trusted projects.** Use `cxsend probe` and `xtest.py`, which need no TUI. Or pre-trust the selftest folders `/tmp/peertest-st*` in WSL's `~/.codex/config.toml`.

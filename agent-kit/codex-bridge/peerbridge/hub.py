@@ -31,7 +31,7 @@ import ccpeer  # noqa: E402
 import policy  # noqa: E402
 from cxrpc import CodexRPC, RPCError  # noqa: E402
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 HOME = ccpeer.STATE_DIR
 THREADS_DIR = os.path.join(HOME, "threads")
 LOG = os.path.join(HOME, "hub.log")

@@ -33,6 +33,7 @@ def _no_daemon(err: BaseException) -> bool:
                                 "no such file", "failed to connect to socket", "10061"))
 
 
+HANDSHAKE_TIMEOUT = float(os.environ.get("PEERBRIDGE_HANDSHAKE_TIMEOUT", "10"))
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 CONTROL_SOCK = os.path.join(CODEX_HOME, "app-server-control", "app-server-control.sock")
 
@@ -94,14 +95,28 @@ class CodexRPC:
         self._pending: dict[int, queue.Queue] = {}
         self._lock = threading.Lock()
         self.closed = threading.Event()
-        try:
-            self._handshake()
-        except (ConnectionError, OSError) as e:
+        # The handshake must never block forever: with no daemon, `codex app-server proxy` can hang instead of
+        # exiting (seen on Linux/WSL), which would wedge the hub's retry loop. Run it with a deadline.
+        err: list = []
+        hs = threading.Thread(target=lambda: self._safe_handshake(err), daemon=True)
+        hs.start()
+        hs.join(HANDSHAKE_TIMEOUT)
+        if hs.is_alive():
+            self.s.close()  # kills the proxy / closes the socket, which unblocks the reader thread
+            raise ConnectionError(f"websocket handshake timed out after {HANDSHAKE_TIMEOUT:.0f}s: {NO_DAEMON_HINT}")
+        if err:
+            e = err[0]
             raise ConnectionError(f"{e}: {NO_DAEMON_HINT}" if _no_daemon(e) or mode == "proxy" else str(e)) from e
         threading.Thread(target=self._reader, daemon=True, name="cxrpc-reader").start()
         self.init = self.call("initialize", {"clientInfo": {"name": client_name, "version": version},
                                              "capabilities": {"experimentalApi": True}})
         self.notify("initialized")
+
+    def _safe_handshake(self, err: list) -> None:
+        try:
+            self._handshake()
+        except Exception as e:
+            err.append(e)
 
     # ---- websocket framing -------------------------------------------------------------
     def _handshake(self) -> None:

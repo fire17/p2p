@@ -293,6 +293,22 @@ def spawn_codex(session: str, cwd: str, default_sandbox: bool = False) -> None:
     subprocess.run(["tmux", "new-session", "-d", "-s", session, "-x", "200", "-y", "50", "-c", cwd, inner], check=True)
 
 
+def tui_hint(session: str) -> str:
+    """Why a TUI never registered: read its pane instead of guessing."""
+    try:
+        pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", session], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        pane = ""
+    low = pane.lower()
+    if "trust" in low and ("folder" in low or "directory" in low or "project" in low):
+        return ("TUI is at Codex's first-run 'trust this folder?' screen: pre-trust the test folder in ~/.codex/config.toml "
+                "([projects.\"<abs path>\"] trust_level = \"trusted\") or answer it once")
+    if "skipping the shared" in low or "app-server daemon" in low and "skip" in low:
+        return "TUI skipped the shared daemon (a -c/--enable/--disable/--search flag or an elevated launch)"
+    last = [ln for ln in pane.splitlines() if ln.strip()][-3:]
+    return "no registry row; pane tail: " + " | ".join(x.strip()[:80] for x in last)
+
+
 def tmux_alive(session: str) -> bool:
     return subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0
 
@@ -439,7 +455,7 @@ def main() -> int:
         spawn_codex(TMUX1, CWD)
         spawned.append(TMUX1)
         got = wait_registered(CWD, before, 60)
-        if not check("codex_registered", bool(got), "no registry row within 60s" if not got else ""):
+        if not check("codex_registered", bool(got), tui_hint(TMUX1) if not got else ""):
             return 1
         tid1, st1, row1 = got
         timings["register_s"] = rd(time.time() - ts)
@@ -550,7 +566,7 @@ def main() -> int:
             spawn_codex(TMUX2, CWD2)
             spawned.append(TMUX2)
             got2 = wait_registered(CWD2, before, 60)
-            if check("codex2_registered", bool(got2)):
+            if check("codex2_registered", bool(got2), "" if got2 else tui_hint(TMUX2)):
                 tid2, st2, _ = got2
                 bridged["codex2"] = {"tid": tid2, "stubPid": st2["stubPid"], "name": st2["name"]}
                 mon.wait_idle(tid2, 20, settle=0.5)
@@ -586,7 +602,7 @@ def main() -> int:
             spawn_codex(tmux3, cwd3, default_sandbox=True)
             spawned.append(tmux3)
             got3 = wait_registered(cwd3, before, 60)
-            if check("sbx_codex_registered", bool(got3), "plain `codex`, default sandbox/approvals"):
+            if check("sbx_codex_registered", bool(got3), "plain `codex`, default sandbox/approvals" if got3 else tui_hint(tmux3)):
                 tid3, st3, _ = got3
                 bridged["codex_sbx"] = {"tid": tid3, "stubPid": st3["stubPid"], "name": st3["name"]}
                 mon.wait_idle(tid3, 20, settle=0.5)
