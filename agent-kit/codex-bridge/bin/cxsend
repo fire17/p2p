@@ -58,7 +58,10 @@ def main():
         i = a.index("--cwd"); cwdp = os.path.realpath(a[i + 1]); del a[i:i + 2]
     if policy.load().get("off"):
         sys.exit("cxsend: peerbridge is OFF on this machine (kill switch); `pb on` to re-enable")
-    rpc = CodexRPC(client_name="cxsend", version="0.2.0")
+    try:
+        rpc = CodexRPC(client_name="cxsend", version="0.2.2")
+    except ConnectionError as e:
+        sys.exit(f"cxsend: cannot reach the Codex app-server daemon: {e}")
     if a[0] == "list":
         show_all = "--all" in a
         for t in threads(rpc, cwdp, include_hidden=show_all):

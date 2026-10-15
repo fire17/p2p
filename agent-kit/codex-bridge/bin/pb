@@ -275,6 +275,21 @@ def _target(args):
     die("say what to expose: --thread ID | --cwd PATH | --all (or run inside a Codex session)")
 
 
+def private_app_servers() -> int:
+    """Count Codex app-server processes that are NOT the shared managed daemon (desktop app, IDE extension)."""
+    try:
+        if os.name == "nt":
+            argv = ["powershell", "-NoProfile", "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | ForEach-Object { $_.CommandLine }"]
+        else:
+            argv = ["ps", "-axo", "command="]
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=15).stdout.splitlines()
+    except Exception:
+        return 0
+    return sum(1 for c in out if " app-server" in c and "--managed-daemon" not in c and " proxy" not in c
+               and "daemon " not in c and "--listen" not in c)
+
+
 def cmd_doctor(args):
     import platform, shutil, socket as _s
     sys.path.insert(0, PKG)
@@ -282,11 +297,22 @@ def cmd_doctor(args):
     out = []
     def row(k, v):
         out.append(f"{k:<22} {v}")
-    row("platform", f"{platform.system()} {platform.release()} ({sys.platform})")
+    rel = platform.release()
+    if os.name == "nt":
+        try:
+            build = int(platform.version().split(".")[-1])
+            rel = f"11 (build {build})" if build >= 22000 else f"10 (build {build})"
+        except Exception:
+            pass
+    wsl = sys.platform.startswith("linux") and "microsoft" in platform.release().lower()
+    row("platform", f"{platform.system()} {rel} ({sys.platform}{', WSL' if wsl else ''})")
     row("python", sys.version.split()[0])
     row("af_unix", "yes" if hasattr(_s, "AF_UNIX") else "no (Windows CPython: proxy transport)")
     codex = shutil.which("codex")
     row("codex", codex or "NOT FOUND on PATH")
+    if wsl and codex and codex.startswith("/mnt/"):
+        row("FIX (wsl)", "this `codex` is the Windows npm shim via interop and fails without node in WSL; "
+            "install a native one inside WSL: install node, then `npm i -g @openai/codex`")
     if codex:
         try:
             v = subprocess.run([codex, "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
@@ -294,9 +320,19 @@ def cmd_doctor(args):
             d = subprocess.run([codex, "app-server", "daemon", "version"], capture_output=True, text=True, timeout=15)
             try:
                 dj = json.loads(d.stdout)
+                daemon_up = dj.get("status") == "running"
                 row("daemon", f"{dj.get('status')} app-server {dj.get('appServerVersion')} backend={dj.get('backend')}")
             except Exception:
+                daemon_up = False
                 row("daemon", (d.stdout or d.stderr).strip().splitlines()[0] if (d.stdout or d.stderr).strip() else "?")
+            priv = private_app_servers()
+            if priv:
+                row("other app-servers", f"{priv} private (desktop app, IDE extension or a tool; their threads are NOT reachable"
+                    + ("; on Windows the desktop app never uses the shared daemon)" if os.name == "nt" else
+                       "; launch the app with CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 to share the daemon)"))
+            if not daemon_up:
+                row("FIX", "open one CLI `codex` session (non-elevated, no -c/--enable/--disable flags) "
+                    "or run `codex app-server daemon start`; then `pb doctor` again")
         except Exception as e:
             row("codex version", f"error: {e}")
     row("codex control sock", f"{cxrpc.CONTROL_SOCK} ({'present' if os.path.exists(cxrpc.CONTROL_SOCK) else 'absent'})")
@@ -308,11 +344,14 @@ def cmd_doctor(args):
         row("daemon rpc", f"ok, {n} loaded thread(s)")
         rpc.close()
     except Exception as e:
-        row("daemon rpc", f"FAIL: {e}")
+        row("daemon rpc", f"FAIL: {str(e)[:300]}")
     row("cc sessions dir", f"{ccpeer.SESSIONS_DIR} ({'present' if os.path.isdir(ccpeer.SESSIONS_DIR) else 'absent'})")
     row("cc socks dir", ccpeer.socks_dir())
     recs = ccpeer.records()
     row("cc peers", f"{len(recs)} live ({sum(1 for r in recs if r.get('entrypoint') == 'codex')} codex)")
+    if os.name == "nt":
+        row("NOTE (windows)", "native-Windows Claude peers use named pipes; Claude<->Codex stubs for them arrive in "
+            "peerbridge v0.3. Today on Windows: cxsend (Codex inject) works once a shared daemon runs.")
     p = policy.load()
     row("policy", f"expose={p.get('expose')} off={p.get('off')} threads={len(p.get('threads') or [])} cwds={len(p.get('cwds') or [])}")
     try:

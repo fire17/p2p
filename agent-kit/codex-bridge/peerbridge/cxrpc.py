@@ -19,6 +19,20 @@ import threading
 import time
 from typing import Any, Callable
 
+NO_DAEMON_HINT = (
+    "no shared Codex app-server daemon is running. It starts when a CLI `codex` session opens "
+    "(daemon_auto_start). The Codex DESKTOP APP runs a private app-server that peerbridge cannot reach "
+    "(on macOS/Linux unless the app is launched with CODEX_APP_SERVER_USE_LOCAL_DAEMON=1; on Windows never). "
+    "Fix: open one CLI `codex` session (not elevated, no -c/--enable/--disable flags), or run "
+    "`codex app-server daemon start`, then retry.")
+
+
+def _no_daemon(err: BaseException) -> bool:
+    t = str(err).lower()
+    return any(k in t for k in ("10050", "dead network", "closed during websocket handshake", "connection refused",
+                                "no such file", "failed to connect to socket", "10061"))
+
+
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 CONTROL_SOCK = os.path.join(CODEX_HOME, "app-server-control", "app-server-control.sock")
 
@@ -71,13 +85,19 @@ class CodexRPC:
         mode = mode or os.environ.get("PEERBRIDGE_CODEX_TRANSPORT") or (
             "unix" if hasattr(socket, "AF_UNIX") and os.path.exists(CONTROL_SOCK) else "proxy")
         self.mode = mode
-        self.s = _Stream(mode)
+        try:
+            self.s = _Stream(mode)
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            raise ConnectionError(f"{e}: {NO_DAEMON_HINT}") from e
         self._buf = b""
         self._next = 1
         self._pending: dict[int, queue.Queue] = {}
         self._lock = threading.Lock()
         self.closed = threading.Event()
-        self._handshake()
+        try:
+            self._handshake()
+        except (ConnectionError, OSError) as e:
+            raise ConnectionError(f"{e}: {NO_DAEMON_HINT}" if _no_daemon(e) or mode == "proxy" else str(e)) from e
         threading.Thread(target=self._reader, daemon=True, name="cxrpc-reader").start()
         self.init = self.call("initialize", {"clientInfo": {"name": client_name, "version": version},
                                              "capabilities": {"experimentalApi": True}})
