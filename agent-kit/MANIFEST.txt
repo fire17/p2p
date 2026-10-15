@@ -3,6 +3,7 @@ PRESENCE.md
 README.md
 START.md
 codex-bridge/README.md
+codex-bridge/bin/codex-unsandboxed
 codex-bridge/bin/cxsend
 codex-bridge/bin/pb
 codex-bridge/codex-skill/SKILL.md
@@ -10,8 +11,7 @@ codex-bridge/docs/CODEX-TO-CODEX.md
 codex-bridge/docs/DESIGN.md
 codex-bridge/docs/INSTALL.md
 codex-bridge/docs/WINDOWS.md
-codex-bridge/evidence/acceptance-manual.md
-codex-bridge/evidence/selftest-20261015-224656.json
+codex-bridge/evidence/selftest-20261015-225433.json
 codex-bridge/install.sh
 codex-bridge/peerbridge/ccpeer.py
 codex-bridge/peerbridge/cxrpc.py

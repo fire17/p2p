@@ -10,7 +10,7 @@ own unix socket + registry row + key file, exactly the CC peer layout) and measu
   3 CC -> Codex PONG round trip + inject ack  7 teardown: rows vanish (<= 90 s), our row removed
   4 busy steer (2nd message steers)
 
-Usage: selftest.py [--no-c2c]   Exit 0 only when every check PASSes.
+Usage: selftest.py [--no-c2c] [--no-sandbox-leg]   Exit 0 only when every check PASSes.
 Evidence: evidence/selftest-<timestamp>.json
 """
 from __future__ import annotations
@@ -283,10 +283,13 @@ def fsize(p: str) -> int:
     return os.path.getsize(p) if os.path.exists(p) else 0
 
 
-def spawn_codex(session: str, cwd: str) -> None:
+def spawn_codex(session: str, cwd: str, default_sandbox: bool = False) -> None:
+    """default_sandbox=True launches plain `codex` with the user's DEFAULT approval policy + sandbox (real use)."""
     os.makedirs(cwd, exist_ok=True)
+    # mode (b) legs launch through the opt-in launcher itself, so the gate tests exactly what users run
+    exe = "codex" if default_sandbox else shlex.quote(os.path.join(REPO, "bin", "codex-unsandboxed"))
     inner = (f"env -u HERDR_PANE_ID -u HERDR_SESSION -u HERDR_ENV PATH={shlex.quote(os.path.join(REPO, 'bin'))}:$PATH "
-             f"codex --no-alt-screen -a never -s danger-full-access -C {shlex.quote(cwd)}")
+             f"{exe} --no-alt-screen -C {shlex.quote(cwd)}")
     subprocess.run(["tmux", "new-session", "-d", "-s", session, "-x", "200", "-y", "50", "-c", cwd, inner], check=True)
 
 
@@ -394,6 +397,7 @@ def main() -> int:
     bridged: dict[str, dict] = {}  # label -> {tid, stubPid}
     ev_off, rc_off, log_off = fsize(EVENTS), fsize(RECEIPTS), fsize(HUBLOG)
     exposed = False
+    exposed_extra: list[str] = []
     stage = "init"
     try:
         # 1 ---- hub + daemon + policy
@@ -570,6 +574,33 @@ def main() -> int:
                 timings["c2c_ack_roundtrip_s"] = rd(ackt - t6) if ackt else None
                 ok_from = bool(ackf) and ccpeer.parse_envelope(ackf["message"]["content"]).get("from") == (thread_state(tid2) or {}).get("address")
                 check("c2c_codex2_ack_to_fake_claude", bool(ackt) and ok_from, f"{timings['c2c_ack_roundtrip_s']}s")
+        # 7 ---- DEFAULT sandbox + approval policy (plain `codex`): pb must reply without escalation
+        if "--no-sandbox-leg" not in sys.argv:
+            stage = "7-default-sandbox"
+            cwd3, tmux3 = CWD + "-sbx", "peertest-st-sbx"
+            if not policy.allowed("-", os.path.realpath(cwd3)):
+                subprocess.run([PB, "expose", "--cwd", cwd3], capture_output=True, text=True, timeout=10)
+                notes.append(f"temporarily exposed --cwd {cwd3}")
+                exposed_extra.append(cwd3)
+            before = set(thread_files())
+            spawn_codex(tmux3, cwd3, default_sandbox=True)
+            spawned.append(tmux3)
+            got3 = wait_registered(cwd3, before, 60)
+            if check("sbx_codex_registered", bool(got3), "plain `codex`, default sandbox/approvals"):
+                tid3, st3, _ = got3
+                bridged["codex_sbx"] = {"tid": tid3, "stubPid": st3["stubPid"], "name": st3["name"]}
+                mon.wait_idle(tid3, 20, settle=0.5)
+                n7, ev7 = secrets.token_hex(3), fsize(EVENTS)
+                _, t7 = send_user(fake, tid3, f"Reply by running exactly: pb send '{fake.address}' 'SBX {n7}'")
+                st7, f7 = wait_reply(fake, mon, tid3, f"SBX {n7}", t7, grace=10)
+                timings["sbx_roundtrip_s"] = rd(st7 - t7) if st7 else None
+                via = next((e for e in jsonl_since(EVENTS, ev7) if e.get("ev") == "outbox" and e.get("thread") == tid3), None)
+                check("sbx_reply_via_output_channel", bool(via), "pb fell back to the rollout marker" if via else
+                      (rollout_hint(tid3, "Operation not permitted") or "no outbox event"))
+                env7 = ccpeer.parse_envelope(f7["message"]["content"]) if f7 else {}
+                check("sbx_reply_arrived", bool(st7), f"{timings['sbx_roundtrip_s']}s from-mode={env7.get('from_mode')}")
+                check("sbx_from_mode_honest", env7.get("from_mode") == "prompting",
+                      "sandboxed on-request Codex declares prompting (a bypass Claude will HOLD it for its user)")
         stage = "done"
     except Exception:
         check(f"unexpected_exception@{stage}", False, traceback.format_exc().strip().splitlines()[-1])
@@ -594,6 +625,8 @@ def main() -> int:
             check("registry_rows_removed", bool(g), f"{timings['rows_gone_s']}s" if g else f"still listed: {left}")
         if exposed:
             subprocess.run([PB, "hide", "--cwd", CWD], capture_output=True, text=True, timeout=10)
+        for c in exposed_extra:
+            subprocess.run([PB, "hide", "--cwd", c], capture_output=True, text=True, timeout=10)
         fake.stop()
         check("fake_peer_removed", not any(os.path.exists(p) for p in (fake.rec_path, fake.key_path, fake.sock)))
         if mon:

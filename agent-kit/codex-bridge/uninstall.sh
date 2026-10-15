@@ -118,3 +118,4 @@ elif [ -d "$PREFIX" ]; then
 fi
 say "uninstalled."
 [ -L "$HOME/.local/bin/cxsend" ] && rm -f "$HOME/.local/bin/cxsend" && echo "peerbridge: removed ~/.local/bin/cxsend"
+[ -L "$HOME/.local/bin/codex-unsandboxed" ] && rm -f "$HOME/.local/bin/codex-unsandboxed" && echo "peerbridge: removed ~/.local/bin/codex-unsandboxed"

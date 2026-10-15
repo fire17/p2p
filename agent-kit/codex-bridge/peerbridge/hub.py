@@ -7,8 +7,12 @@ receipts / idle notices honestly. Control socket ~/.peerbridge/hub.sock serves t
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
+import hmac
+import re
+import secrets
 import json
 import os
 import queue
@@ -24,7 +28,7 @@ import ccpeer  # noqa: E402
 import policy  # noqa: E402
 from cxrpc import CodexRPC, RPCError  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 HOME = ccpeer.STATE_DIR
 THREADS_DIR = os.path.join(HOME, "threads")
 LOG = os.path.join(HOME, "hub.log")
@@ -36,6 +40,12 @@ STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stub.py")
 INCLUDE_SUBAGENTS = os.environ.get("PEERBRIDGE_INCLUDE_SUBAGENTS") == "1"
 IDLE_SETTLE = 0.75
 LATE_NOTICE_AFTER = 1.5  # a non-delivered receipt arriving after `pb send` returned is injected as a notice
+
+SEEN = os.path.join(HOME, "outbox-seen.json")
+# Sandbox-proof outbound channel: a sandboxed `pb send` cannot open any socket, but whatever it prints lands in the
+# thread's rollout, which the (unsandboxed) hub tails. Charset survives any depth of JSON string escaping.
+MARK_RE = re.compile(rb"@@PBSEND1\.([A-Za-z0-9_-]{8,})\.([0-9a-f]{64})@@")
+OUTBOX_MAX_AGE = 300
 
 os.makedirs(THREADS_DIR, exist_ok=True)
 
@@ -53,7 +63,8 @@ def jappend(path: str, obj: dict) -> None:
 
 def atomic_json(path: str, obj) -> None:
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(obj, f, ensure_ascii=False)
     os.replace(tmp, path)
 
@@ -96,6 +107,13 @@ class Thread_:
         self.address: str | None = None
         self.ref: str | None = None
         self.name: str = ""
+        self.send_key = secrets.token_hex(32)  # per-thread HMAC key, readable only by this user (threads/<tid>.json 0600)
+        rollout = info.get("path")
+        try:
+            self.offset = os.path.getsize(rollout) if rollout else 0  # never replay history
+        except OSError:
+            self.offset = 0
+        self.partial = b""
         self.idle_subs: list[tuple[str, str]] = []
         self.idle_timer: threading.Timer | None = None
 
@@ -113,6 +131,10 @@ class Hub:
         self.policy = policy.load()
         self.policy_mtime = policy.mtime()
         self.stub_err = open(os.path.join(HOME, "stub-stderr.log"), "a")
+        try:
+            self.seen: dict[str, float] = json.load(open(SEEN))
+        except Exception:
+            self.seen = {}
         self.crashes: dict[str, list[float]] = {}  # tid -> recent unexpected stub exits (respawn backoff)
         try:
             self.names = json.load(open(NAMES))
@@ -241,7 +263,8 @@ class Hub:
             return
         atomic_json(os.path.join(THREADS_DIR, f"{t.tid}.json"), {
             "threadId": t.tid, "name": t.name, "address": t.address, "ref": t.ref, "stubPid": t.proc.pid,
-            "status": t.status, "cwd": t.info.get("cwd"), "rollout": t.info.get("path"), "hubPid": os.getpid()})
+            "status": t.status, "cwd": t.info.get("cwd"), "rollout": t.info.get("path"), "hubPid": os.getpid(),
+            "sendKey": t.send_key})
 
     def set_status(self, t: Thread_, st: str) -> None:
         if st == t.status:
@@ -357,7 +380,9 @@ class Hub:
                                "reason": reason, "dropReason": frame.get("drop_reason"), "from": frame.get("from")})
             p = self.pending_sent.get(orig or "")
             if p and time.time() - p["t"] > LATE_NOTICE_AFTER:
-                word = {"delivered": "approved and released to that session"}.get(status, status)
+                word = {"delivered": "approved and released to that session",
+                        "held": "HELD for that session's user to approve (you run sandboxed/prompting, it runs bypass; "
+                                "do not resend, do not wait for a reply until it is approved)"}.get(status, status)
                 self.inject(t, f"[Cross-session delivery notice] Your message {orig} to {p['to']}: {word}. {reason}".strip())
         elif action == "peer_idle_notice":
             st = frame.get("state") or "idle"
@@ -400,7 +425,8 @@ class Hub:
                                        "as": t.name, "fromMode": mode})
         now = time.time()
         self.pending_sent = {k: v for k, v in self.pending_sent.items() if now - v["t"] < 3600}
-        self.pending_sent[msg_id] = {"tid": t.tid, "to": target["name"], "t": now}
+        # a sandboxed sender's pb has already exited, so every later receipt must be injected (no 1.5 s grace)
+        self.pending_sent[msg_id] = {"tid": t.tid, "to": target["name"], "t": now - (99 if req.get("viaOutput") else 0)}
         jappend(EVENTS, {"ev": "outbound", "thread": t.tid, "to": target["address"], "toName": target["name"], "msgId": msg_id, "chars": len(text)})
         self.via_stub(t, target["address"], frames, rid)
 
@@ -510,6 +536,7 @@ class Hub:
         threading.Thread(target=self.connect_loop, daemon=True).start()
         threading.Thread(target=self.ctl_serve, daemon=True).start()
         threading.Thread(target=self.policy_watch, daemon=True).start()
+        threading.Thread(target=self.rollout_tail, daemon=True).start()
         log(f"hub {VERSION} up pid={os.getpid()} socks={ccpeer.socks_dir()}")
         while True:
             ev = self.q.get()
@@ -519,6 +546,12 @@ class Hub:
                     self.on_notify(ev[1], ev[2])
                 elif kind == "resync":
                     self.resync()
+                elif kind == "outbox":
+                    self.on_outbox(ev[1], ev[2], ev[3])
+                elif kind == "notice":
+                    t = self.threads.get(ev[1])
+                    if t:
+                        self.inject(t, ev[2])
                 elif kind == "respawn":
                     self.ensure(ev[1])
                 elif kind == "policy":
@@ -570,6 +603,77 @@ class Hub:
                         ev[2].put({"ok": False, "error": str(e)})
             except Exception:
                 log("loop error: " + traceback.format_exc())
+
+    def rollout_tail(self) -> None:
+        while True:
+            time.sleep(0.2)
+            for t in list(self.threads.values()):
+                path = t.info.get("path")
+                if not path:
+                    continue
+                try:
+                    size = os.path.getsize(path)
+                    if size < t.offset:
+                        t.offset, t.partial = 0, b""
+                    if size == t.offset:
+                        continue
+                    with open(path, "rb") as f:
+                        f.seek(t.offset)
+                        data = f.read(size - t.offset)
+                    t.offset = size
+                except OSError:
+                    continue
+                data = t.partial + data
+                lines = data.split(b"\n")
+                t.partial = lines.pop()
+                for line in lines:
+                    if b"@@PBSEND1." in line:
+                        for m in MARK_RE.finditer(line):
+                            self.q.put(("outbox", t.tid, m.group(1).decode(), m.group(2).decode()))
+
+    def on_outbox(self, tid: str, b64: str, mac: str) -> None:
+        t = self.threads.get(tid)
+        if not t:
+            return
+        want = hmac.new(t.send_key.encode(), b64.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(want, mac):
+            jappend(EVENTS, {"ev": "outbox_bad_mac", "thread": tid})
+            return
+        try:
+            req = json.loads(base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4)))
+        except Exception:
+            return
+        mid = str(req.get("id") or "")
+        if not mid or mid in self.seen or abs(time.time() - float(req.get("ts", 0))) > OUTBOX_MAX_AGE:
+            return  # replay (the marker also shows up when the model quotes the output) or stale
+        self.seen[mid] = time.time()
+        try:
+            atomic_json(SEEN, dict(sorted(self.seen.items(), key=lambda kv: kv[1])[-2000:]))
+        except Exception:
+            pass
+        text = req.get("text") or ""
+        if req.get("file"):
+            try:
+                with open(req["file"], encoding="utf-8") as f:
+                    text = f.read()
+                if req.get("sha") and hashlib.sha256(text.encode()).hexdigest() != req["sha"]:
+                    raise ValueError("file changed after pb wrote it")
+            except Exception as e:
+                return self.inject(t, f"[peerbridge] your sandboxed `pb send` to {req.get('to')} was NOT sent: {e}")
+        box: queue.Queue = queue.Queue(1)
+        jappend(EVENTS, {"ev": "outbox", "thread": tid, "id": mid, "to": req.get("to")})
+        self.ctl_send({"cmd": "send", "threadId": tid, "to": req.get("to", ""), "text": text,
+                       "notifyIdle": bool(req.get("notify")), "viaOutput": True}, box)
+
+        def wait_result():
+            try:
+                r = box.get(timeout=15)
+            except queue.Empty:
+                r = {"ok": False, "error": "stub did not confirm the write"}
+            jappend(EVENTS, {"ev": "outbox_result", "thread": tid, "id": mid, "ok": r.get("ok"), "error": r.get("error")})
+            if not r.get("ok"):
+                self.q.put(("notice", tid, f"[peerbridge] your sandboxed `pb send` {mid} to {req.get('to')} was NOT sent: {r.get('error')}"))
+        threading.Thread(target=wait_result, daemon=True).start()
 
     def policy_watch(self) -> None:
         while True:

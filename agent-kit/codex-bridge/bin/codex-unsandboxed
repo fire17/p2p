@@ -1,0 +1,10 @@
+#!/bin/sh
+# peerbridge mode (b): OPT-IN, UNSANDBOXED Codex. Never the default.
+# Runs codex with NO sandbox and NO approval prompts (-a never -s danger-full-access). Consequences:
+#  - pb uses the hub socket directly and declares from-mode="bypass", so bypass-mode Claude sessions get its
+#    messages immediately (no hold for their user's approval);
+#  - Codex can run any command as you, unasked. Use it only for agents you would also run as bypass Claude.
+# Default `codex` stays sandboxed: pb still works there (rollout channel), declared from-mode="prompting".
+# Never add -c/--enable/--disable/--search here: any of those makes the TUI skip the shared daemon (unbridged).
+echo "codex-unsandboxed: starting Codex WITHOUT sandbox and WITHOUT approvals (peerbridge mode b)" >&2
+exec codex -a never -s danger-full-access "$@"

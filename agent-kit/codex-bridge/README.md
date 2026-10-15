@@ -22,7 +22,18 @@ Codex shell: pb send <claude-or-codex-peer> "text" ──► target's CC socket 
 | | What | Status |
 |---|---|---|
 | v0.1 | `cxsend`: inject a message into a live Codex thread via the daemon | STABLE (macOS). Windows untested. Shipped to Shai 22:28. |
-| v0.2 | hub + per-thread stubs + `pb`: Codex in ListAgents, native SendMessage both ways, CC-convention receipts, opt-in policy + kill switch | EXPERIMENTAL→verifying: live on macOS (evidence/acceptance-manual.md); installer + selftest gate pending |
+| v0.2 | hub + per-thread stubs + `pb`: Codex in ListAgents, native SendMessage both ways, CC-convention receipts, opt-in policy + kill switch | Claude→Codex STABLE. Codex→Claude only in unsandboxed Codex. |
+| v0.2.1 | sandbox-proof `pb send` (rollout channel, HMAC + dedupe), `codex-unsandboxed` opt-in launcher, default-sandbox selftest leg | macOS: 29/29 PASS (evidence/selftest-20261015-225433.json) |
+| v0.3 (planned) | native-Windows Claude⇄Codex via named pipes | not started |
+
+## Two modes (both validated by selftest, 29/29 PASS)
+
+| Mode | Launch | Codex to Claude path | Declared from-mode | Bypass-mode Claude receiver |
+|---|---|---|---|---|
+| **(a) default, sandboxed** | plain `codex` | The sandbox blocks sockets. `pb` prints one signed `@@PBSEND1…@@` line, and the hub reads it from the thread's rollout. No escalation, no config change. | `prompting` (honest) | **Holds the message until its user approves.** This is Claude Code's anti-permission-laundering rule; Codex gets a `[Cross-session delivery notice] … HELD` turn. A prompting-mode Claude receives it immediately. |
+| **(b) opt-in, unsandboxed** | `codex-unsandboxed` (= `codex -a never -s danger-full-access`) | Direct hub socket | `bypass` | Delivered immediately |
+
+Claude to Codex works the same in both modes: it wakes an idle session or steers a busy one.
 
 ## Commands
 
@@ -52,8 +63,8 @@ Codex shell: pb send <claude-or-codex-peer> "text" ──► target's CC socket 
 - Windows: see docs/WINDOWS.md.
 - Design and dead ends: docs/DESIGN.md.
 
-## Status in agent-kit (v0.2)
-- macOS: stable. Linux/WSL: experimental. Native Windows: `cxsend` only (proxy transport); Claude<->Codex on native Windows needs v0.3 (named pipes).
+## Status in agent-kit (v0.2.1)
+- Claude->Codex: stable (both modes). Codex->Claude: stable from an unsandboxed Codex (mode b); stable from a default-sandbox Codex (mode a) to prompting-mode Claude receivers; HELD for the human's approval when the receiving Claude runs in bypass mode (Claude Code's permission-parity rule). macOS stable; Linux/WSL experimental; native Windows = cxsend only (v0.3 for named pipes).
 - Default policy is **optin**: no Codex session is reachable until the machine's owner runs `pb expose ...` locally. `pb off` is the kill switch.
+- Mode (b) `bin/codex-unsandboxed` runs Codex with NO sandbox and NO approvals. It is an explicit opt-in the machine's owner chooses per machine; never the default, never enabled silently.
 - Windows: never run codex or cxsend from an Administrator terminal; launch codex without -c/--enable/--disable flags. See docs/WINDOWS.md.
-- **Known limit (2026-10-15):** Claude->Codex is stable. Codex->Claude (`pb send`) is experimental and is BLOCKED under Codex's default sandbox (the sandbox blocks the peerbridge socket). Two fixes are coming: (1) a sandbox-compatible path, and (2) an explicit, clearly labelled opt-in mode that runs Codex outside the sandbox. Never disable the sandbox silently or by default; the unsandboxed mode is a deliberate choice the machine's owner makes locally, per machine.

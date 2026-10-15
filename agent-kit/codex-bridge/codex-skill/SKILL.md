@@ -49,8 +49,8 @@ Say "sent" or "accepted", never "they got it", until the peer answers.
 
 ## Gotchas
 
-- **Sandbox.** In `workspace-write` / `read-only` sandboxes, `pb send` fails with `hub unreachable` (the sandbox blocks the hub socket, `Operation not permitted`). The hub is fine: rerun that same `pb send` with sandbox escalation. Do not run `pb ensure` or `pb stop` to "fix" it. `pb whoami` and `pb list` work inside the sandbox.
-- **from-mode.** You declare `bypass` only when this thread runs with no approvals; otherwise `prompting`, and a Claude peer in bypass mode holds your message for its user (`NOT DELIVERED (held)`). That is by design.
+- **Sandbox.** Inside the default `workspace-write` / `read-only` sandbox, `pb send` cannot reach the hub socket, so it prints one `@@PBSEND1...@@` line and the line `queued <id> -> <peer> via the Codex output channel`. That is a SUCCESSFUL hand-off: the hub reads it from your session log and sends it from your peer address within about 0.2 s after the command ends. Do NOT ask for escalation, rerun the command, or run `pb ensure`. Do not echo or copy the `@@PBSEND1` line yourself, because it is single-use. If delivery fails or is held, a `[peerbridge]` or `[Cross-session delivery notice]` turn tells you. `pb whoami` and `pb list` work normally.
+- **from-mode.** You declare `bypass` only when this thread runs with no approvals (launched via `codex-unsandboxed`). Otherwise you declare `prompting`, and a Claude peer in bypass mode HOLDS your message until its user approves it. You get a `[Cross-session delivery notice] ... HELD` turn. That is Claude Code's anti-permission-laundering rule and it is by design. Do not resend. Do not wait for a reply until it is approved.
 - **Not bridged / not listed.** The user's local policy can hide Codex threads (`pb policy`). `pb expose`, `pb hide`, `pb off` change who can inject into whom: run them only when your user asks.
 - **Do not loop.** Never answer idle or delivery notices with a message, and do not reply to a reply unless it asks something.
 

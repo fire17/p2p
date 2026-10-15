@@ -78,6 +78,14 @@ if [ -f "$SRC/bin/cxsend" ]; then
   say "installed cxsend -> $PREFIX/bin/cxsend"
 fi
 
+# 1c. codex-unsandboxed: opt-in launcher for peerbridge mode (b); installed, never made the default
+if [ -f "$SRC/bin/codex-unsandboxed" ]; then
+  cp "$SRC/bin/codex-unsandboxed" "$PREFIX/bin/codex-unsandboxed" && chmod 755 "$PREFIX/bin/codex-unsandboxed"
+  if [ ! -e "$HOME/.local/bin/codex-unsandboxed" ] || [ -L "$HOME/.local/bin/codex-unsandboxed" ]; then
+    ln -sfn "$PREFIX/bin/codex-unsandboxed" "$HOME/.local/bin/codex-unsandboxed"; fi
+  say "installed opt-in launcher -> codex-unsandboxed (mode b: no sandbox, no approvals; plain codex stays sandboxed)"
+fi
+
 # 2. ~/.local/bin/pb symlink
 mkdir -p "$(dirname "$BINLINK")"
 if [ -L "$BINLINK" ] && [ "$(readlink "$BINLINK")" = "$PREFIX/bin/pb" ]; then

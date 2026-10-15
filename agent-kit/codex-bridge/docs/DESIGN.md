@@ -1,6 +1,6 @@
 # peerbridge: design record
 
-2026-10-15, claude-opus-5-5. Ground truth: internal research notes, plus the live probes in `research/` and `evidence/`.
+2026-10-15, claude-opus-5-5. Ground truth: the live probes in `research/` and `evidence/`.
 
 ## Decision: new design on Codex's own daemon. The ASTRA sidecar is not revived.
 

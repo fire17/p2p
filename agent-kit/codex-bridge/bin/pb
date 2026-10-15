@@ -159,7 +159,10 @@ def cmd_send(args):
     st = me()
     start = os.path.getsize(RECEIPTS) if os.path.exists(RECEIPTS) else 0
     t0 = time.time()
-    r = ctl({"cmd": "send", "threadId": st["threadId"], "to": to, "text": text, "notifyIdle": notify}, 25)
+    try:
+        r = ctl({"cmd": "send", "threadId": st["threadId"], "to": to, "text": text, "notifyIdle": notify}, 25)
+    except Sandboxed:
+        return send_via_output(st, to, text, notify)
     if not r:
         die("hub unreachable (pb status / pb ensure)")
     if not r.get("ok"):
@@ -186,8 +189,45 @@ def cmd_send(args):
           "(Claude Code and peerbridge send receipts only for held/refused/expired; a later notice would be injected here).")
 
 
+def send_via_output(st: dict, to: str, text: str, notify: bool) -> None:
+    """Sandbox path: no socket is reachable, so print ONE signed marker line. Command output always lands in this
+    thread's rollout; the hub tails it, checks the HMAC with this thread's key (threads/<tid>.json, 0600),
+    de-duplicates by id and sends from this thread's stub. Nothing is written inside the sandbox."""
+    import base64, hashlib, hmac, uuid
+    key = st.get("sendKey")
+    if not key:
+        die("hub is older than v0.2.1 (no sendKey); cannot send from inside the sandbox", 3)
+    matches = [r for r in ccpeer.resolve(to) if r["address"] != st.get("address")]
+    if len(matches) != 1:
+        cands = ", ".join(f"{r['name']} [{r['ref'][:6]}]" for r in matches) or "none"
+        die(f"expected exactly one live peer for '{to}', found {len(matches)}: {cands}. Use `pb list`.")
+    req = {"v": 1, "id": str(uuid.uuid4()), "to": to, "notify": notify, "ts": time.time()}
+    if len(text.encode("utf-8")) <= 1500:
+        req["text"] = text
+    else:  # long text: a temp file the hub reads (sandbox usually allows writing $TMPDIR/workspace)
+        import tempfile
+        for d in (os.environ.get("TMPDIR"), "/tmp", os.getcwd()):
+            try:
+                fd, path = tempfile.mkstemp(prefix="pb-out-", suffix=".txt", dir=d)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                req["file"], req["sha"] = path, hashlib.sha256(text.encode()).hexdigest()
+                break
+            except Exception:
+                continue
+        else:
+            die("message too long for the sandbox channel (>1500 bytes) and no writable temp dir; shorten it", 3)
+    b64 = base64.urlsafe_b64encode(json.dumps(req, separators=(",", ":")).encode()).decode().rstrip("=")
+    mac = hmac.new(key.encode(), b64.encode(), hashlib.sha256).hexdigest()
+    print(f"@@PBSEND1.{b64}.{mac}@@")
+    print(f"queued {req['id']} -> {matches[0]['name']} via the Codex output channel (sandbox blocks sockets): "
+          f"the peerbridge hub sends it from your peer address about 0.2 s after this command finishes. "
+          f"No escalation needed. If it fails, a [peerbridge] notice is injected into this thread.")
+
+
 def cmd_whoami(args):
-    st = me()
+    st = dict(me())
+    st.pop("sendKey", None)
     st["fromMode"] = from_mode(st)
     print(json.dumps(st, indent=1))
 
