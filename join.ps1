@@ -1,6 +1,6 @@
-# p2p.akeyo.io/join.ps1 — ONE static script for every Windows machine; the listener key is a PARAMETER, never a file on this site:
+# p2p.akeyo.io/join.ps1 - ONE static script for every Windows machine; the listener key is a PARAMETER, never a file on this site:
 #   & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <LISTENER_KEY>
-# (share it as https://p2p.akeyo.io/#/join/<LISTENER_KEY> — the page renders this line client-side)
+# (share it as https://p2p.akeyo.io/#/join/<LISTENER_KEY> - the page renders this line client-side)
 # Installs verified Bun + p2p v0.3.8, joins the listener's chat, identifies the machine. Never enables terminal access.
 # Rendered from tools/join-bootstrap.ps1.in + tools/join-client.mjs by tools/render-generic.py. PowerShell 5.1 and 7.
 param([Parameter(Position = 0)][string]$Key = '')
@@ -84,7 +84,7 @@ function cliSpin(args, label, timeout = 45000) {
   return new Promise(resolvePromise => {
     const child = spawn(process.execPath, [bin, 'tunnel', ...args], { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = '', err = '', i = 0
-    const frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
+    const frames = ['\u280b','\u2819','\u2839','\u2838','\u283c','\u2834','\u2826','\u2827','\u2807','\u280f']
     const tick = setInterval(() => { process.stdout.write('\r  ' + frames[i++ % frames.length] + ' ' + label + ' '); }, 90)
     const killer = setTimeout(() => { try { child.kill() } catch {} }, timeout)
     child.stdout.on('data', d => { out += d })
@@ -175,7 +175,7 @@ if (!selected) {
   const state = status(name)
   if (!state?.alive || !state.connected || state.peerKey !== key) fail('the requested peer did not become connected', 3)
   selected = { name, state }
-  console.log('  ✓ connected to ' + key)
+  console.log('  \u2713 connected to ' + key)
 }
 // --file avoids PowerShell native argv quoting and never treats machine metadata
 // or remote messages as shell syntax. Wait for a delivery acknowledgment.
@@ -190,8 +190,8 @@ try {
     if (result.code === 0) acked = true
     else { lastErr = result.err.trim(); const st = status(selected.name); if (!st?.alive || !st.connected) fail('the connection dropped while sending machine identification: ' + lastErr, 3) }
   }
-  if (!acked) console.log('  ! machine identification sent, delivery not acknowledged in 60 s (' + lastErr + ') — the link is up; continuing.')
-  else console.log('  ✓ machine identification acknowledged')
+  if (!acked) console.log('  ! machine identification sent, delivery not acknowledged in 60 s (' + lastErr + ') \u2014 the link is up; continuing.')
+  else console.log('  \u2713 machine identification acknowledged')
 } finally { try { unlinkSync(messageFile) } catch {} }
 console.log('Agent Tunnel connected to ' + key + ' as ' + selected.state.self + '.')
 console.log('Chat daemon is running in the background (PID ' + selected.state.pid + '). It does not start automatically after a reboot.')

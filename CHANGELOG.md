@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [Unreleased]
+
+- Windows PowerShell 5.1 join line fixed: the hash-pinned `init.ps1` was UTF-8 without a BOM and full of `—`/`·`/`─`; the join line runs it with `-File`, which 5.1 reads in the ANSI code page, so byte 0x94 became a `”` string delimiter (33 parse errors, first `Unexpected token 'off'` at line 406). `init.ps1` and `join.ps1` are now pure ASCII (comments and messages only; the join helper's spinner/check marks are JS `\uXXXX` escapes — identical at runtime), `join.ps1` pins the fixed `init.ps1`, and `test/ps1-encoding.ps1` (PowerShell 7 everywhere + the real Windows PowerShell 5.1 loader in CI) and `test/ps1-encoding.test.js` keep every `*.ps1` ASCII and parseable as UTF-8, cp1252 and cp1255. PowerShell 7, `init`, `join.sh` and already-joined machines are unchanged.
+
 ## [0.3.8] — 2026-09-13
 
 - `tunnel serve` now exits on SIGTERM/SIGINT/SIGHUP. On 0.3.7 the handlers wrote `state.stopped`, released the owner lock and set the exit code, then the process lingered on the relay's open WebSocket (close handshake never completed) — `systemctl stop` of the server keeper ran into its 90 s TimeoutStopSec and a relaunch needed SIGKILL. Signals now exit explicitly, as the `stop` verb always did (test/tunnel-signal-exit.test.js: red on 0.3.7 for all three signals, green here).

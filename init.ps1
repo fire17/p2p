@@ -1,5 +1,5 @@
 <#
-  p2p installer — Windows.  (Linux/macOS: the POSIX `init` script)
+  p2p installer - Windows.  (Linux/macOS: the POSIX `init` script)
 
     irm p2p.akeyo.io/init.ps1 | iex                        install, then print next steps
     & ([scriptblock]::Create((irm p2p.akeyo.io/init.ps1))) KEY     install, then chat with KEY
@@ -12,7 +12,7 @@
     2. fetches the p2p source into %USERPROFILE%\.p2p\app  (skips if already up to date)
     3. drops p2p.cmd + p2p.ps1 in %USERPROFILE%\.local\bin and adds that dir to the
        *user* PATH (setx-equivalent, no admin)
-    4. logs every step to %USERPROFILE%\.p2p\install.log — on ANY failure it prints that path
+    4. logs every step to %USERPROFILE%\.p2p\install.log - on ANY failure it prints that path
 
   Your identity/friends (~\.p2p\*.json) are NEVER touched by an update.
   PowerShell 5.1+ compatible.
@@ -27,15 +27,15 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-# ── config (override via env) ───────────────────────────────────────────────────
-# PRODUCTION DEFAULT: a PINNED release of the p2p repo (an immutable tag — NEVER the
+# -- config (override via env) ---------------------------------------------------
+# PRODUCTION DEFAULT: a PINNED release of the p2p repo (an immutable tag - NEVER the
 # floating `main` branch). The source archive is fetched as a release asset and
 # SHA256-verified against its SHASUMS256.txt manifest BEFORE extraction (fail CLOSED),
 # exactly the way the node runtime is already verified. See docs/RELEASE-SIGNING.md.
 #   - Why not `main`: a moving branch means a compromised push or a MITM of the archive
 #     would be executed with zero verification.
 #   - Why still "latest": the /init.ps1 served from the site is regenerated to the newest
-#     release tag on every release, so `irm … | iex` still installs the latest version.
+#     release tag on every release, so `irm ... | iex` still installs the latest version.
 # Overrides (local testing / private forks):
 #   P2P_REF       release tag to install                 (default: the newest release)
 #   P2P_SRC       a local DIRECTORY (trusted, unverified), OR a .zip/.tar.gz URL
@@ -65,7 +65,7 @@ if (-not $RuntimeKind) {
 # a bare positional key may arrive with a leading flag-ish token from `iex` forms
 if ($Key -match '^-') { $Key = '' }
 
-# ── logging + failure reporting ─────────────────────────────────────────────────
+# -- logging + failure reporting -------------------------------------------------
 New-Item -ItemType Directory -Force -Path $P2pHome | Out-Null
 $script:Step = 'startup'
 function Stamp { (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
@@ -92,10 +92,10 @@ New-Item -ItemType Directory -Force -Path $script:Tmp | Out-Null
 
 try {
   if ($RuntimeKind -notin @('node', 'bun')) { Fail 'P2P_RUNTIME must be node or bun' }
-  # TLS 1.2 — PS 5.1 on older Windows still defaults to SSL3/TLS1.0 and nodejs.org refuses it
+  # TLS 1.2 - PS 5.1 on older Windows still defaults to SSL3/TLS1.0 and nodejs.org refuses it
   try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol } catch {}
 
-  # ── platform ──────────────────────────────────────────────────────────────────
+  # -- platform ------------------------------------------------------------------
   Step 'detect-platform'
   $archRaw = $env:PROCESSOR_ARCHITECTURE
   if (-not $archRaw) { $archRaw = 'AMD64' }
@@ -103,15 +103,15 @@ try {
     'ARM64'        { $NArch = 'arm64'; break }
     'AMD64|x86_64' { $NArch = 'x64';   break }
     'x86'          { $NArch = 'x86';   break }
-    default        { Fail "unsupported CPU arch '$archRaw' — no portable node build exists for it" }
+    default        { Fail "unsupported CPU arch '$archRaw' - no portable node build exists for it" }
   }
   $NodePlat = "win-$NArch"
 
   Log "=============================================================="
-  Log "p2p install start — OS=Windows ARCH=$archRaw node-target=$NodePlat"
+  Log "p2p install start - OS=Windows ARCH=$archRaw node-target=$NodePlat"
   Log "HOME=$UserHome P2P_HOME=$P2pHome src=$Src force=$($Force.IsPresent) key=$(if($Key){$Key}else{'<none>'})"
   Write-Host ""
-  Say "p2p installer  ·  Windows/$archRaw" 'Cyan'
+  Say "p2p installer  |  Windows/$archRaw" 'Cyan'
 
   function Download([string]$url, [string]$out) {
     Log "GET $url -> $out"
@@ -138,29 +138,29 @@ try {
     if (Test-Path -LiteralPath $src) { return (Get-Content -Raw -LiteralPath $src) }
     return (DownloadText $src)
   }
-  # verify a downloaded SOURCE archive against its SHASUMS256.txt manifest. FAIL CLOSED —
+  # verify a downloaded SOURCE archive against its SHASUMS256.txt manifest. FAIL CLOSED -
   # Fail() (never warn-and-proceed) on: no/empty manifest, no matching entry, or a hash
   # mismatch. Get-FileHash ships with PowerShell 5.1+, so (unlike the POSIX path) there is
   # no "no hash tool" case on Windows. Mirrors the node path; see docs/RELEASE-SIGNING.md.
   # NOTE: a same-repo checksum stops a tampered DOWNLOAD (MITM/bad mirror), not an attacker
-  # who can rewrite the repo itself (they rewrite the manifest too) — for that verify the
+  # who can rewrite the repo itself (they rewrite the manifest too) - for that verify the
   # manifest's signature (RELEASE-SIGNING.md).
   function VerifySourceArchive([string]$archive) {
     Step 'verify-source-checksum'
     $got = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()
-    if (-not $Sums) { Fail "no source checksum manifest (P2P_SRC_SUMS is empty) — refusing to install an unverified source archive.`n  set P2P_SRC_SUMS to its SHASUMS256.txt, or point P2P_SRC at a trusted local directory." }
+    if (-not $Sums) { Fail "no source checksum manifest (P2P_SRC_SUMS is empty) - refusing to install an unverified source archive.`n  set P2P_SRC_SUMS to its SHASUMS256.txt, or point P2P_SRC at a trusted local directory." }
     Say "v verifying source integrity..."
     $sumsText = ReadOrDownload $Sums
     $name = Split-Path -Leaf $Src
     $line = ($sumsText -split "`n") | Where-Object { $_ -match ("\s+" + [Regex]::Escape($name) + "\s*$") } | Select-Object -First 1
-    if (-not $line) { Fail "the source manifest ($Sums) has no SHA256 entry for '$name' — is it the right manifest for this archive?" }
+    if (-not $line) { Fail "the source manifest ($Sums) has no SHA256 entry for '$name' - is it the right manifest for this archive?" }
     $want = (($line.Trim() -split '\s+')[0]).ToLower()
-    if ($got -ne $want) { Fail "source checksum MISMATCH for $name`n  expected $want`n  got      $got`n  the downloaded p2p source does not match its manifest — refusing to install." }
-    Say "  + source sha256 verified  ·  $name" 'Green'
+    if ($got -ne $want) { Fail "source checksum MISMATCH for $name`n  expected $want`n  got      $got`n  the downloaded p2p source does not match its manifest - refusing to install." }
+    Say "  + source sha256 verified  |  $name" 'Green'
     Log "source sha256 OK: $name = $got"
   }
 
-  # ── 1. selected runtime ──────────────────────────────────────────────────────
+  # -- 1. selected runtime ------------------------------------------------------
   $Node = $null  # historical name; this is the selected executable, Node or Bun
   if ($RuntimeKind -eq 'bun') {
     Step 'find-bun'
@@ -208,7 +208,7 @@ try {
       Copy-Item -LiteralPath $bunCandidate -Destination (Join-Path $bunRuntime 'bun.exe') -Force
       $Node = Join-Path $bunRuntime 'bun.exe'
     }
-    Say ("+ bun " + (& $Node --version) + " (>=1.4.2)  ·  $Node") 'Green'
+    Say ("+ bun " + (& $Node --version) + " (>=1.4.2)  |  $Node") 'Green'
     Log "using Bun: $Node"
   } else {
   # Node remains the default and retains the existing verified bootstrap.
@@ -224,7 +224,7 @@ try {
   $Node = $null
   $runtimeNode = Join-Path $RuntimeDir 'node.exe'
   if ($env:P2P_FORCE_NODE_BOOTSTRAP -eq '1') {
-    Log 'P2P_FORCE_NODE_BOOTSTRAP=1 — skipping node discovery'
+    Log 'P2P_FORCE_NODE_BOOTSTRAP=1 - skipping node discovery'
   } elseif ((Test-Path $runtimeNode) -and (NodeOk $runtimeNode)) {
     $Node = $runtimeNode
     Log "using bootstrapped node: $Node"
@@ -235,7 +235,7 @@ try {
   }
 
   if ($Node) {
-    Say ("+ node " + (& $Node --version) + " (>= v$NodeMin)  ·  $Node") 'Green'
+    Say ("+ node " + (& $Node --version) + " (>= v$NodeMin)  |  $Node") 'Green'
   } else {
     Say "v no node >= v$NodeMin found - downloading a portable one (no admin, no package manager)..." 'Yellow'
 
@@ -267,7 +267,7 @@ try {
       Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
       [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $exTmp)
     } catch { Expand-Archive -Path $zipPath -DestinationPath $exTmp -Force }
-    # the zip has a single top-level dir (node-vX-win-x64) — flatten it
+    # the zip has a single top-level dir (node-vX-win-x64) - flatten it
     $inner = Get-ChildItem -Path $exTmp -Directory | Select-Object -First 1
     if (-not $inner) { Fail "the extracted node archive has no top-level directory" }
     $newRt = "$RuntimeDir.new"
@@ -288,18 +288,18 @@ try {
   }
 
   # remember WHICH node worked, so legacy shims keep working after Node installs
-  # later. Not a *.json file — user data (identity/friends) is untouched.
+  # later. Not a *.json file - user data (identity/friends) is untouched.
   if ($RuntimeKind -eq 'node') { try { Set-Content -LiteralPath (Join-Path $P2pHome 'node.path') -Value $Node -Encoding ASCII } catch {} }
 
-  # ── 2. fetch the p2p source ───────────────────────────────────────────────────
+  # -- 2. fetch the p2p source ---------------------------------------------------
   Step 'fetch-source'
   $stage = Join-Path $script:Tmp 'stage'
   New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
   if (Test-Path -LiteralPath $Src -PathType Container) {
-    # A local directory is an EXPLICIT operator choice (dev/test/private fork) — trusted,
+    # A local directory is an EXPLICIT operator choice (dev/test/private fork) - trusted,
     # so no checksum is applied here. Only remote ARCHIVES are verified (below).
-    Log "P2P_SRC is a local directory — trusted, no checksum verification"
+    Log "P2P_SRC is a local directory - trusted, no checksum verification"
     Say "v copying p2p source from $Src"
     Get-ChildItem -LiteralPath $Src -Force |
       Where-Object { $_.Name -notin @('.git', 'node_modules', 'scratch') } |
@@ -324,15 +324,15 @@ try {
     Download $Src $srcTgz
     VerifySourceArchive $srcTgz
     # bsdtar ships with Windows 10 1803+ as tar.exe
-    if (-not (Get-Command tar -ErrorAction SilentlyContinue)) { Fail "P2P_SRC is a .tar.gz but this Windows has no tar.exe — use the .zip URL instead" }
+    if (-not (Get-Command tar -ErrorAction SilentlyContinue)) { Fail "P2P_SRC is a .tar.gz but this Windows has no tar.exe - use the .zip URL instead" }
     & tar -xzf $srcTgz -C $stage --strip-components 1
     if ($LASTEXITCODE -ne 0) { Fail "tar could not extract the source archive" }
   } else {
-    Fail "unsupported P2P_SRC '$Src' — use a local directory, a .zip URL, or a .tar.gz URL"
+    Fail "unsupported P2P_SRC '$Src' - use a local directory, a .zip URL, or a .tar.gz URL"
   }
 
   if (-not (Test-Path (Join-Path $stage 'package.json')) -or -not (Test-Path (Join-Path $stage 'bin\p2p.js'))) {
-    Fail "the fetched source is missing package.json or bin\p2p.js — wrong URL?"
+    Fail "the fetched source is missing package.json or bin\p2p.js - wrong URL?"
   }
 
   function PkgVersion([string]$pkgPath) {
@@ -355,7 +355,7 @@ try {
   if (-not $newVer) { Fail "could not read a version out of the fetched package.json" }
   Log "fetched p2p version: $newVer"
 
-  # ── 3. install / skip / update ────────────────────────────────────────────────
+  # -- 3. install / skip / update ------------------------------------------------
   Step 'version-check'
   $oldVer = ''
   $oldPkg = Join-Path $AppDir 'package.json'
@@ -394,7 +394,7 @@ try {
     Log "app installed: $action -> $newVer"
   }
 
-  # ── 4. the `p2p` launcher on PATH ─────────────────────────────────────────────
+  # -- 4. the `p2p` launcher on PATH ---------------------------------------------
   Step 'launcher'
   # Persist only after source verification/install succeeded.
   [IO.File]::WriteAllText((Join-Path $P2pHome 'runtime.path'), ($Node + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
@@ -441,7 +441,7 @@ exit /b 1
   $ps1Shim = Join-Path $BinDir 'p2p.ps1'
   $ps1Body = @'
 #!/usr/bin/env pwsh
-# p2p launcher (generated by the p2p installer — safe to delete along with ~\.p2p)
+# p2p launcher (generated by the p2p installer - safe to delete along with ~\.p2p)
 $p2pHome = if ($env:P2P_HOME) { $env:P2P_HOME } else { Join-Path $env:USERPROFILE '.p2p' }
 $app     = Join-Path $p2pHome 'app'
 $rtNode  = Join-Path $p2pHome 'runtime\node.exe'
@@ -466,7 +466,7 @@ exit $LASTEXITCODE
   Say "+ launcher: $cmdShim" 'Green'
   Log "shims written: $cmdShim, $ps1Shim"
 
-  # ── 5. PATH (user-scoped, no admin) ───────────────────────────────────────────
+  # -- 5. PATH (user-scoped, no admin) -------------------------------------------
   Step 'path'
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (-not $userPath) { $userPath = '' }
@@ -485,16 +485,16 @@ exit $LASTEXITCODE
   }
 
   Step 'done'
-  Log "SUCCESS — p2p $newVer ($action), $RuntimeKind $(& $Node --version), shim $cmdShim"
+  Log "SUCCESS - p2p $newVer ($action), $RuntimeKind $(& $Node --version), shim $cmdShim"
   Remove-Item -Recurse -Force $script:Tmp -ErrorAction SilentlyContinue
 
-  # ── 6. next step / auto-launch ────────────────────────────────────────────────
+  # -- 6. next step / auto-launch ------------------------------------------------
   Write-Host ""
   Say "+ p2p is ready." 'Green'
   if ($pathAdded) { Say "  PATH updated - open a NEW terminal for `p2p` to resolve." 'Yellow' }
   Write-Host ""
 
-  # `irm … | iex` has no interactive host for a full-screen TUI — only auto-launch when
+  # `irm ... | iex` has no interactive host for a full-screen TUI - only auto-launch when
   # there is a real console.
   $haveTty = $false
   try { $haveTty = -not [Console]::IsOutputRedirected -and $Host.Name -ne 'Default Host' } catch { $haveTty = $false }

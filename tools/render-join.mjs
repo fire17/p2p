@@ -19,8 +19,12 @@ export function renderJoin(key, platform, installer = INSTALLERS[platform]) {
   if (!installer || !/^[a-f0-9]{64}$/.test(installer.sha256)) throw new Error('Installer SHA256 is required')
   const url = new URL(installer.url)
   if (!['http:', 'https:'].includes(url.protocol) || /['\r\n]/.test(installer.url)) throw new Error('Invalid installer URL')
-  const values = { KEY: key, INSTALLER_URL: installer.url, INSTALLER_SHA256: installer.sha256,
-    HELPER: readFileSync(join(here, 'join-client.mjs'), 'utf8').trimEnd() }
+  let helper = readFileSync(join(here, 'join-client.mjs'), 'utf8').trimEnd()
+  // Windows PowerShell 5.1 decodes charset-less HTTP bodies and BOM-less files as ANSI/Latin-1:
+  // keep the PowerShell script pure ASCII. The helper's non-ASCII characters sit in JS string
+  // literals, where a \uXXXX escape is the identical string at runtime.
+  if (platform === 'ps1') helper = helper.replace(/[^\x00-\x7f]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
+  const values = { KEY: key, INSTALLER_URL: installer.url, INSTALLER_SHA256: installer.sha256, HELPER: helper }
   return readFileSync(join(here, 'join-bootstrap.' + platform + '.in'), 'utf8')
     .replace(/@@(KEY|INSTALLER_URL|INSTALLER_SHA256|HELPER)@@/g, (_, field) => values[field])
 }
