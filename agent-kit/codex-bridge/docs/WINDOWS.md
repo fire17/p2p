@@ -77,3 +77,21 @@ trust_level = "trusted"
 ```
 
 (in `%USERPROFILE%\.codex\config.toml`). peerbridge and its selftest never edit `config.toml` themselves.
+
+
+## Headless proof (v0.2.6): no TUI needed
+
+On the test desktop an unattended Windows TUI never created a thread (3 tries: plain; read-only + on-request). Likely causes are a first-run screen or the Windows sandbox setup. `-a untrusted` does not exist in 0.162.1; the only values are `on-request` and `never`. Do not test the TUI path unattended. Instead:
+
+```
+codex app-server daemon start                 # shared daemon, no TUI
+py bin\cxsend probe --cwd %TEMP%\cxtest        # thread/start (ephemeral, read-only, no approvals) + turn/start + wait for reply
+codex app-server daemon stop                  # if you started it only for the test
+```
+
+PASS means the daemon accepted a thread, an injected turn ran, and the model replied. That is the whole Codex-side path peerbridge uses. On macOS: thread 103 ms, inject 3 ms, reply +4.1 s.
+
+The questions from that run, answered:
+- `codex "hello"` (initial prompt argument) starts a turn at once, which creates the thread.
+- `codex resume <id>` attaches a TUI to an existing thread, including one made by `thread/start`. (A TUI attaching is a subscriber, so the thread then stays loaded while it is open.)
+- `thread/start` over RPC creates a thread with no TUI at all. That is what `cxsend probe` does.

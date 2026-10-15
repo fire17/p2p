@@ -335,6 +335,17 @@ def cmd_doctor(args):
                     "or run `codex app-server daemon start`; then `pb doctor` again")
         except Exception as e:
             row("codex version", f"error: {e}")
+    try:
+        top = open(os.path.join(cxrpc.CODEX_HOME, "config.toml"), encoding="utf-8").read().split("\n[")[0]
+        import re as _re
+        ap = (_re.search(r'(?m)^\s*approval_policy\s*=\s*"([^"]+)"', top) or [None, "default"])[1]
+        sm = (_re.search(r'(?m)^\s*sandbox_mode\s*=\s*"([^"]+)"', top) or [None, "default"])[1]
+        row("codex defaults", f"approval_policy={ap} sandbox_mode={sm}")
+        if ap == "never" and sm == "danger-full-access":
+            row("WARN", "plain `codex` here runs UNSANDBOXED with no approvals (pb declares from-mode=bypass); "
+                "that is mode (b) by default on this machine - make sure the owner intends it")
+    except OSError:
+        pass
     row("codex control sock", f"{cxrpc.CONTROL_SOCK} ({'present' if os.path.exists(cxrpc.CONTROL_SOCK) else 'absent'})")
     mode = os.environ.get("PEERBRIDGE_CODEX_TRANSPORT") or ("unix" if hasattr(_s, "AF_UNIX") and os.path.exists(cxrpc.CONTROL_SOCK) else "proxy")
     row("codex transport", mode)

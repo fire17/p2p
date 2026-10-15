@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """cxsend - message a LIVE Codex session through Codex's own app-server daemon (peerbridge v0.1).
 
+  cxsend probe [--cwd DIR]                      headless end-to-end proof, NO TUI needed: creates an ephemeral
+                                                read-only thread on the daemon (thread/start), injects a turn,
+                                                waits for the model's reply, prints timings. Uses a tiny model turn.
   cxsend list [--cwd PREFIX] [--all]            live Codex threads you may reach (--all: also unexposed ones)
   cxsend send <thread-id|name|cwd-basename> <text...> [--from NAME] [--raw] [--file PATH]
                                                 inject as a user turn: wakes an idle thread (new turn),
@@ -43,6 +46,48 @@ def threads(rpc, cwd_prefix=None, include_hidden=False):
     return out
 
 
+def probe(rpc, cwd):
+    import queue as _q
+    events = _q.Queue()
+    rpc.on_notify = lambda m, p: events.put((time.time(), m, p))
+    t0 = time.time()
+    try:
+        th = rpc.call("thread/start", {"cwd": cwd, "ephemeral": True, "sandbox": "read-only",
+                                       "approvalPolicy": "never", "threadSource": "user"}, timeout=60)["thread"]
+    except Exception as e:
+        sys.exit(f"cxsend probe: thread/start failed: {e}")
+    tid = th["id"]
+    t1 = time.time()
+    print(f"thread/start ok: {tid} in {(t1 - t0) * 1000:.0f} ms (ephemeral, read-only, cwd={cwd})")
+    nonce = os.urandom(3).hex()
+    text = f"peerbridge probe: reply with exactly PROBE-OK-{nonce} and nothing else. Do not run any tools."
+    rpc.call("turn/start", {"threadId": tid, "input": [{"type": "text", "text": text}]}, timeout=30)
+    t2 = time.time()
+    print(f"turn/start ok in {(t2 - t1) * 1000:.0f} ms")
+    reply, active, done = None, None, None
+    deadline = t2 + 120
+    while time.time() < deadline and not done:
+        try:
+            ts, m, p = events.get(timeout=1)
+        except _q.Empty:
+            continue
+        if p.get("threadId") not in (None, tid):
+            continue
+        if m == "turn/started" and not active:
+            active = ts
+        if m == "item/completed":
+            it = p.get("item") or {}
+            if it.get("type") in ("agentMessage", "AgentMessage") and f"PROBE-OK-{nonce}" in json.dumps(it):
+                reply = ts
+        if m == "turn/completed":
+            done = ts
+    ok = bool(reply)
+    print(f"turn started +{(active - t2):.2f}s" if active else "turn/started: not seen")
+    print(f"reply PROBE-OK-{nonce}: {'+%.2fs' % (reply - t2) if reply else 'NOT seen within 120 s'}")
+    print("RESULT:", "PASS (daemon accepted thread + injected turn + model replied)" if ok else "FAIL")
+    sys.exit(0 if ok else 1)
+
+
 def status(t):
     s = t.get("status") or {}
     return s.get("type", "?") + ("(" + ",".join(s["activeFlags"]) + ")" if s.get("activeFlags") else "")
@@ -62,6 +107,8 @@ def main():
         rpc = CodexRPC(client_name="cxsend", version="0.2.2")
     except ConnectionError as e:
         sys.exit(f"cxsend: cannot reach the Codex app-server daemon: {e}")
+    if a[0] == "probe":
+        return probe(rpc, cwdp or os.getcwd())
     if a[0] == "list":
         show_all = "--all" in a
         for t in threads(rpc, cwdp, include_hidden=show_all):
