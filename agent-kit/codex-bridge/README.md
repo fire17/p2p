@@ -27,6 +27,7 @@ Codex shell: pb send <claude-or-codex-peer> "text" ──► target's CC socket 
 | v0.2.2 | `pb doctor`, `codex-unsandboxed.cmd` | macOS doctor verified; .cmd untested |
 | v0.2.3 | no-daemon diagnosis (desktop-app-only machines), clean cxsend errors | macOS verified |
 | v0.2.4 | docs: the three hold options with exact apply/revert commands | docs only |
+| v0.2.5 | doctor hint for 0 threads (trust screen); Windows live result + pre-trust note in docs/WINDOWS.md | Windows daemon + proxy PASS live (the remote helper agent) |
 | v0.3 (planned) | native-Windows Claude⇄Codex via named pipes | not started |
 
 ## Two modes (both validated by selftest, 29/29 PASS)
@@ -68,7 +69,7 @@ For a held reply, there are three ways through: manual approval, `codex-unsandbo
 - Windows: see docs/WINDOWS.md.
 - Design and dead ends: docs/DESIGN.md.
 
-## Status in agent-kit (v0.2.4)
+## Status in agent-kit (v0.2.5)
 - Claude->Codex: stable (both modes). Codex->Claude: stable from an unsandboxed Codex (mode b); stable from a default-sandbox Codex (mode a) to prompting-mode Claude receivers; HELD for the human's approval when the receiving Claude runs in bypass mode (Claude Code's permission-parity rule). macOS stable; Linux/WSL experimental; native Windows = cxsend + `pb doctor` (v0.3 for named pipes). Diagnose any machine with `python bin/pb doctor` (read-only).
 - Default policy is **optin**: no Codex session is reachable until the machine's owner runs `pb expose ...` locally. `pb off` is the kill switch.
 - Mode (b) `bin/codex-unsandboxed` (`bin\codex-unsandboxed.cmd` on native Windows, untested live) runs Codex with NO sandbox and NO approvals. It is an explicit opt-in the machine's owner chooses per machine; never the default, never enabled silently.

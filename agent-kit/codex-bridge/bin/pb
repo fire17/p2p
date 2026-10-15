@@ -342,6 +342,10 @@ def cmd_doctor(args):
         rpc = cxrpc.CodexRPC(client_name="pb-doctor", version="0.2.1")
         n = len(rpc.call("thread/loaded/list", {}).get("data", []))
         row("daemon rpc", f"ok, {n} loaded thread(s)")
+        if n == 0:
+            row("NOTE", "daemon up but no loaded threads: a codex TUI may be waiting at its first-run "
+                "'trust this folder?' screen (answer it, or pre-trust the folder in config.toml); "
+                "elevated or -c/--enable/--disable launches never attach")
         rpc.close()
     except Exception as e:
         row("daemon rpc", f"FAIL: {str(e)[:300]}")

@@ -59,3 +59,21 @@ Use the read-only checklist in `research/lane-C-windows.md` §Q5, steps 1–9 pl
 3. Whether the Codex Windows sandbox allows opening `\\.\pipe\LOCAL\*` and running the proxy.
 4. The `daemon_auto_start` default on Windows.
 5. Whether CC treats `pidDomain` strictly.
+
+
+## Live result on Windows 11 (a Windows 11 test desktop, build 26200, 2026-10-15 ~23:04, via the remote helper agent)
+
+- PASS: a plain `cmd /k codex` auto-started the shared daemon (`codex app-server daemon version`: running, pid backend, 0.162.1, AF_UNIX `.sock` under `%USERPROFILE%\.codex\app-server-control`).
+- PASS: `pb doctor` showed Windows 11 (build 26200), daemon running, the desktop app's private app-server detected as unreachable, transport proxy, `daemon rpc ok`.
+- PASS: `cxsend list --cwd <folder>` returned exit 0.
+- 0 threads: the unattended TUI sat at Codex's first-run **trust this folder?** screen, so no thread was created yet.
+- After that window closed (taskkill /T), the daemon refused connections (10061), as expected: the auto-started daemon lives with its session.
+
+**Unattended tests on Windows.** The machine owner should pre-trust the throwaway folder once, so the TUI does not stop at the trust screen:
+
+```
+[projects.'C:\Users\<you>\AppData\Local\Temp\cxtest']
+trust_level = "trusted"
+```
+
+(in `%USERPROFILE%\.codex\config.toml`). peerbridge and its selftest never edit `config.toml` themselves.
