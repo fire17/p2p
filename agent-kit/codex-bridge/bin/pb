@@ -271,10 +271,25 @@ def cmd_status(args):
     print(json.dumps(r, indent=1))
 
 
+def _is_hub(pid: int) -> bool:
+    try:
+        if ccpeer.WINDOWS:
+            argv = ["powershell", "-NoProfile", "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter \"ProcessId={int(pid)}\").CommandLine"]
+        else:
+            argv = ["ps", "-o", "command=", "-p", str(int(pid))]
+        cmd = subprocess.run(argv, capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return False
+    return "hub.py" in cmd and "peerbridge" in cmd
+
+
 def cmd_stop(args):
     try:
         pidfile = os.path.join(HOME, "hub.pid")
         pid = int(open(pidfile if os.path.exists(pidfile) else os.path.join(HOME, "hub.lock")).read().strip())
+        if not _is_hub(pid):  # never terminate a recycled pid that is not our hub
+            die(f"pid {pid} from the pid file is not a running peerbridge hub; nothing stopped")
         os.kill(pid, signal.SIGTERM)
         print(f"stopped hub pid={pid}")
     except Exception as e:

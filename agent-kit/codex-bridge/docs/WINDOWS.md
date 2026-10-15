@@ -2,7 +2,7 @@
 
 2026-10-15, claude-opus-5-5. Status: **DESIGN DRAFT, nothing verified on Windows.** The evidence and command citations are in `research/lane-C-windows.md`. Tags: [CODE] read from the 0.162.1 `codex.exe` and 2.1.301 `claude.exe` Windows builds; [WEB] public issue or PR; [INFERRED] reasoning only.
 
-Target: Windows test machines, Windows, possibly with WSL.
+Target: Windows 10/11 machines, possibly with WSL.
 
 ## What each harness gives us on Windows
 
@@ -40,17 +40,13 @@ Rule: each side runs its own hub for the agents on that side. The boundary is cr
    - WSL: `.bashrc` or a Codex SessionStart hook running `pb ensure`.
 7. **Python:** python.org 3.12+ via `py -3`. The Store `python3` stub exits 49.
 
-## Fit with the agent bridge (the bridge plan)
+## Fit with a cross-machine tunnel
 
-The p2p tunnel stays the only Mac⇄PC link, and peerbridge stays local to each machine. The win: inbound G1 lines from the remote helper agent can go into the PC's Codex thread through `turn/start`, a real wake. That removes the plan's "Codex has no push" limit and the `recv --wait 60` polling in the agent prompt. All of the plan's rules still apply:
-- Windows `join.ps1` only, never `join.sh` in WSL.
-- No terminal or exec.
-- `.ps1` files ASCII or UTF-8 with BOM.
-- Message text goes through `--file`.
+A p2p tunnel stays the only link between machines, and peerbridge stays local to each machine. The gain: messages arriving over the tunnel can go into a Codex thread through `turn/start`, which is a real wake, instead of being polled.
 
-## First thing to ask the remote helper agent to run
+## First thing to run on a Windows machine
 
-Use the read-only checklist in `research/lane-C-windows.md` §Q5, steps 1–9 plus W1–W4. Two results decide whether to proceed: step 3 (is the daemon running on Windows?) and step 6 (does CC show a `cc-msg-` pipe?).
+`pb doctor` (non-elevated PowerShell), then `codex app-server daemon start` and `cxsend probe`. Two results decide whether to proceed: is the daemon running, and does Claude Code show a `cc-msg-` pipe?
 
 ## Open questions
 
@@ -61,7 +57,7 @@ Use the read-only checklist in `research/lane-C-windows.md` §Q5, steps 1–9 pl
 5. Whether CC treats `pidDomain` strictly.
 
 
-## Live result on Windows 11 (a Windows 11 test desktop, build 26200, 2026-10-15 ~23:04, via the remote helper agent)
+## Live result on a Windows 11 test desktop (build 26200, 2026-10-15, run by the remote helper agent)
 
 - PASS: a plain `cmd /k codex` auto-started the shared daemon (`codex app-server daemon version`: running, pid backend, 0.162.1, AF_UNIX `.sock` under `%USERPROFILE%\.codex\app-server-control`).
 - PASS: `pb doctor` showed Windows 11 (build 26200), daemon running, the desktop app's private app-server detected as unreachable, transport proxy, `daemon rpc ok`.
@@ -81,7 +77,7 @@ trust_level = "trusted"
 
 ## Headless proof (v0.2.6): no TUI needed
 
-On the test desktop an unattended Windows TUI never created a thread (3 tries: plain; read-only + on-request). Likely causes are a first-run screen or the Windows sandbox setup. `-a untrusted` does not exist in 0.162.1; the only values are `on-request` and `never`. Do not test the TUI path unattended. Instead:
+On the Windows 11 test desktop an unattended Windows TUI never created a thread (3 tries: plain; read-only + on-request). Likely causes are a first-run screen or the Windows sandbox setup. `-a untrusted` does not exist in 0.162.1; the only values are `on-request` and `never`. Do not test the TUI path unattended. Instead:
 
 ```
 codex app-server daemon start                 # shared daemon, no TUI

@@ -63,4 +63,4 @@ message, so it cannot tell who wrote or where to reply), returns no receipt, wai
 thread's turn to finish instead of steering into it, and also needs escalation from a sandbox.
 Use `pb send` to reach Claude sessions, or when the target must know who you are or must see it
 mid-turn. Use `codex queue` to leave a note for a Codex thread that is not running.
-Details and measurements: `~/Creations/peerbridge/docs/CODEX-TO-CODEX.md`.
+Details and measurements: `docs/CODEX-TO-CODEX.md` in the peerbridge source.

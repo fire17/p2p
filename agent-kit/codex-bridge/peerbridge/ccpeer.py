@@ -1,6 +1,6 @@
 """Claude Code peer-mesh protocol (peerProtocol 1), stdlib only.
 
-Wire facts (observed live on CC 2.1.261 and 2.1.281; see ~/Creations/om/extension/peers/claude-code.ts):
+Wire facts (observed live on CC 2.1.261 and 2.1.281):
   registry   ~/.claude/sessions/<pid>.json, listed while <pid> is alive and its socket exists
   inbox      Unix socket at messagingSocketPath, bound by THAT pid (senders check LOCAL_PEERPID)
   key        ~/.claude/sessions/<pid>.<sha256(socketPath)>.key = {peerToken, procStart, pidDomain}, 0600

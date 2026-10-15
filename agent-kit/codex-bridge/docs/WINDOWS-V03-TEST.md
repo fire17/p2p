@@ -18,3 +18,26 @@ codex app-server daemon stop                  # only if you started it for this 
 Optional real-Claude check, while a bridged thread exists. Keep `py xtest.py` paused or open a Codex TUI: in a REAL Claude Code session on that PC, ListAgents should list `codex-<folder>-xx`, and SendMessage to it should start a Codex turn.
 
 Report: the full xtest output (it contains no secrets; pidDomain includes the hostname, so mask it if you like) and `py bin\pb doctor`.
+
+## rc1 live result and rc2 changes
+
+rc1 passed 14/14 live on a Windows 11 test desktop, over native named pipes:
+
+| Leg | Result |
+|---|---|
+| peer row published | 0.20 s |
+| Claude to Codex, turn start | 0.15 s |
+| Codex reply | 4.6 s |
+| Codex to Claude, authenticated | 10 ms |
+| wrong token | rejected |
+
+The thread's read-only, no-approval policy held: 0 shell calls.
+
+rc2 changes:
+1. xtest waits up to 10 s for the hub to attach to the daemon. rc1 failed once on that race.
+2. xtest marks the policy as exposed before calling `pb expose`, so a timeout still restores it.
+3. `pb stop` verifies that the pid is really a peerbridge hub, via its command line, before terminating it.
+
+Declined: re-passing sandbox/approval on the hub's `turn/start`. Those `turn/start` overrides persist on the thread ("for this turn and subsequent turns"). The hub injects into the OWNER's live threads, so sending them would silently change the owner's session policy. The hub sends input only. Each thread keeps whatever sandbox and approval its owner set; xtest's own thread sets them at `thread/start`.
+
+Note: `codex app-server daemon stop` can leave a `pid-update-loop` helper process running (Codex behaviour). Ending it is harmless.

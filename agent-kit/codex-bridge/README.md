@@ -21,13 +21,13 @@ Codex shell: pb send <claude-or-codex-peer> "text" ──► target's CC socket 
 
 | | What | Status |
 |---|---|---|
-| v0.1 | `cxsend`: inject a message into a live Codex thread via the daemon | STABLE (macOS). Windows untested. Shipped to Shai 22:28. |
+| v0.1 | `cxsend`: inject a message into a live Codex thread via the daemon | STABLE (macOS). Windows untested. |
 | v0.2 | hub + per-thread stubs + `pb`: Codex in ListAgents, native SendMessage both ways, CC-convention receipts, opt-in policy + kill switch | Claude→Codex STABLE. Codex→Claude only in unsandboxed Codex. |
 | v0.2.1 | sandbox-proof `pb send` (rollout channel, HMAC + dedupe), `codex-unsandboxed` opt-in launcher, default-sandbox selftest leg | macOS: 29/29 PASS (evidence/selftest-20261015-225433.json) |
 | v0.2.2 | `pb doctor`, `codex-unsandboxed.cmd` | macOS doctor verified; .cmd untested |
 | v0.2.3 | no-daemon diagnosis (desktop-app-only machines), clean cxsend errors | macOS verified |
 | v0.2.4 | docs: the three hold options with exact apply/revert commands | docs only |
-| v0.2.5 | doctor hint for 0 threads (trust screen); Windows live result + pre-trust note in docs/WINDOWS.md | Windows daemon + proxy PASS live (the remote helper agent) |
+| v0.2.5 | doctor hint for 0 threads (trust screen); Windows live result + pre-trust note in docs/WINDOWS.md | Windows daemon + proxy PASS live (remote helper agent) |
 | v0.2.6 | `cxsend probe` (headless end-to-end proof via thread/start), doctor shows codex defaults + WARN when plain codex is unsandboxed | macOS probe PASS |
 | v0.3.0-rc1 | native-Windows Claude<->Codex over named pipes (winpipe.py), xtest.py headless cross-platform gate | macOS xtest 14/14 + selftest PASS; Windows: under test |
 
@@ -71,11 +71,11 @@ For a held reply, there are three ways through: manual approval, `codex-unsandbo
 - Windows: see docs/WINDOWS.md.
 - Design and dead ends: docs/DESIGN.md.
 
-## Status in agent-kit (v0.3.0-rc1)
+## Status in agent-kit (v0.3.0-rc2)
 - Claude->Codex: stable (both modes). Codex->Claude: stable from an unsandboxed Codex (mode b); stable from a default-sandbox Codex (mode a) to prompting-mode Claude receivers; HELD for the human's approval when the receiving Claude runs in bypass mode (Claude Code's permission-parity rule). macOS stable; Linux/WSL experimental; native Windows = cxsend + `pb doctor` (v0.3 for named pipes). Diagnose any machine with `python bin/pb doctor` (read-only).
 - Default policy is **optin**: no Codex session is reachable until the machine's owner runs `pb expose ...` locally. `pb off` is the kill switch.
 - Mode (b) `bin/codex-unsandboxed` (`bin\codex-unsandboxed.cmd` on native Windows, untested live) runs Codex with NO sandbox and NO approvals. It is an explicit opt-in the machine's owner chooses per machine; never the default, never enabled silently.
 - Windows: never run codex or cxsend from an Administrator terminal; launch codex without -c/--enable/--disable flags. See docs/WINDOWS.md.
 - Windows: the Codex DESKTOP APP uses a private app-server that cannot be bridged on Windows today; only CLI `codex` sessions are bridgeable. `pb doctor` prints a FIX line when no shared daemon runs.
 - `cxsend probe --cwd DIR`: headless end-to-end proof, no TUI (ephemeral read-only thread on the shared daemon, one tiny model turn, PASS/FAIL).
-- v0.3.0-rc1 (EXPERIMENTAL): native-Windows Claude<->Codex over named pipes (peerbridge/winpipe.py). Acceptance gate: `py xtest.py` (headless). Not yet live-run on Windows.
+- v0.3.0-rc2 (EXPERIMENTAL): native-Windows Claude<->Codex over named pipes (peerbridge/winpipe.py). Acceptance gate: `py xtest.py` (headless). rc1 passed 14/14 live on a Windows 11 test desktop.

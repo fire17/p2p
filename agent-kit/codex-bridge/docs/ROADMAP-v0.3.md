@@ -1,4 +1,4 @@
-# peerbridge v0.3 backlog (from the remote helper agent gating, 2026-10-15)
+# peerbridge v0.3 backlog (2026-10-15)
 
 | Item | Status | Notes |
 |---|---|---|
@@ -15,7 +15,7 @@ Facts for the named-pipe stub (research/lane-C-windows.md, read from the Windows
 - The Codex daemon on Windows is AF_UNIX. Python has no AF_UNIX there, so use `codex app-server proxy` (already the cxrpc fallback).
 - Native-Windows CC and WSL CC cannot see each other: separate registries and transports.
 
-## First real Windows data (a Windows 11 test desktop, 2026-10-15 ~22:58, via the remote helper agent, read-only)
+## First real Windows data (a Windows 11 test desktop, 2026-10-15, read-only)
 
 - The only Codex there is the **desktop app**, which runs a private stdio app-server. No CLI `codex` was ever opened, so the shared daemon never started: `app-server-control\` is empty, and the proxy fails with os error 10050.
 - The desktop app uses the shared daemon only if `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` **and platform != win32** (lane A [CODE]). So **on Windows, desktop-app threads cannot be bridged**. Only CLI `codex` sessions can (non-elevated, without -c/--enable/--disable).

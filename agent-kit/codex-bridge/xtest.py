@@ -153,11 +153,16 @@ def main():
     exposed, rpc, tid, fake = False, None, None, None
     try:
         r = pb("ensure")
-        st = pb("status")
-        try:
-            ping = json.loads(st.stdout[st.stdout.index("{"):])
-        except Exception:
-            ping = {}
+
+        def ping_now():
+            st = pb("status")
+            try:
+                return json.loads(st.stdout[st.stdout.index("{"):])
+            except Exception:
+                return {}
+        ping = ping_now()
+        if ping.get("ok") and not ping.get("codex"):  # a freshly started hub attaches to the daemon ~1 s later
+            ping = wait_until(lambda: (lambda p: p if p.get("codex") else None)(ping_now()), 10, 0.5) or ping_now()
         if not check("hub_up", ping.get("ok"), f"pid={ping.get('pid')} v={ping.get('version')} {r.stderr.strip()[:200]}"):
             return 1
         if not check("hub_connected_to_codex_daemon", ping.get("codex"), "start one CLI codex or `codex app-server daemon start`"):
@@ -166,8 +171,8 @@ def main():
             check("policy_not_off", False, "kill switch is on (pb on)")
             return 1
         if not policy.allowed("-", cwd):
+            exposed = True  # set first: a timeout inside expose must still trigger the hide in finally
             pb("expose", "--cwd", cwd)
-            exposed = True
         check("policy_allows_test_cwd", policy.allowed("-", cwd), cwd)
 
         events = []
