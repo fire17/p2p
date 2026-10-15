@@ -52,9 +52,16 @@ that the daemon is connected but identification was not acknowledged.
 
 ## Integrity and scope
 
-Both scripts download their platform installer from the exact v0.3.8 source
-commit `c26fde63ea01164bcbdb470e3c6a6f69682f748b`, check an embedded SHA256, and
-execute only after a match. The installer then verifies the published source
+Both scripts download their platform installer from an exact source commit,
+check an embedded SHA256, and execute only after a match: `join.sh` fetches
+`init` from `c26fde63ea01164bcbdb470e3c6a6f69682f748b`; `join.ps1` fetches
+`init.ps1` from `18bbc23e0e4cefe4231cb4611ce138e4c22d813e`, the same installer
+in pure ASCII (Windows PowerShell 5.1 reads a BOM-less `-File` script in the ANSI
+code page and could not parse the earlier UTF-8 copy; `test/ps1-encoding.ps1`
+guards every `*.ps1`). To move a pin: commit the installer change, take that
+commit's SHA and the installer's SHA256 (`git show <sha>:init.ps1 | shasum -a 256`),
+update `INSTALLERS` in `tools/render-join.mjs`, run `python3 tools/render-generic.py`
+(and edit `join.sh` by hand for `init`), then commit the rendered scripts. The installer then verifies the published source
 archive and Bun download against their existing checksum manifests. The
 bootstrap forces the v0.3.8 source URL and Bun runtime; it does not downgrade a
 newer installed p2p version. Existing installer mirror settings remain subject to

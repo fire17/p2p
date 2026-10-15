@@ -8,9 +8,12 @@ import { decodeKey } from '../src/key.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const base = 'https://raw.githubusercontent.com/fire17/p2p/c26fde63ea01164bcbdb470e3c6a6f69682f748b/'
+// init.ps1 is pinned separately: the c26fde6 copy is BOM-less UTF-8 that Windows PowerShell 5.1
+// cannot parse under -File; 18bbc23 is the same installer in pure ASCII. The POSIX init stays put.
+const basePs1 = 'https://raw.githubusercontent.com/fire17/p2p/18bbc23e0e4cefe4231cb4611ce138e4c22d813e/'
 export const INSTALLERS = Object.freeze({
   sh: { url: base + 'init', sha256: '71833d1f4b1d305f8fc551151182c113ea93ca5c02b3f5dc4a0c89ad0a0826cd' },
-  ps1: { url: base + 'init.ps1', sha256: 'd57e40fb2784c5780295a8cd6f10daa68c987aa7f04d720406fe1face4a077e9' },
+  ps1: { url: basePs1 + 'init.ps1', sha256: '924432bd236169f7c36bd8e9a2714d49fcdef55fc9820e0c78f4823ed8a88dbf' },
 })
 export function renderJoin(key, platform, installer = INSTALLERS[platform]) {
   if (!/^0[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$/.test(key || '')) throw new Error('Expected one canonical version-0 listener key')

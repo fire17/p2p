@@ -26,9 +26,9 @@ param([Parameter(Position = 0)][string]$Key = '')
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol } catch {}
     $joinInstaller = Join-Path $joinTemp 'init.ps1'
     $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri 'https://raw.githubusercontent.com/fire17/p2p/c26fde63ea01164bcbdb470e3c6a6f69682f748b/init.ps1' -OutFile $joinInstaller
+    Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri 'https://raw.githubusercontent.com/fire17/p2p/18bbc23e0e4cefe4231cb4611ce138e4c22d813e/init.ps1' -OutFile $joinInstaller
     $joinHash = (Get-FileHash -LiteralPath $joinInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($joinHash -ne 'd57e40fb2784c5780295a8cd6f10daa68c987aa7f04d720406fe1face4a077e9') { throw 'Installer SHA256 mismatch; nothing was executed' }
+    if ($joinHash -ne '924432bd236169f7c36bd8e9a2714d49fcdef55fc9820e0c78f4823ed8a88dbf') { throw 'Installer SHA256 mismatch; nothing was executed' }
     foreach ($joinName in $joinEnv.Keys) { [Environment]::SetEnvironmentVariable($joinName, $joinEnv[$joinName], 'Process') }
     # Isolate the installer's explicit exit statements from the interactive owner shell.
     $joinShell = (Get-Process -Id $PID).Path
