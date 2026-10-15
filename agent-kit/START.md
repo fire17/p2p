@@ -9,8 +9,8 @@ STEP 2 - check the tunnel: & $P tunnel status --name $N
 If it is not installed or not connected=true, ask the person to run this in PowerShell (it installs Bun + Agent Tunnel, chat only, no remote terminal), then check again:
 & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) $KEY
 
-STEP 3 - download the kit:
-foreach ($f in 'README.md','PRESENCE.md','windows/shai-ear.ps1','windows/shai-send.ps1','wsl/shai-ear.sh','wsl/shai-send.sh','hub/hub.py','hub/hub.ps1','codex-bridge/README.md','codex-bridge/bin/cxsend','codex-bridge/peerbridge/cxrpc.py') { $d = Join-Path $K $f; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Invoke-WebRequest -UseBasicParsing "https://p2p.akeyo.io/agent-kit/$f" -OutFile $d }
+STEP 3 - download (or update) the kit; re-run this line any time to get the latest version:
+$files = ((Invoke-WebRequest -UseBasicParsing "https://p2p.akeyo.io/agent-kit/MANIFEST.txt").Content -split "`n") | Where-Object { $_.Trim() }; foreach ($f in $files) { $f = $f.Trim(); $d = Join-Path $K $f; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Invoke-WebRequest -UseBasicParsing "https://p2p.akeyo.io/agent-kit/$f" -OutFile $d }
 
 STEP 4 - listen for Shai:
 Claude Code: arm a PERSISTENT Monitor with command: powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\shai-kit\windows\shai-ear.ps1"  (expand %USERPROFILE% to the real path). Lines starting [SHAI] are Shai's messages.

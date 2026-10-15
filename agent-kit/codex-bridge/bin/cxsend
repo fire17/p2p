@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""cxsend — message a LIVE Codex session through Codex's own app-server daemon (peerbridge v0.1).
+"""cxsend - message a LIVE Codex session through Codex's own app-server daemon (peerbridge v0.1).
 
-  cxsend list                                   live (loaded) Codex threads: id, status, cwd, name
+  cxsend list [--cwd PREFIX] [--all]            live Codex threads you may reach (--all: also unexposed ones)
   cxsend send <thread-id|name|cwd-basename> <text...> [--from NAME] [--raw] [--file PATH]
                                                 inject as a user turn: wakes an idle thread (new turn),
                                                 steers a busy one (folded into the running turn)
-Works wherever `codex` 0.162+ runs: direct to ~/.codex/app-server-control/app-server-control.sock when it
+Only threads exposed by this machine's owner are reachable (~/.peerbridge/policy.json, edited with
+`pb expose` / `pb off`; default: nothing exposed). Works wherever `codex` 0.162+ runs: direct to ~/.codex/app-server-control/app-server-control.sock when it
 exists, else through `codex app-server proxy` (Codex picks the OS transport; set
 PEERBRIDGE_CODEX_TRANSPORT=proxy to force). Python 3.9+, stdlib only.
 """
@@ -20,10 +21,12 @@ for cand in (os.path.join(HERE, "..", "peerbridge"), os.path.join(HERE, "..", "l
         sys.path.insert(0, os.path.abspath(cand))
         break
 from cxrpc import CodexRPC, RPCError  # noqa: E402
+import policy  # noqa: E402
 
 
-def threads(rpc):
+def threads(rpc, cwd_prefix=None, include_hidden=False):
     out = []
+    pol = policy.load()
     for tid in rpc.call("thread/loaded/list", {}).get("data", []):
         try:
             t = rpc.call("thread/read", {"threadId": tid})["thread"]
@@ -31,7 +34,12 @@ def threads(rpc):
             continue
         if t.get("ephemeral"):
             continue
-        out.append(t)
+        cwd = os.path.realpath(t.get("cwd") or "")
+        if cwd_prefix and not (cwd == cwd_prefix or cwd.startswith(cwd_prefix.rstrip("/") + "/")):
+            continue
+        t["_exposed"] = policy.allowed(t["id"], t.get("cwd"), pol)
+        if t["_exposed"] or include_hidden:
+            out.append(t)
     return out
 
 
@@ -45,10 +53,17 @@ def main():
     if not a or a[0] in ("-h", "--help"):
         print(__doc__)
         return
-    rpc = CodexRPC(client_name="cxsend", version="0.1.0")
+    cwdp = None
+    if "--cwd" in a:
+        i = a.index("--cwd"); cwdp = os.path.realpath(a[i + 1]); del a[i:i + 2]
+    if policy.load().get("off"):
+        sys.exit("cxsend: peerbridge is OFF on this machine (kill switch); `pb on` to re-enable")
+    rpc = CodexRPC(client_name="cxsend", version="0.2.0")
     if a[0] == "list":
-        for t in threads(rpc):
-            print(f"{t['id']}  {status(t):<10} {t.get('cwd', '')}  {t.get('name') or ''}")
+        show_all = "--all" in a
+        for t in threads(rpc, cwdp, include_hidden=show_all):
+            flag = "" if t["_exposed"] else "  (NOT exposed)"
+            print(f"{t['id']}  {status(t):<10} {t.get('cwd', '')}  {t.get('name') or ''}{flag}")
         return
     if a[0] != "send" or len(a) < 2:
         sys.exit(__doc__)
@@ -65,11 +80,14 @@ def main():
     if not text.strip():
         sys.exit("cxsend: empty message")
     target = a[1]
-    ts = threads(rpc)
+    ts = threads(rpc, cwdp)
     m = [t for t in ts if t["id"] == target] or [t for t in ts if (t.get("name") or "") == target] \
         or [t for t in ts if os.path.basename((t.get("cwd") or "").rstrip("/")) == target]
     if len(m) != 1:
-        sys.exit(f"cxsend: expected one live thread for '{target}', found {len(m)}. Try `cxsend list`.")
+        hidden = [t for t in threads(rpc, cwdp, include_hidden=True) if target in (t["id"], t.get("name"))]
+        if hidden and not m:
+            sys.exit(f"cxsend: '{target}' is live but NOT exposed by this machine's owner (pb expose --thread {hidden[0]['id']}).")
+        sys.exit(f"cxsend: expected one live exposed thread for '{target}', found {len(m)}. Try `cxsend list`.")
     t = m[0]
     if not raw:
         who = frm or os.environ.get("USER", "agent")

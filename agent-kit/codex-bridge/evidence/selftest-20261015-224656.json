@@ -1,0 +1,488 @@
+{
+ "started": "2026-10-15T22:44:49",
+ "duration_s": 127.83,
+ "overall": "PASS",
+ "checks": [
+  {
+   "check": "hub_up",
+   "result": "PASS",
+   "detail": "pid=90306 codex=True v=0.162.1"
+  },
+  {
+   "check": "hub_connected_to_daemon",
+   "result": "PASS",
+   "detail": ""
+  },
+  {
+   "check": "policy_allows_test_cwd",
+   "result": "PASS",
+   "detail": "expose=all"
+  },
+  {
+   "check": "daemon_reachable",
+   "result": "PASS",
+   "detail": "1 loaded threads, transport=unix"
+  },
+  {
+   "check": "fake_peer_listed",
+   "result": "PASS",
+   "detail": "uds:/tmp/cc-socks/91244.sock"
+  },
+  {
+   "check": "codex_registered",
+   "result": "PASS",
+   "detail": ""
+  },
+  {
+   "check": "registry_row_shape",
+   "result": "PASS",
+   "detail": "status=idle"
+  },
+  {
+   "check": "pong_injected",
+   "result": "PASS",
+   "detail": "0.007s accepted injected: started a new Codex turn (01a14118-8d5a-7f63-a97b-9480f3364e8a)"
+  },
+  {
+   "check": "pong_no_failure_receipt",
+   "result": "PASS",
+   "detail": "none (CC convention: success is silent)"
+  },
+  {
+   "check": "pong_wake_active",
+   "result": "PASS",
+   "detail": "0.011s to thread active"
+  },
+  {
+   "check": "pong_roundtrip_bare_pb",
+   "result": "PASS",
+   "detail": "6.445s"
+  },
+  {
+   "check": "pong_provenance",
+   "result": "PASS",
+   "detail": "from-name=codex-peertest-st-15 from-mode=bypass"
+  },
+  {
+   "check": "steer_second_injected_steered",
+   "result": "PASS",
+   "detail": "status-at-send=active reason=injected: steered into the running Codex turn (01a14118-bd2e-7cf3-912e-174c68defd00)"
+  },
+  {
+   "check": "steer_same_turn_id",
+   "result": "PASS",
+   "detail": "A=01a14118-bd2e-7cf3-912e-174c68defd00 B=01a14118-bd2e-7cf3-912e-174c68defd00"
+  },
+  {
+   "check": "steer_both_handled",
+   "result": "PASS",
+   "detail": "A=13.634s B=12.156s"
+  },
+  {
+   "check": "idle_notice_busy_sub",
+   "result": "PASS",
+   "detail": "notice 0.953s after idle, state=idle"
+  },
+  {
+   "check": "hub_frames_authenticated",
+   "result": "PASS",
+   "detail": "idle notice carried our peer token; auth failures=0"
+  },
+  {
+   "check": "idle_notice_combined_not_premature",
+   "result": "PASS",
+   "detail": "notice +4.895s, active +0.008s, idle +4.015s"
+  },
+  {
+   "check": "codex2_registered",
+   "result": "PASS",
+   "detail": ""
+  },
+  {
+   "check": "c2c_codex1_to_codex2_injected",
+   "result": "PASS",
+   "detail": "4.042s injected: started a new Codex turn (01a14119-5c27-7043-a77f-438996820747)"
+  },
+  {
+   "check": "c2c_codex2_accepted_no_failure",
+   "result": "PASS",
+   "detail": "accepted failures=0"
+  },
+  {
+   "check": "c2c_codex2_ack_to_fake_claude",
+   "result": "PASS",
+   "detail": "13.07s"
+  },
+  {
+   "check": "tmux_sessions_killed",
+   "result": "PASS",
+   "detail": "peertest-st-codex,peertest-st-codex2"
+  },
+  {
+   "check": "registry_rows_removed",
+   "result": "PASS",
+   "detail": "64.418s"
+  },
+  {
+   "check": "fake_peer_removed",
+   "result": "PASS",
+   "detail": ""
+  }
+ ],
+ "timings": {
+  "register_s": 1.4,
+  "inject_ack_s": 0.007,
+  "wake_s": 0.011,
+  "pong_roundtrip_s": 6.445,
+  "pong_model_turn_s": 11.125,
+  "steer_ack_s": 0.003,
+  "steer_a_s": 13.634,
+  "steer_b_s": 12.156,
+  "idle_notice_after_idle_s": 0.953,
+  "c2c_inbound_s": 4.042,
+  "c2c_ack_roundtrip_s": 13.07,
+  "rows_gone_s": 64.418
+ },
+ "bridged": {
+  "codex1": {
+   "tid": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "stubPid": 91499,
+   "name": "codex-peertest-st-15",
+   "stubPids": [
+    91499
+   ]
+  },
+  "codex2": {
+   "tid": "01a14119-4b52-7771-8826-de14982a8eae",
+   "stubPid": 93904,
+   "name": "codex-codex2-09",
+   "stubPids": [
+    93904
+   ]
+  }
+ },
+ "notes": [],
+ "server_requests_seen_by_monitor": 0,
+ "status_events": [
+  {
+   "t": 1.449,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "active",
+    "activeFlags": []
+   }
+  },
+  {
+   "t": 12.574,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "idle"
+   }
+  },
+  {
+   "t": 13.694,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "active",
+    "activeFlags": []
+   }
+  },
+  {
+   "t": 32.901,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "idle"
+   }
+  },
+  {
+   "t": 34.069,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "active",
+    "activeFlags": []
+   }
+  },
+  {
+   "t": 42.775,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "idle"
+   }
+  },
+  {
+   "t": 43.946,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "active",
+    "activeFlags": []
+   }
+  },
+  {
+   "t": 47.952,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "idle"
+   }
+  },
+  {
+   "t": 50.378,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "active",
+    "activeFlags": []
+   }
+  },
+  {
+   "t": 54.406,
+   "thread": "01a14119-4b52-7771-8826-de14982a8eae",
+   "status": {
+    "type": "active",
+    "activeFlags": []
+   }
+  },
+  {
+   "t": 57.432,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "idle"
+   }
+  },
+  {
+   "t": 67.373,
+   "thread": "01a14119-4b52-7771-8826-de14982a8eae",
+   "status": {
+    "type": "idle"
+   }
+  },
+  {
+   "t": 123.437,
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "status": {
+    "type": "notLoaded"
+   }
+  },
+  {
+   "t": 127.377,
+   "thread": "01a14119-4b52-7771-8826-de14982a8eae",
+   "status": {
+    "type": "notLoaded"
+   }
+  }
+ ],
+ "hub_events": [
+  {
+   "t": 1792093490.456,
+   "ev": "peer_up",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "name": "codex-peertest-st-15",
+   "address": "uds:/tmp/cc-socks/91499.sock"
+  },
+  {
+   "t": 1792093490.526,
+   "ev": "inbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "from": "uds:/tmp/cc-socks/91244.sock",
+   "fromName": "peertest-st-claude",
+   "msgId": "3082fa81-e101-4858-be0e-8a8fa96e7454",
+   "chars": 78,
+   "ok": true,
+   "detail": "injected: started a new Codex turn (01a14118-8d5a-7f63-a97b-9480f3364e8a)"
+  },
+  {
+   "t": 1792093490.526,
+   "ev": "receipt",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "msgId": "3082fa81-e101-4858-be0e-8a8fa96e7454",
+   "status": "accepted",
+   "reason": "injected: started a new Codex turn (01a14118-8d5a-7f63-a97b-9480f3364e8a)"
+  },
+  {
+   "t": 1792093496.959,
+   "ev": "outbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "toName": "peertest-st-claude",
+   "msgId": "b3c77fa6-2d65-4b38-9f67-0a02ddf87ee6",
+   "chars": 11
+  },
+  {
+   "t": 1792093502.77,
+   "ev": "inbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "from": "uds:/tmp/cc-socks/91244.sock",
+   "fromName": "peertest-st-claude",
+   "msgId": "b8af0aab-fbc6-4555-a6c8-f044b27a6abb",
+   "chars": 133,
+   "ok": true,
+   "detail": "injected: started a new Codex turn (01a14118-bd2e-7cf3-912e-174c68defd00)"
+  },
+  {
+   "t": 1792093502.77,
+   "ev": "receipt",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "msgId": "b8af0aab-fbc6-4555-a6c8-f044b27a6abb",
+   "status": "accepted",
+   "reason": "injected: started a new Codex turn (01a14118-bd2e-7cf3-912e-174c68defd00)"
+  },
+  {
+   "t": 1792093505.83,
+   "ev": "inbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "from": "uds:/tmp/cc-socks/91244.sock",
+   "fromName": "peertest-st-claude",
+   "msgId": "c69f5ad4-550c-43ff-8515-db969e14919c",
+   "chars": 93,
+   "ok": true,
+   "detail": "injected: steered into the running Codex turn (01a14118-bd2e-7cf3-912e-174c68defd00)"
+  },
+  {
+   "t": 1792093505.83,
+   "ev": "receipt",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "msgId": "c69f5ad4-550c-43ff-8515-db969e14919c",
+   "status": "accepted",
+   "reason": "injected: steered into the running Codex turn (01a14118-bd2e-7cf3-912e-174c68defd00)"
+  },
+  {
+   "t": 1792093516.396,
+   "ev": "outbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "toName": "peertest-st-claude",
+   "msgId": "3dd62637-63f9-47f2-bc6a-38a62565068b",
+   "chars": 14
+  },
+  {
+   "t": 1792093517.981,
+   "ev": "outbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "toName": "peertest-st-claude",
+   "msgId": "b10bb8e6-0017-4290-ac9b-087fa9333472",
+   "chars": 14
+  },
+  {
+   "t": 1792093523.145,
+   "ev": "inbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "from": "uds:/tmp/cc-socks/91244.sock",
+   "fromName": "peertest-st-claude",
+   "msgId": "8d32fe29-d17a-4d29-803b-aeab85c3c1d8",
+   "chars": 94,
+   "ok": true,
+   "detail": "injected: started a new Codex turn (01a14119-0cc5-7620-9212-8e5fb5d0785a)"
+  },
+  {
+   "t": 1792093523.145,
+   "ev": "receipt",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "msgId": "8d32fe29-d17a-4d29-803b-aeab85c3c1d8",
+   "status": "accepted",
+   "reason": "injected: started a new Codex turn (01a14119-0cc5-7620-9212-8e5fb5d0785a)"
+  },
+  {
+   "t": 1792093532.808,
+   "ev": "idle_notice_sent",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "state": "idle"
+  },
+  {
+   "t": 1792093533.022,
+   "ev": "inbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "from": "uds:/tmp/cc-socks/91244.sock",
+   "fromName": "peertest-st-claude",
+   "msgId": "3ca316b7-3a32-4ddc-ad5a-debfb5382edc",
+   "chars": 46,
+   "ok": true,
+   "detail": "injected: started a new Codex turn (01a14119-335b-7c63-9b66-d3573430dfbf)"
+  },
+  {
+   "t": 1792093533.023,
+   "ev": "receipt",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "msgId": "3ca316b7-3a32-4ddc-ad5a-debfb5382edc",
+   "status": "accepted",
+   "reason": "injected: started a new Codex turn (01a14119-335b-7c63-9b66-d3573430dfbf)"
+  },
+  {
+   "t": 1792093537.913,
+   "ev": "idle_notice_sent",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "state": "idle"
+  },
+  {
+   "t": 1792093539.409,
+   "ev": "peer_up",
+   "thread": "01a14119-4b52-7771-8826-de14982a8eae",
+   "name": "codex-codex2-09",
+   "address": "uds:/tmp/cc-socks/93904.sock"
+  },
+  {
+   "t": 1792093539.454,
+   "ev": "inbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "from": "uds:/tmp/cc-socks/91244.sock",
+   "fromName": "peertest-st-claude",
+   "msgId": "975ad14e-b305-4e25-9597-aa6d190fe872",
+   "chars": 125,
+   "ok": true,
+   "detail": "injected: started a new Codex turn (01a14119-4c62-7c32-870a-959735da7b2e)"
+  },
+  {
+   "t": 1792093539.454,
+   "ev": "receipt",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "msgId": "975ad14e-b305-4e25-9597-aa6d190fe872",
+   "status": "accepted",
+   "reason": "injected: started a new Codex turn (01a14119-4c62-7c32-870a-959735da7b2e)"
+  },
+  {
+   "t": 1792093543.457,
+   "ev": "outbound",
+   "thread": "01a14118-8c0e-7492-95dd-e10e21b87dcc",
+   "to": "uds:/tmp/cc-socks/93904.sock",
+   "toName": "codex-codex2-09",
+   "msgId": "7120de02-6854-48a9-ba7a-d83718eea928",
+   "chars": 86
+  },
+  {
+   "t": 1792093543.467,
+   "ev": "inbound",
+   "thread": "01a14119-4b52-7771-8826-de14982a8eae",
+   "from": "uds:/tmp/cc-socks/91499.sock",
+   "fromName": "codex-peertest-st-15",
+   "msgId": "7120de02-6854-48a9-ba7a-d83718eea928",
+   "chars": 86,
+   "ok": true,
+   "detail": "injected: started a new Codex turn (01a14119-5c27-7043-a77f-438996820747)"
+  },
+  {
+   "t": 1792093543.467,
+   "ev": "receipt",
+   "thread": "01a14119-4b52-7771-8826-de14982a8eae",
+   "to": "uds:/tmp/cc-socks/91499.sock",
+   "msgId": "7120de02-6854-48a9-ba7a-d83718eea928",
+   "status": "accepted",
+   "reason": "injected: started a new Codex turn (01a14119-5c27-7043-a77f-438996820747)"
+  },
+  {
+   "t": 1792093552.491,
+   "ev": "outbound",
+   "thread": "01a14119-4b52-7771-8826-de14982a8eae",
+   "to": "uds:/tmp/cc-socks/91244.sock",
+   "toName": "peertest-st-claude",
+   "msgId": "835c2c07-87fd-4e5b-811e-5aa5126923ec",
+   "chars": 14
+  }
+ ],
+ "hub_receipts": []
+}

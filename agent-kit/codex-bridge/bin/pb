@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""pb - peerbridge command for Codex sessions (and humans).
+
+  pb list [--json]                       live peers: Claude Code sessions + bridged Codex threads
+  pb send <to> <text...> [--notify-idle] [--wait SEC] [--file PATH | -]
+                                         message a peer (name, "name [ref]", uds:address, ref, sessionId)
+  pb whoami                              this Codex thread's peer identity
+  pb name <new-name>                     rename this Codex thread's peer
+  pb ensure | status | stop              hub lifecycle
+  pb policy                              show who may be reached (local file ~/.peerbridge/policy.json)
+  pb expose [--thread ID | --cwd PATH | --all]   make a Codex thread reachable (default: this thread)
+  pb hide   [--thread ID | --cwd PATH | --all]   undo expose (--all returns to opt-in mode)
+  pb off | pb on                         kill switch: withdraw every Codex peer and refuse all injection
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+for cand in (os.path.join(HERE, "..", "peerbridge"), os.path.join(HERE, "..", "lib", "peerbridge")):
+    if os.path.exists(os.path.join(cand, "ccpeer.py")):
+        sys.path.insert(0, os.path.abspath(cand))
+        PKG = os.path.abspath(cand)
+        break
+else:
+    sys.exit("pb: cannot find the peerbridge package next to this script")
+import ccpeer  # noqa: E402
+import policy  # noqa: E402
+
+HOME = ccpeer.STATE_DIR
+CTL = os.path.join(HOME, "hub.sock")
+RECEIPTS = os.path.join(HOME, "receipts.jsonl")
+
+
+def die(msg: str, code: int = 1):
+    print(f"pb: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+class Sandboxed(Exception):
+    pass
+
+
+def ctl(req: dict, timeout: float = 20.0) -> dict | None:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(CTL)
+        s.sendall((json.dumps(req) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+        s.close()
+        return json.loads(data.split(b"\n")[0])
+    except PermissionError:
+        raise Sandboxed()
+    except OSError as e:
+        if getattr(e, "errno", None) == 1:  # EPERM: Codex sandbox blocks the socket
+            raise Sandboxed()
+        return None
+    except Exception:
+        return None
+
+
+def ensure(quiet: bool = False) -> dict:
+    r = ctl({"cmd": "ping"}, 3)
+    if r and r.get("ok"):
+        return r
+    os.makedirs(HOME, exist_ok=True)
+    log = open(os.path.join(HOME, "hub.out"), "a")
+    subprocess.Popen([sys.executable, os.path.join(PKG, "hub.py")], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True, close_fds=True)
+    for _ in range(50):
+        time.sleep(0.1)
+        r = ctl({"cmd": "ping"}, 2)
+        if r and r.get("ok"):
+            if not quiet:
+                print(f"hub started pid={r['pid']}")
+            return r
+    die("hub did not come up; see ~/.peerbridge/hub.log and hub.out")
+
+
+def me(required: bool = True) -> dict | None:
+    tid = os.environ.get("CODEX_THREAD_ID") or os.environ.get("PEERBRIDGE_THREAD_ID")
+    if not tid:
+        if required:
+            die("not inside a Codex session (CODEX_THREAD_ID unset). Claude sessions use their native SendMessage tool.")
+        return None
+    path = os.path.join(HOME, "threads", f"{tid}.json")
+    for i in range(40):
+        try:
+            st = json.load(open(path))
+            if ccpeer.pid_alive(st.get("stubPid", 0)):
+                return st
+        except Exception:
+            pass
+        if i == 0:
+            ensure(quiet=True)
+            ctl({"cmd": "resync"}, 10)
+        time.sleep(0.1)
+    if required:
+        die(f"this Codex thread ({tid}) is not bridged yet; is the Codex app-server daemon running? see `pb status`")
+    return None
+
+
+def from_mode(st: dict) -> str:
+    sys.path.insert(0, PKG)
+    from hub import approval_of  # noqa: E402
+    return "bypass" if approval_of(st.get("rollout")) == "never" else "prompting"
+
+
+def cmd_list(args):
+    recs = ccpeer.records()
+    mine = me(required=False)
+    if "--json" in args:
+        print(json.dumps([{k: r.get(k) for k in ("name", "ref", "address", "status", "cwd", "entrypoint", "harness", "sessionId", "pid")} for r in recs], indent=1))
+        return
+    for r in recs:
+        harness = r.get("harness") or ("codex" if r.get("entrypoint") == "codex" else "claude")
+        star = " (you)" if mine and r["address"] == mine.get("address") else ""
+        print(f"{r['name']:<28} [{r['ref'][:6]}] {harness:<6} {r.get('status', '?'):<7} {r.get('cwd', '')}{star}")
+        print(f"{'':<28}   {r['address']}")
+
+
+def cmd_send(args):
+    notify = "--notify-idle" in args
+    args = [a for a in args if a != "--notify-idle"]
+    wait = 1.5
+    if "--wait" in args:
+        i = args.index("--wait")
+        try:
+            wait = float(args[i + 1])
+        except (IndexError, ValueError):
+            die("--wait needs a number of seconds")
+        del args[i:i + 2]
+    text = None
+    if "--file" in args:
+        i = args.index("--file")
+        text = open(args[i + 1], encoding="utf-8").read()
+        del args[i:i + 2]
+    if not args:
+        die("usage: pb send <to> <text...>")
+    to, rest = args[0], args[1:]
+    if text is None:
+        text = sys.stdin.read() if rest == ["-"] or (not rest and not sys.stdin.isatty()) else " ".join(rest)
+    if not text.strip() and not notify:
+        die("empty message")
+    if len(text.encode("utf-8")) > 900_000:
+        die("message too large (> 900 KB); Claude Code caps a frame at 1 MiB. Send a file path instead.")
+    st = me()
+    start = os.path.getsize(RECEIPTS) if os.path.exists(RECEIPTS) else 0
+    t0 = time.time()
+    r = ctl({"cmd": "send", "threadId": st["threadId"], "to": to, "text": text, "notifyIdle": notify}, 25)
+    if not r:
+        die("hub unreachable (pb status / pb ensure)")
+    if not r.get("ok"):
+        die(r.get("error", "send failed"))
+    msg_id = r["msgId"]
+    print(f"sent {msg_id} -> {r['to']} [{r['ref']}] ({r.get('toHarness')}) as {r['as']} from-mode={r['fromMode']} "
+          f"in {(time.time() - t0) * 1000:.0f} ms")
+    deadline = t0 + wait
+    while time.time() < deadline:
+        if os.path.exists(RECEIPTS):
+            with open(RECEIPTS) as fh:
+                fh.seek(start)
+                for line in fh:
+                    try:
+                        rc = json.loads(line)
+                    except Exception:
+                        continue
+                    if rc.get("msgId") == msg_id:
+                        print(f"NOT DELIVERED ({rc.get('status')}{'/' + rc['detail'] if rc.get('detail') else ''}) after "
+                              f"{time.time() - t0:.2f}s - {rc.get('reason')}")
+                        sys.exit(2)
+        time.sleep(0.1)
+    print("accepted: written into the peer's inbox and no hold/refusal came back "
+          "(Claude Code and peerbridge send receipts only for held/refused/expired; a later notice would be injected here).")
+
+
+def cmd_whoami(args):
+    st = me()
+    st["fromMode"] = from_mode(st)
+    print(json.dumps(st, indent=1))
+
+
+def cmd_name(args):
+    if not args:
+        die("usage: pb name <new-name>")
+    st = me()
+    r = ctl({"cmd": "rename", "threadId": st["threadId"], "name": " ".join(args)})
+    if not r or not r.get("ok"):
+        die((r or {}).get("error", "hub unreachable"))
+    print(f"renamed to {r['name']}")
+
+
+def cmd_status(args):
+    r = ctl({"cmd": "ping"}, 3)
+    if not r:
+        print("hub: not running")
+        sys.exit(1)
+    print(json.dumps(r, indent=1))
+
+
+def cmd_stop(args):
+    try:
+        pid = int(open(os.path.join(HOME, "hub.lock")).read().strip())
+        os.kill(pid, signal.SIGTERM)
+        print(f"stopped hub pid={pid}")
+    except Exception as e:
+        die(f"no hub to stop ({e})")
+
+
+def _target(args):
+    st = me(required=False)
+    if "--all" in args:
+        return ("all", None)
+    if "--thread" in args:
+        return ("thread", args[args.index("--thread") + 1])
+    if "--cwd" in args:
+        return ("cwd", os.path.realpath(args[args.index("--cwd") + 1]))
+    if st:
+        return ("thread", st["threadId"])
+    if os.environ.get("CODEX_THREAD_ID"):
+        return ("thread", os.environ["CODEX_THREAD_ID"])
+    die("say what to expose: --thread ID | --cwd PATH | --all (or run inside a Codex session)")
+
+
+def cmd_policy(args):
+    print(json.dumps(policy.load(), indent=1))
+
+
+def cmd_expose(args, hide=False):
+    p = policy.load()
+    kind, val = _target(args)
+    if kind == "all":
+        p["expose"] = "optin" if hide else "all"
+    else:
+        key = "threads" if kind == "thread" else "cwds"
+        cur = [x for x in (p.get(key) or []) if x != val]
+        p[key] = cur if hide else cur + [val]
+    policy.save(p)
+    print(json.dumps(policy.load(), indent=1))
+
+
+def cmd_off(args, off=True):
+    p = policy.load()
+    p["off"] = off
+    policy.save(p)
+    print("peerbridge OFF: every Codex peer withdrawn within ~1 s, all injection refused" if off else "peerbridge ON")
+
+
+def main():
+    try:
+        _main()
+    except Sandboxed:
+        die("the Codex sandbox blocked the peerbridge socket (Operation not permitted). "
+            "Re-run this exact pb command with escalated permissions (sandbox_permissions=require_escalated); "
+            "do NOT run `pb ensure` - the hub is already running.", 3)
+
+
+def _main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmds = {"list": cmd_list, "ls": cmd_list, "send": cmd_send, "whoami": cmd_whoami, "name": cmd_name,
+            "ensure": lambda a: ensure(quiet=True) if "--quiet" in a else print(json.dumps(ensure(), indent=1)), "status": cmd_status, "stop": cmd_stop,
+            "policy": cmd_policy, "expose": cmd_expose, "hide": lambda a: cmd_expose(a, hide=True),
+            "off": cmd_off, "on": lambda a: cmd_off(a, off=False)}
+    if a[0] not in cmds:
+        die(f"unknown command {a[0]}\n{__doc__}")
+    cmds[a[0]](a[1:])
+
+
+if __name__ == "__main__":
+    main()
