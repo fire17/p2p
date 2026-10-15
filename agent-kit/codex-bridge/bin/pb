@@ -11,6 +11,7 @@
   pb expose [--thread ID | --cwd PATH | --all]   make a Codex thread reachable (default: this thread)
   pb hide   [--thread ID | --cwd PATH | --all]   undo expose (--all returns to opt-in mode)
   pb off | pb on                         kill switch: withdraw every Codex peer and refuse all injection
+  pb doctor                              ASCII health report: platform, codex + daemon, transport, policy, hub
 """
 from __future__ import annotations
 
@@ -274,6 +275,61 @@ def _target(args):
     die("say what to expose: --thread ID | --cwd PATH | --all (or run inside a Codex session)")
 
 
+def cmd_doctor(args):
+    import platform, shutil, socket as _s
+    sys.path.insert(0, PKG)
+    import cxrpc  # noqa: E402
+    out = []
+    def row(k, v):
+        out.append(f"{k:<22} {v}")
+    row("platform", f"{platform.system()} {platform.release()} ({sys.platform})")
+    row("python", sys.version.split()[0])
+    row("af_unix", "yes" if hasattr(_s, "AF_UNIX") else "no (Windows CPython: proxy transport)")
+    codex = shutil.which("codex")
+    row("codex", codex or "NOT FOUND on PATH")
+    if codex:
+        try:
+            v = subprocess.run([codex, "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
+            row("codex version", v or "?")
+            d = subprocess.run([codex, "app-server", "daemon", "version"], capture_output=True, text=True, timeout=15)
+            try:
+                dj = json.loads(d.stdout)
+                row("daemon", f"{dj.get('status')} app-server {dj.get('appServerVersion')} backend={dj.get('backend')}")
+            except Exception:
+                row("daemon", (d.stdout or d.stderr).strip().splitlines()[0] if (d.stdout or d.stderr).strip() else "?")
+        except Exception as e:
+            row("codex version", f"error: {e}")
+    row("codex control sock", f"{cxrpc.CONTROL_SOCK} ({'present' if os.path.exists(cxrpc.CONTROL_SOCK) else 'absent'})")
+    mode = os.environ.get("PEERBRIDGE_CODEX_TRANSPORT") or ("unix" if hasattr(_s, "AF_UNIX") and os.path.exists(cxrpc.CONTROL_SOCK) else "proxy")
+    row("codex transport", mode)
+    try:
+        rpc = cxrpc.CodexRPC(client_name="pb-doctor", version="0.2.1")
+        n = len(rpc.call("thread/loaded/list", {}).get("data", []))
+        row("daemon rpc", f"ok, {n} loaded thread(s)")
+        rpc.close()
+    except Exception as e:
+        row("daemon rpc", f"FAIL: {e}")
+    row("cc sessions dir", f"{ccpeer.SESSIONS_DIR} ({'present' if os.path.isdir(ccpeer.SESSIONS_DIR) else 'absent'})")
+    row("cc socks dir", ccpeer.socks_dir())
+    recs = ccpeer.records()
+    row("cc peers", f"{len(recs)} live ({sum(1 for r in recs if r.get('entrypoint') == 'codex')} codex)")
+    p = policy.load()
+    row("policy", f"expose={p.get('expose')} off={p.get('off')} threads={len(p.get('threads') or [])} cwds={len(p.get('cwds') or [])}")
+    try:
+        r = ctl({"cmd": "ping"}, 3)
+    except Sandboxed:
+        r = "sandboxed"
+    if r == "sandboxed":
+        row("hub", "socket blocked by sandbox (pb send uses the output channel)")
+    elif r:
+        row("hub", f"up pid={r.get('pid')} v={r.get('version')} codex={'connected' if r.get('codex') else 'NOT connected'} bridged={len(r.get('threads') or [])}")
+    else:
+        row("hub", "NOT running (pb ensure)")
+    tid = os.environ.get("CODEX_THREAD_ID")
+    row("this codex thread", tid or "- (not inside Codex)")
+    print("\n".join(o.encode("ascii", "replace").decode() for o in out))
+
+
 def cmd_policy(args):
     print(json.dumps(policy.load(), indent=1))
 
@@ -314,7 +370,7 @@ def _main():
         return
     cmds = {"list": cmd_list, "ls": cmd_list, "send": cmd_send, "whoami": cmd_whoami, "name": cmd_name,
             "ensure": lambda a: ensure(quiet=True) if "--quiet" in a else print(json.dumps(ensure(), indent=1)), "status": cmd_status, "stop": cmd_stop,
-            "policy": cmd_policy, "expose": cmd_expose, "hide": lambda a: cmd_expose(a, hide=True),
+            "policy": cmd_policy, "doctor": cmd_doctor, "expose": cmd_expose, "hide": lambda a: cmd_expose(a, hide=True),
             "off": cmd_off, "on": lambda a: cmd_off(a, off=False)}
     if a[0] not in cmds:
         die(f"unknown command {a[0]}\n{__doc__}")
