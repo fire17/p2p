@@ -100,6 +100,13 @@ function Clean([string]$s) {
 }
 
 # ---------- run p2p (Process API: UTF-8 decode, separate stderr, hard timeout) ----------
+# p2p.cmd is cmd.exe -> node: Process.Kill() ends only cmd.exe, and an orphaned node "tunnel recv" could later move
+# the cursor past a message nobody prints. Kill the whole tree (taskkill /T works on PS 5.1).
+function Stop-Tree($p) {
+  if ($env:OS -eq 'Windows_NT') { try { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } catch { } }
+  try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+  try { [void]$p.WaitForExit(5000) } catch { }
+}
 function Invoke-P2P([string[]]$argList, [int]$timeoutSec) {
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $P2P
@@ -114,7 +121,7 @@ function Invoke-P2P([string[]]$argList, [int]$timeoutSec) {
   $psi.CreateNoWindow = $true
   $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
   $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
-  $r = @{ Code = -1; Out = @(); Err = '' }
+  $r = @{ Code = -1; Out = @(); Err = ''; Killed = $false }
   try {
     $p = [System.Diagnostics.Process]::Start($psi)
   } catch {
@@ -124,7 +131,8 @@ function Invoke-P2P([string[]]$argList, [int]$timeoutSec) {
   $outTask = $p.StandardOutput.ReadToEndAsync()
   $errTask = $p.StandardError.ReadToEndAsync()
   if (-not $p.WaitForExit($timeoutSec * 1000)) {
-    try { $p.Kill() } catch { }
+    Stop-Tree $p
+    $r.Killed = $true
     $r.Err = 'p2p did not return within ' + $timeoutSec + 's (killed)'
     return $r
   }
@@ -246,6 +254,48 @@ function Print-Message($row) {
   if ($id) { Remember $id }
 }
 
+# ---------- catch-up after a killed recv ----------
+# recv prints its rows, then moves cursor.json; a recv killed in between consumed rows whose output nobody read.
+# Re-read the mailbox (bin/p2p-tunnel.js files(): <tunnel>\<name>\<current.json id>\inbox.jsonl) from the cursor
+# saved before that recv and print every row; Print-Message skips ids already printed (seen.txt), so nothing doubles.
+function Get-MailDir([string]$n) {
+  if (-not $n) { return '' }
+  try {
+    $id = [string](Get-Field ([IO.File]::ReadAllText((Join-Path (Join-Path $TunnelRoot $n) 'current.json')) | ConvertFrom-Json) 'id')
+    if ($id -match '^[a-f0-9]{32}$') { return (Join-Path (Join-Path $TunnelRoot $n) $id) }
+  } catch { }
+  return ''
+}
+function Get-Cursor([string]$dir) {
+  if (-not $dir) { return -1 }
+  $f = Join-Path $dir 'cursor.json'
+  if (-not (Test-Path -LiteralPath $f)) { return 0 }                 # no cursor yet: recv starts at 0
+  try { $o = Get-Field ([IO.File]::ReadAllText($f) | ConvertFrom-Json) 'offset'; if ($null -ne $o) { return [long]$o } } catch { }
+  return -1                                                          # unreadable right now: skip the catch-up
+}
+function Catch-Up([string]$dir, [long]$from) {
+  if (-not $dir -or $from -lt 0) { return }
+  try {
+    $fs = New-Object IO.FileStream((Join-Path $dir 'inbox.jsonl'), [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+      if ($from -ge $fs.Length) { return }
+      [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
+      $buf = New-Object byte[] ([int][Math]::Min(8MB, $fs.Length - $from))   # = readRows' 8 MiB page
+      $got = 0
+      while ($got -lt $buf.Length) { $k = $fs.Read($buf, $got, $buf.Length - $got); if ($k -le 0) { break }; $got += $k }
+    } finally { $fs.Dispose() }
+    if ($got -le 0) { return }
+    $end = [Array]::LastIndexOf($buf, [byte]10, $got - 1)              # whole rows only, as readRows
+    if ($end -lt 0) { return }
+    foreach ($line in ((New-Object System.Text.UTF8Encoding($false)).GetString($buf, 0, $end) -split "`r?`n")) {
+      if (-not $line.Trim()) { continue }
+      $row = $null
+      try { $row = $line | ConvertFrom-Json } catch { $row = $null }
+      if ($null -ne $row) { Print-Message $row }
+    }
+  } catch { }
+}
+
 # ---------- arm ----------
 if (-not (Test-Path -LiteralPath $P2P)) {
   Ear ('WARN p2p launcher not found at ' + $P2P + ' - the owner must run the join line first. Retrying.')
@@ -278,7 +328,10 @@ while ($true) {
     Ear ('SESSION found ' + (Short $Session 17))
   }
 
+  $mail = Get-MailDir $Session
+  $cur0 = Get-Cursor $mail
   $r = Invoke-P2P @('tunnel', 'recv', '--name', $Session, '--wait', [string]$Wait) ($Wait + 45)
+  if ($r.Killed) { Catch-Up $mail $cur0 }
   $problem = ''
   if ($r.Code -eq 0) {
     foreach ($line in $r.Out) {

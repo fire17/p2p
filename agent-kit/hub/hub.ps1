@@ -20,7 +20,7 @@ param(
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch {}
 $Utf8 = New-Object Text.UTF8Encoding($false)
-$Stale = 45; $Forget = 86400
+$Stale = 45; $Forget = 86400; $ReplaceTries = 20   # = hub.py REPLACE_TRIES
 if (-not $Root) { $Root = if ($env:AGENT_HUB) { $env:AGENT_HUB } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.agent-hub' } }
 $Agents = Join-Path $Root 'agents'
 [void][IO.Directory]::CreateDirectory($Agents)
@@ -40,7 +40,19 @@ function Write-Atomic([string]$path, $obj) {
   $dir = Split-Path $path -Parent; [void][IO.Directory]::CreateDirectory($dir)
   $tmp = Join-Path $dir ('.tmp-' + [Guid]::NewGuid().ToString('N'))
   [IO.File]::WriteAllText($tmp, ($obj | ConvertTo-Json -Compress -Depth 4), $Utf8)
-  Move-Item -LiteralPath $tmp -Destination $path -Force
+  # Not Move-Item -Force: on PS 5.1 that deletes the target, then renames (readers see it missing), and the delete
+  # fails while a reader (hub.py roster() over drvfs, another ear) has the file open. Replace it in place and retry
+  # those sharing violations for ~1 s, then clean up, as hub.py write_atomic does. ([NullString]: PS turns $null into ''.)
+  for ($i = 1; ; $i++) {
+    try {
+      if ([IO.File]::Exists($path)) { [IO.File]::Replace($tmp, $path, [NullString]::Value) } else { [IO.File]::Move($tmp, $path) }
+      return
+    } catch {
+      $e = $_; $c = Win32-Code $e   # 5/32: open elsewhere; 2: target just removed; 80/183: target just created
+      if ($i -ge $ReplaceTries -or @(2, 5, 32, 80, 183, 1175) -notcontains $c) { try { [IO.File]::Delete($tmp) } catch {}; throw $e }
+      Start-Sleep -Milliseconds 50
+    }
+  }
 }
 function Read-Json([string]$path) { try { [IO.File]::ReadAllText($path, $Utf8) | ConvertFrom-Json } catch { $null } }
 function Heartbeat([string]$me, [double]$started) {
@@ -150,18 +162,21 @@ switch ($Verb) {
     $last = Now
     try {
       while ($true) {
-        Claim $me
-        if ((Now) - $last -ge $Every) {
-          Heartbeat $me $started; $last = Now
-          $now = @{}; foreach ($r in @(Roster)) { $now[$r.name] = $r }
-          foreach ($n in ($now.Keys | Sort-Object)) {
-            if ($n -eq $me) { continue }
-            if ($now[$n].state -eq 'up' -and $seen[$n] -ne 'up') { "JOIN $(One $n 64) ($(One $now[$n].machine 128) $(One $now[$n].harness 128))" }
-            if ($now[$n].state -ne 'up' -and $seen[$n] -eq 'up') { "LEAVE $n ($($now[$n].state))" }
+        # One transient IO error (a file held open past the retries) must not end the ear and drop its presence.
+        try {
+          Claim $me
+          if ((Now) - $last -ge $Every) {
+            $last = Now; Heartbeat $me $started
+            $now = @{}; foreach ($r in @(Roster)) { $now[$r.name] = $r }
+            foreach ($n in ($now.Keys | Sort-Object)) {
+              if ($n -eq $me) { continue }
+              if ($now[$n].state -eq 'up' -and $seen[$n] -ne 'up') { "JOIN $(One $n 64) ($(One $now[$n].machine 128) $(One $now[$n].harness 128))" }
+              if ($now[$n].state -ne 'up' -and $seen[$n] -eq 'up') { "LEAVE $n ($($now[$n].state))" }
+            }
+            foreach ($n in @($seen.Keys)) { if (-not $now.ContainsKey($n) -and $n -ne $me -and $seen[$n] -eq 'up') { "LEAVE $n (bye)" } }
+            $seen = @{}; foreach ($k in $now.Keys) { $seen[$k] = $now[$k].state }
           }
-          foreach ($n in @($seen.Keys)) { if (-not $now.ContainsKey($n) -and $n -ne $me -and $seen[$n] -eq 'up') { "LEAVE $n (bye)" } }
-          $seen = @{}; foreach ($k in $now.Keys) { $seen[$k] = $now[$k].state }
-        }
+        } catch { Write-Warning "ear: $($_.Exception.Message) (still listening)" }
         Start-Sleep -Seconds 1
       }
     } finally { Remove-Item -LiteralPath (Join-Path $Agents "$me.json") -ErrorAction SilentlyContinue }

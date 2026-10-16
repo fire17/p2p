@@ -176,7 +176,16 @@ function Log-Line([string]$link, [string]$s) {
   try {
     [void][IO.Directory]::CreateDirectory($LogDir)
     $f = Join-Path $LogDir ($link + '.keeper.log')
-    if ((Test-Path -LiteralPath $f) -and (Get-Item -LiteralPath $f).Length -gt 2MB) { Move-Item -LiteralPath $f -Destination ($f + '.1') -Force }
+    # Rotate to <link>.keeper.prev.log (the name sentinel/ledger.py treats as rotation, not a log_reset; mtime set so it
+    # counts as fresh). A reader holding the file can block the rename: then keep appending and retry on the next line.
+    if ((Test-Path -LiteralPath $f) -and (Get-Item -LiteralPath $f).Length -gt 2MB) {
+      $prev = Join-Path $LogDir ($link + '.keeper.prev.log')
+      try { Move-Item -LiteralPath $f -Destination $prev -Force; [IO.File]::SetLastWriteTimeUtc($prev, [DateTime]::UtcNow); $script:KeeperRotateNoted = $false }
+      catch {   # note it once per stuck stretch, not on every line (StrictMode: the flag may not exist yet)
+        if (-not (Get-Variable -Scope Script -Name KeeperRotateNoted -ValueOnly -ErrorAction SilentlyContinue)) {
+          $script:KeeperRotateNoted = $true; $line += "  (log rotation postponed: $($_.Exception.Message))" }
+      }
+    }
     # Another process (e.g. a WSL tail on /mnt/c) can hold the file for a moment: retry, then say so on stderr.
     for ($i = 0; ; $i++) {
       try { [IO.File]::AppendAllText($f, $line + [Environment]::NewLine, $Utf8); break }

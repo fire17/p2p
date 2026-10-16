@@ -11,7 +11,8 @@
   (an optional "G1 " envelope prefix is accepted; the G1 verbs NOTE | FILE | RETEST are accepted too).
 
   Secrets: the text is scanned for token-like strings (API keys, GitHub tokens, bearer
-  tokens, JWTs, private keys, password=/token= values). With -Redact they are masked as
+  tokens, JWTs, private keys, password=/token= values incl. JSON "token": "...", the
+  26-character mesh join KEY). With -Redact they are masked as
   *** before sending (and your user-profile path becomes ~). Without -Redact the send is
   REFUSED if anything token-like is found - nothing is sent.
 
@@ -91,7 +92,10 @@ $Rules = @(
   @{ re = '\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}'; rep = '***JWT***' },
   @{ re = '(?i)\b(bearer)\s+[A-Za-z0-9._~+/=\-]{12,}'; rep = '$1 ***' },
   @{ re = '(?i)\b(authorization\s*:\s*)\S.*'; rep = '$1***' },
-  @{ re = '(?i)((?:password|passwd|pwd|secret|client_secret|token|access_token|refresh_token|api[_-]?key|apikey|auth[_-]?token)\s*[:=]\s*)("[^"]*"|''[^'']*''|[^\s,;&]+)'; rep = '$1***' },
+  # The optional quote after the name catches JSON ("token": "...", "peerToken":"..."); no \b, so peerToken matches.
+  @{ re = '(?i)((?:password|passwd|pwd|secret|client_secret|token|access_token|refresh_token|api[_-]?key|apikey|auth[_-]?token|private[_-]?key)["'']?\s*[:=]\s*)("[^"]*"|''[^'']*''|[^\s,;&]+)'; rep = '$1***' },
+  # mesh-setup's 26-character join KEY (its own check: ^[0-9A-Z]{26}$); whoever holds it can take a mesh slot.
+  @{ re = '(?<![0-9A-Za-z])[0-9A-Z]{26}(?![0-9A-Za-z])'; rep = '***KEY***' },
   @{ re = '(?i)(://[^/\s:@]+:)[^@\s/]+@'; rep = '$1***@' }
 )
 $hits = 0
@@ -113,6 +117,12 @@ if ($Utf8.GetByteCount($body) -gt 1048576) { Die 'message exceeds 1 MiB (p2p lim
 if ($DryRun) { [Console]::Out.WriteLine($body); exit 0 }
 
 # ---------- run p2p ----------
+# p2p.cmd is cmd.exe -> node: Process.Kill() ends only cmd.exe and leaves node running. Kill the whole tree.
+function Stop-Tree($p) {
+  if ($env:OS -eq 'Windows_NT') { try { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } catch { } }
+  try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+  try { [void]$p.WaitForExit(5000) } catch { }
+}
 function Invoke-P2P([string[]]$argList, [int]$timeoutSec) {
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $P2P
@@ -129,7 +139,12 @@ function Invoke-P2P([string[]]$argList, [int]$timeoutSec) {
   $r = @{ Code = -1; Out = @(); Err = '' }
   try { $p = [System.Diagnostics.Process]::Start($psi) } catch { $r.Err = 'cannot start ' + $P2P + ': ' + $_.Exception.Message; return $r }
   $ot = $p.StandardOutput.ReadToEndAsync(); $et = $p.StandardError.ReadToEndAsync()
-  if (-not $p.WaitForExit($timeoutSec * 1000)) { try { $p.Kill() } catch { }; $r.Err = 'p2p timed out (killed)'; return $r }
+  if (-not $p.WaitForExit($timeoutSec * 1000)) {
+    Stop-Tree $p; $r.Err = 'p2p timed out (killed)'
+    # Keep what it printed before the kill: a {"queued":true} line means the message is out and must not be re-sent.
+    try { if ($ot.Wait(5000)) { $r.Out = @($ot.Result -split "`r?`n" | Where-Object { $_.Trim() -ne '' }) } } catch { }
+    return $r
+  }
   $p.WaitForExit()
   $o = ''; $e = ''
   try { if ($ot.Wait(5000)) { $o = $ot.Result } } catch { }
@@ -180,7 +195,7 @@ try {
     $code = $r.Code
     if ($code -eq 0) { Say ('DELIVERED id=' + $queuedId); break }
     if ($queuedId) {
-      if ($code -eq 4) { Say ('QUEUED id=' + $queuedId + ' - no acknowledgment within ' + $Wait + 's (it may still arrive; do not resend blindly)') }
+      if ($code -eq 4 -or $code -lt 0) { $code = 4; Say ('QUEUED id=' + $queuedId + ' - no acknowledgment within ' + $Wait + 's (it may still arrive; do not resend blindly)') }
       else { Say ('FAILED id=' + $queuedId + ' delivery error: ' + (Field $ack 'error') + ' ' + $r.Err) }
       break
     }
