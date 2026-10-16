@@ -10,13 +10,17 @@ mkdir -p "$T/fakepy"
 pass=0 fail=0
 ok() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "PASS $2"; else fail=$((fail+1)); echo "FAIL $2"; fi; }
 
-# ---- fake ccpeer: every live peer in $FAKE_PEERS; send_to logs {to, mode, text} per frame to $FAKE_CCPEER_LOG
+# ---- fake ccpeer: every live peer in $FAKE_PEERS; send_to logs {to, mode, text} per frame to $FAKE_CCPEER_LOG.
+# A peer named codex-* is a Codex record: send_to then writes peerbridge's inbound event to $FAKE_PB_HOME/events.jsonl
+# as $FAKE_INJECT says (ok | fail | policy | silent).
 cat > "$T/fakepy/ccpeer.py" <<'EOF'
-import json, os
+import json, os, uuid
 _last = {}
+STATE_DIR = os.environ.get("FAKE_PB_HOME", "/nonexistent")
 def records():
-    return [{"name": n, "ref": "abcdef123456", "sessionId": "sid-" + n, "address": "uds:/x/" + n,
-             "messagingSocketPath": "/x/" + n, "pid": 1} for n in os.environ.get("FAKE_PEERS", "").split(",") if n]
+    return [dict({"name": n, "ref": "abcdef123456", "sessionId": "sid-" + n, "address": "uds:/x/" + n,
+                  "messagingSocketPath": "/x/" + n, "pid": 1}, **({"harness": "codex"} if n.startswith("codex-") else {}))
+            for n in os.environ.get("FAKE_PEERS", "").split(",") if n]
 def resolve(to, recs=None):
     return [r for r in (records() if recs is None else recs) if r["name"] == to or r["sessionId"] == to]
 def envelope(text, frm, from_name, from_mode=None):
@@ -25,13 +29,22 @@ def envelope(text, frm, from_name, from_mode=None):
     return '<cross-session-message from="%s" from-name="%s" from-mode="%s">\n%s\n</cross-session-message>' % (
         frm, from_name, mode, text)
 def user_frame(frm, env, session_id=None, msg_id=None):
-    return {"type": "user", "from": frm, "session_id": session_id, "message": {"role": "user", "content": env}}
+    return {"type": "user", "from": frm, "session_id": session_id, "msg_id": msg_id or str(uuid.uuid4()),
+            "message": {"role": "user", "content": env}}
 def send_to(rec, frames):
     with open(os.environ["FAKE_CCPEER_LOG"], "a") as f:
         for fr in frames:
             env = fr["message"]["content"]
             mode = env.split('from-mode="', 1)[1].split('"', 1)[0] if 'from-mode="' in env else "none"
             f.write(json.dumps({"to": rec["name"], "mode": mode, "text": env}) + "\n")
+    how = os.environ.get("FAKE_INJECT", "ok")
+    if rec.get("harness") == "codex" and how != "silent":
+        ok, detail = {"ok": (True, "injected: started a new Codex turn (t1)"),
+                      "fail": (None, "Codex app-server unreachable: [Errno 111] refused"),
+                      "policy": (False, "target is not exposed by its owner's local peerbridge policy")}[how]
+        with open(os.path.join(STATE_DIR, "events.jsonl"), "a") as f:
+            for fr in frames:
+                f.write(json.dumps({"ev": "inbound", "msgId": fr["msg_id"], "ok": ok, "detail": detail}) + "\n")
 EOF
 
 export FAKE_CCPEER_LOG="$T/sent.log" FAKE_PEERS="peer-yes,peer-no" PYTHONPATH="$T/fakepy" AGENT_HUB="$T/hub"
@@ -209,6 +222,113 @@ inject r-yes t-a "tok-dry" ""
 OUT=$(BR $MAPS --gate trusted --once --dry-run 2>&1)
 echo "$OUT" | grep -q "^DRY r-yes <- t-a .*from-mode=bypass (dry-run, not sent)" && [ "$(mode_of tok-dry)" = MISSING ]
 ok $? "dry-run: reports from-mode=bypass, sends nothing"
+
+# ---- 10b. +trusted routes (Codex without approvals): only trusted senders, whatever the gate and the adapter
+printf '{"senders":[{"name":"t-*","via":"local"}]}\n' | trust
+inject r-to t-a "tok-to-trusted" ""
+inject r-to x-a "tok-to-untrusted" "tunnel"
+OUT=$(BR --map r-to=peer:peer-no+trusted --gate trusted --once 2>&1)
+[ "$(mode_of tok-to-trusted)" = none ] && [ "$(mode_of tok-to-untrusted)" = MISSING ] \
+  && echo "$OUT" | grep -q "^REFUSE r-to <- x-a .*trusted senders only"; ok $? "+trusted peer: trusted sender delivered (no bypass claim), untrusted refused"
+echo "$OUT" | grep -q "^BRIDGE r-to=ccpeer+trusted " && echo "$OUT" | grep -q "^NOTE +trusted: r-to"; ok $? "+trusted peer: BRIDGE + NOTE lines name it"
+inject r-to x-a "tok-to-gnone-bad" "tunnel"
+inject r-to t-a "tok-to-gnone-trusted" ""
+OUT=$(BR --map r-to=peer:peer-no+trusted --gate none --once 2>&1)
+[ "$(mode_of tok-to-gnone-bad)" = MISSING ] && [ "$(mode_of tok-to-gnone-trusted)" = none ]; ok $? "+trusted peer: --gate none still refuses untrusted senders"
+inject r-to x-a "tok-to-all" "tunnel"
+OUT=$(BR --map r-to=peer:peer-no+trusted --gate all --once 2>&1)
+[ "$(mode_of tok-to-all)" = none ]; ok $? "+trusted peer: --gate all lets everyone through (still no bypass claim)"
+printf '{"agents":[{"name":"r-tc","adapter":"ccpeer","peer":"peer-no","trusted_only":true}]}\n' > "$T/to.json"
+inject r-tc x-a "tok-to-cfg" "tunnel"
+OUT=$(BR --config "$T/to.json" --gate trusted --once 2>&1)
+[ "$(mode_of tok-to-cfg)" = MISSING ] && echo "$OUT" | grep -q "^REFUSE r-tc"; ok $? "+trusted: \"trusted_only\": true in the config works"
+printf '{"agents":[{"name":"r-tc","adapter":"ccpeer","peer":"peer-no","trusted_only":"yes"}]}\n' > "$T/to2.json"
+BR --config "$T/to2.json" --once >/dev/null 2>&1; [ $? = 2 ]; ok $? "+trusted: non-boolean trusted_only refused"
+
+python3 "$HERE/hub.py" here t-a --harness test >/dev/null   # registered, so NOT CONFIRMED/DELIVERED notices reach it
+# ---- 10c. herdr routes: +trusted, the composer draft check, UNSURE sends, deferred stop
+cat > "$T/bin/herdr" <<'HEOF'
+#!/usr/bin/env python3
+import json, os, sys, time
+d = os.environ["FAKE_HERDR_DIR"]; a = sys.argv[3:]
+if a[:2] == ["agent", "get"]:
+    time.sleep(float(os.environ.get("FAKE_GET_SLEEP") or 0))
+    print(json.dumps({"result": {"agent": {"pane_id": a[2], "agent_status": "idle"}}}))
+elif a[:2] == ["agent", "read"]:
+    try: screen = open(os.path.join(d, a[2] + ".screen"), encoding="utf-8").read()
+    except OSError: screen = "> "
+    print(json.dumps({"result": {"text": screen}}))
+elif a[:2] == ["agent", "prompt"]:
+    with open(os.path.join(d, "typed.log"), "a") as f: f.write(json.dumps({"pane": a[2], "text": a[3]}) + "\n")
+    sys.exit(int(os.environ.get("FAKE_SEND_RC") or 0))
+else:
+    sys.exit(9)
+HEOF
+chmod +x "$T/bin/herdr"
+HB() { PATH="$T/bin:$PATH" FAKE_HERDR_DIR="$T/herdr" BR "$@"; }
+typed_has() { grep -q "$1" "$T/herdr/typed.log" 2>/dev/null; }
+inject r-ht x-a "tok-ht-untrusted" "tunnel"
+inject r-ht t-a "tok-ht-trusted" ""
+OUT=$(HB --map r-ht=herdr:main:p1+trusted --gate trusted --once 2>&1)
+! typed_has tok-ht-untrusted && typed_has tok-ht-trusted && echo "$OUT" | grep -q "^REFUSE r-ht <- x-a"; ok $? "+trusted herdr: untrusted sender never typed, trusted one typed"
+HB --map r-hb=herdr:main:p1+bypass+trusted --once >/dev/null 2>&1; [ $? = 2 ]; ok $? "+trusted herdr: +bypass on a herdr route still refused"
+
+printf '\342\224\200\342\224\200\n\342\200\272 half typed by the user\n  ? for shortcuts\n' > "$T/herdr/p2.screen"
+inject r-dr t-a "tok-draft" ""
+OUT=$(HB --map r-dr=herdr:main:p2 --once 2>&1); RC=$?
+echo "$OUT" | sed 's/^/    /'
+[ $RC = 1 ] && ! typed_has tok-draft && echo "$OUT" | grep -q "^HOLD r-dr .*draft is in the composer" \
+  && ls "$ROOT/inbox/r-dr" | grep -q '\.json$'; ok $? "draft: Codex composer holds text -> HOLD, nothing typed, message waits"
+! grep -rq "half typed" "$ROOT/inbox/t-a" 2>/dev/null && ! echo "$OUT" | grep -q "half typed"; ok $? "draft: the draft text is never logged nor sent to the sender"
+printf '\342\200\272 Ask Codex to do anything\n' > "$T/herdr/p2.screen"
+OUT=$(HB --map r-dr=herdr:main:p2 --once 2>&1)
+typed_has tok-draft; ok $? "draft: the Codex placeholder counts as an empty composer (typed)"
+printf '\342\224\202 > \342\224\202\n\342\224\202 > also typed \342\224\202\n' > "$T/herdr/p2.screen"
+inject r-dr t-a "tok-draft-cc" ""
+OUT=$(HB --map r-dr=herdr:main:p2 --once 2>&1)
+! typed_has tok-draft-cc && echo "$OUT" | grep -q "^HOLD r-dr .*draft"; ok $? "draft: Claude box composer row with text -> HOLD (last glyph row wins)"
+printf '{"herdr_session":"main","agents":[{"name":"r-dr","adapter":"herdr","pane":"p2","composer_check":false}]}\n' > "$T/nodraft.json"
+rm -f "$ROOT"/inbox/r-dr/.claims/* 2>/dev/null
+OUT=$(HB --config "$T/nodraft.json" --once 2>&1)
+typed_has tok-draft-cc; ok $? "draft: \"composer_check\": false skips the check"
+
+inject r-un t-a "tok-unsure" ""
+OUT=$(FAKE_SEND_RC=3 HB --map r-un=herdr:main:p1 --once 2>&1)
+echo "$OUT" | sed 's/^/    /'
+echo "$OUT" | grep -q "^UNSURE r-un <- t-a .*herdr send rc=3; it may have been typed; not retried" \
+  && ! ls "$ROOT/inbox/r-un" | grep -q '\.json$'; ok $? "unsure: send rc != 0 after herdr ran -> UNSURE, not put back"
+OUT=$(FAKE_SEND_RC=3 HB --map r-un=herdr:main:p1 --once 2>&1)
+[ "$(grep -c tok-unsure "$T/herdr/typed.log")" = 1 ]; ok $? "unsure: never typed a second time"
+grep -l "NOT CONFIRMED r-un .*It is not retried" "$ROOT"/inbox/t-a/*.json >/dev/null 2>&1; ok $? "unsure: sender gets one NOT CONFIRMED notice"
+
+inject r-sg t-a "tok-sigterm" ""
+PATH="$T/bin:$PATH" FAKE_HERDR_DIR="$T/herdr" FAKE_GET_SLEEP=2 python3 "$HERE/agent-bridge.py" --root "$ROOT" \
+  --map r-sg=herdr:main:p1 > "$T/sig.out" 2>&1 &
+BP=$!
+sleep 1; kill -TERM $BP; wait $BP; RC=$?
+sed 's/^/    /' "$T/sig.out"
+[ $RC = 0 ] && typed_has tok-sigterm && grep -q "^DELIVER r-sg <- t-a" "$T/sig.out"; ok $? "stop: SIGTERM mid-message waits for that message (delivered, not stranded in read/)"
+
+# ---- 10d. Codex peers: delivered only once peerbridge's events.jsonl shows the inject worked
+mkdir -p "$T/pb"; : > "$T/pb/events.jsonl"
+CX() { FAKE_PB_HOME="$T/pb" FAKE_PEERS="codex-a" BR --map r-cx=peer:codex-a --once 2>&1; }
+inject r-cx t-a "tok-cx-ok" ""
+OUT=$(FAKE_INJECT=ok CX)
+echo "$OUT" | grep -q "^DELIVER r-cx <- t-a .*via=ccpeer"; ok $? "codex: inject ok in events.jsonl -> DELIVER"
+inject r-cx t-a "tok-cx-fail" ""
+OUT=$(FAKE_INJECT=fail CX); RC=$?
+[ $RC = 1 ] && echo "$OUT" | grep -q "^HOLD r-cx .*codex inject failed: Codex app-server unreachable" \
+  && ls "$ROOT/inbox/r-cx" | grep -q '\.json$'; ok $? "codex: inject failed -> HOLD, message back in the inbox"
+grep -l "NOT DELIVERED r-cx .*retried" "$ROOT"/inbox/t-a/*.json >/dev/null 2>&1; ok $? "codex: sender gets a NOT DELIVERED notice"
+OUT=$(FAKE_INJECT=policy CX)
+echo "$OUT" | grep -q "^REFUSE r-cx .*codex inject refused" && ! ls "$ROOT/inbox/r-cx" | grep -q '\.json$'; ok $? "codex: policy refusal -> REFUSE (not retried)"
+inject r-cx t-a "tok-cx-silent" ""
+OUT=$(FAKE_INJECT=silent CX)
+echo "$OUT" | grep -q "^UNSURE r-cx .*no inject within 10 s" && ! ls "$ROOT/inbox/r-cx" | grep -q '\.json$'; ok $? "codex: no inject event -> UNSURE, not resent"
+rm -f "$T/pb/events.jsonl"
+inject r-cx t-a "tok-cx-noevents" ""
+OUT=$(FAKE_INJECT=silent CX)
+echo "$OUT" | grep -q "^DELIVER r-cx"; ok $? "codex: no events.jsonl at all -> delivered as before (nothing to confirm with)"
 
 # ---- 11. source hygiene
 python3 -c "import sys; sys.exit(0 if all(b < 128 for f in sys.argv[1:] for b in open(f,'rb').read()) else 1)" \
