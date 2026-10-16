@@ -10,7 +10,7 @@ stops nothing, runs nothing it reads, reads no pane screens and no project files
   ledger.py show   [--out DIR] [--open]     the incidents so far, one line each
   ledger.py plan   [--out DIR] --minutes N --why TEXT
                                         a planned change (restart, deploy): for N minutes hits are only counted as
-                                        planned, never opened. Say it BEFORE you restart our own links.
+                                        planned, never opened (N <= 120). Say it BEFORE you restart our own links.
   ledger.py selftest                        offline test on made-up logs
 
 Out dir (default ~/.agent-sentinel): planned.json (windows from `plan`), incidents.jsonl (one line per NEW incident), state.json (offsets,
@@ -179,7 +179,11 @@ def watch(a):
         lg.new = []; lg.save(); time.sleep(a.every)
 
 
+PLAN_MAX_MIN = 120   # a planned window can never silence the ledger for longer
+
+
 def plan(a):
+    if not 0 < a.minutes <= PLAN_MAX_MIN: sys.exit(f"ledger: --minutes must be 1..{PLAN_MAX_MIN}")
     os.makedirs(a.out, exist_ok=True); pf, now = os.path.join(a.out, "planned.json"), time.time()
     try: cur = json.load(open(pf, encoding="utf-8"))
     except (OSError, ValueError): cur = []
@@ -280,6 +284,9 @@ def selftest():
     check(lg7.new == [] and lg7.st["planned_hits"].get("link_exit") == 1, "inside a planned window: counted, not opened")
     lg7.hit("link_exit", "k|1", "x", "k.keeper.log", time.time() + 700)
     check(len(lg7.new) == 1, "after the window: opens again")
+    try: plan(argparse.Namespace(out=o7, minutes=600, why="too long")); capped = False
+    except SystemExit: capped = True
+    check(capped, "a planned window longer than 120 min is refused")
     shutil.rmtree(d)
     print(f"{ok[0]} ok, {ok[1]} failed"); return 0 if ok[1] == 0 else 1
 
