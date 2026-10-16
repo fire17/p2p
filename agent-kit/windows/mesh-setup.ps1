@@ -27,6 +27,9 @@
                  remove exactly what this script added (all links, or just one)
     -Keep -Link name
                  the keeper loop itself (what the logon task runs)
+    -Restart -Link name
+                 restart one keeper safely: stop request, wait, start it again through its task
+                 (never Stop-ScheduledTask alone: it can leave the old keeper running)
 
   OPTIONS
     -MainName name     what the extra machines call the main PC (default: main). On the MAIN PC it
@@ -68,6 +71,7 @@ param(
   [switch]$Status,
   [switch]$Uninstall,
   [switch]$Keep,
+  [switch]$Restart,
   [string]$Link = '',
   [ValidateSet('Task', 'Startup', 'None')][string]$Autostart = 'Task',
   [string]$P2P = '',
@@ -615,8 +619,29 @@ function Run-Keeper {
   }
 }
 
+# Restart one link's keeper the safe way: ask it to stop (it stops its hub link and says bye), then start it again
+# through its autostart. Stop-ScheduledTask alone kills the conhost wrapper but can leave the keeper's powershell
+# running, and the next start then exits at once ("already running").
+function Restart-Keeper([string]$name) {
+  $cfg = Load-Config
+  if (-not $cfg.links.Contains($name)) { throw "no link '$name' in $ConfigPath" }
+  Stop-Keeper $name
+  $pidFile = Join-Path $RunDir ($name + '.pid')
+  if ($DryRun) { Plan "start the keeper again: Task $TaskPath`AgentMesh-$name, else Startup\AgentMesh-$name.cmd"; return }
+  if (Test-Path -LiteralPath $pidFile) { throw "keeper $name is still running after the stop request; not starting a second one" }
+  $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName ('AgentMesh-' + $name) -ErrorAction SilentlyContinue
+  $su = Get-StartupFile $name
+  if ($t) { Start-ScheduledTask -TaskPath $TaskPath -TaskName ('AgentMesh-' + $name); $how = 'task' }
+  elseif (Test-Path -LiteralPath $su) { Start-Process -FilePath $su -WindowStyle Hidden; $how = 'startup file' }
+  else { throw "no autostart for $name; start it with -Keep -Link $name" }
+  $end = [DateTime]::UtcNow.AddSeconds(20)
+  while (-not (Test-Path -LiteralPath $pidFile) -and [DateTime]::UtcNow -lt $end) { Start-Sleep -Milliseconds 500 }
+  if (Test-Path -LiteralPath $pidFile) { Say "  keeper $name started again ($how), pid $([IO.File]::ReadAllText($pidFile).Trim())" }
+  else { Say "  keeper $name did not write its pid file within 20 s; see $(Join-Path $LogDir ($name + '.keeper.log'))" }
+}
+
 # ------------------------------------------------------------------ dispatch
-$modes = @(@(@($Machines).Count -gt 0), [bool]$Join, [bool]$Status, [bool]$Uninstall, [bool]$Keep) | Where-Object { $_ }
+$modes = @(@(@($Machines).Count -gt 0), [bool]$Join, [bool]$Status, [bool]$Uninstall, [bool]$Keep, [bool]$Restart) | Where-Object { $_ }
 if (@($modes).Count -ne 1) {
   foreach ($h in (Get-Content -LiteralPath $PSCommandPath | Select-Object -Skip 1)) { if ($h -eq '#>') { break }; if ($h -notmatch '^\.[A-Z]+$') { Write-Host $h } }
   if (@($modes).Count -gt 1) { throw 'pick exactly one mode' }
@@ -628,3 +653,4 @@ elseif ($Join) { Setup-Member }
 elseif ($Status) { Show-Status }
 elseif ($Uninstall) { Remove-Links }
 elseif ($Keep) { if (-not $Link) { throw '-Keep needs -Link <name>' }; Run-Keeper }
+elseif ($Restart) { if (-not $Link) { throw '-Restart needs -Link <name>' }; Restart-Keeper $Link }
