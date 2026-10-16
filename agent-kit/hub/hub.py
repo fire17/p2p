@@ -707,9 +707,27 @@ class Uplink:
         return gid, os.path.join(d, "inbox.jsonl"), read_json(os.path.join(d, "state.json")) or {}
 
     def link_state(self, st):
-        beat = float(st.get("beat") or 0) / 1000.0     # p2p state.json beat is in ms; live() wants < 15 s
-        alive = bool(st) and not st.get("stopped") and not st.get("error") and time.time() - beat < 15
-        return "up" if alive and st.get("connected") else "down"
+        """up | down. A clear signal (state readable, beat fresh: connected or not, stopped, error) counts at once.
+        An unclear one (no mailbox, state.json unreadable mid-rewrite, beat late because the machine was busy) keeps
+        the last state for LINK_GRACE_S, so a busy moment is not a link drop. self.link_why says why it is down."""
+        now = time.time()
+        try: beat = float((st or {}).get("beat") or 0) / 1000.0     # p2p state.json beat is in ms
+        except (TypeError, ValueError): beat = 0.0
+        if not st: why = "no tunnel mailbox" if st is None else "state.json unreadable"
+        elif st.get("stopped") or st.get("error"): why = "tunnel stopped" if st.get("stopped") else "tunnel error"
+        elif now - beat >= 15: why = f"tunnel beat {int(now - beat)} s old"
+        else: why = "" if st.get("connected") else "tunnel not connected"
+        clear = bool(st) and now - beat < 15
+        last = getattr(self, "_link_last", "down")
+        if not why:
+            self._link_last, self._link_bad_since, self.link_why = "up", None, ""
+            return "up"
+        if not clear and last == "up":
+            since = getattr(self, "_link_bad_since", None) or now
+            self._link_bad_since = since
+            if now - since < LINK_GRACE_S: return "up"
+        self._link_last, self.link_why = "down", why
+        return "down"
 
     def p2p(self, *args, timeout=60):
         env = dict(os.environ, P2P_HOME=self.p2p_home) if not self.wsl_paths else dict(os.environ)
@@ -948,7 +966,7 @@ class Uplink:
             if rc == 0: self.last_roster, self.last_push = line, time.time(); out(f"UPLINK pushed {line}")
 
     def step(self):
-        gid, _, st = self.mailbox(); link = self.link_state(st) if gid else "down"
+        gid, _, st = self.mailbox(); link = self.link_state(st if gid else None)
         if gid and not self.check_peer(st): link = "peer-changed"
         if link != "peer-changed":
             for row, end in self.inbound():
@@ -1252,6 +1270,7 @@ def tunnel_args(a):
     cmd = shlex.split(a.p2p, posix=(os.name != "nt")) if a.p2p else default_p2p(interop)
     return home, cmd, interop
 
+LINK_GRACE_S = 20    # an unclear tunnel reading (unreadable state, late beat) keeps "up" this long before "down"
 STEP_FAILS_MAX = 5   # a link/uplink exits (code 1) only after this many failed steps in a row
 
 def run_bridge(hub, a, br, banner):
@@ -1273,7 +1292,9 @@ def run_bridge(hub, a, br, banner):
                 out(f"STEP ERROR {br.me} ({fails}/{STEP_FAILS_MAX}): {type(e).__name__}: {clean(str(e))[:160]}")
                 if fails >= STEP_FAILS_MAX: raise
                 time.sleep(min(30, a.poll * 2 ** fails)); continue
-            if link != last: out(f"LINK {br.me} {link.upper()}"); last = link
+            if link != last:
+                why = getattr(br, "link_why", "") if link != "up" else ""
+                out(f"LINK {br.me} {link.upper()} {iso()}" + (f" ({why})" if why else "")); last = link
             if a.once: return 0
             time.sleep(a.poll)
     except KeyboardInterrupt: pass
@@ -1409,6 +1430,7 @@ def selftest():
         guard_selftest(check, os.path.join(root, "guard-test"))
         matrix_selftest(check, os.path.join(root, "matrix-test"))
         step_selftest(check, os.path.join(root, "step-test"))
+        grace_selftest(check)
         replace_selftest(check, os.path.join(root, "replace-test"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -1434,6 +1456,21 @@ def replace_selftest(check, root):
         check(raised and read_json(p) == {"v": 1} and not left, "write_atomic: gives up after REPLACE_TRIES, old file kept, no temp left")
     finally:
         os.replace = real
+
+def grace_selftest(check):
+    """link_state: a clear 'not connected' is down at once; an unreadable state or a late beat only after LINK_GRACE_S."""
+    class L(Uplink):
+        def __init__(self): pass
+    lk, now = L(), time.time() * 1000
+    up = {"connected": True, "beat": now}
+    check(lk.link_state(up) == "up", "link_state: fresh connected beat is up")
+    check(lk.link_state({}) == "up" and lk.link_state(None) == "up", "link_state: one unreadable read keeps up (grace)")
+    check(lk.link_state({"connected": True, "beat": now - 17000}) == "up", "link_state: a late beat within the grace keeps up")
+    lk._link_bad_since = time.time() - LINK_GRACE_S - 1
+    check(lk.link_state({}) == "down" and lk.link_why == "state.json unreadable", "link_state: unclear past the grace is down, with why")
+    check(lk.link_state(up) == "up" and lk.link_why == "", "link_state: back up clears why")
+    check(lk.link_state({"connected": False, "beat": now}) == "down" and lk.link_why == "tunnel not connected",
+          "link_state: a clear 'not connected' is down at once")
 
 def step_selftest(check, root):
     """run_bridge: a failing step is logged and retried; only STEP_FAILS_MAX failures in a row end the link."""
