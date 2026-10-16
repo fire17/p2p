@@ -38,6 +38,14 @@ hub/test_agent_bridge.sh
 hub/test_bridge_gate.sh
 hub/test_matrix.sh
 hub/trusted.example.json
+windows/admin-runner/README.md
+windows/admin-runner/approve.ps1
+windows/admin-runner/common.ps1
+windows/admin-runner/install.ps1
+windows/admin-runner/request.ps1
+windows/admin-runner/runner.ps1
+windows/admin-runner/status.ps1
+windows/admin-runner/tests.ps1
 windows/mesh-setup.ps1
 windows/shai-ear.ps1
 windows/shai-send.ps1
