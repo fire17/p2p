@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # agent-bridge-start.sh - discover this PC's herdr agents and (re)start hub/agent-bridge.py for them, detached.
 #
-#   agent-bridge-start.sh --prefix lap [--session main] [--dry-run] [--wait 120]   one shot
-#   agent-bridge-start.sh --prefix lap [--session main] --watch 60                 keep the bridge matching the panes
+#   agent-bridge-start.sh --prefix lap [--session main] [--claude claude] [--dry-run] [--wait 120]   one shot
+#   agent-bridge-start.sh --prefix lap [--session main] [--claude claude] --watch 60                 keep it matching
 #
-# Routes (hub name -> route), discovered every time, never fixed ids. For each herdr pane labelled claude / rc / codex:
-#   <prefix>-claude, <prefix>-rc  peer:<label>, the Claude Code session named like the pane (`claude -n <label>`); it
+# Routes (hub name -> route), discovered every time, never fixed ids. For the herdr pane labelled codex and each pane
+# named in --claude (comma list, default "claude"; e.g. --claude claude,review for a second Claude pane):
+#   <prefix>-<label>  peer:<label>, the Claude Code session named like the pane (`claude -n <label>`); it
 #        must resolve to exactly one live session (ccpeer.resolve). +bypass only when that claude process really runs
 #        bypassPermissions (its /proc/<pid>/cmdline has --dangerously-skip-permissions or --permission-mode
 #        bypassPermissions); herdr reports no argv for claude, so /proc is read directly.
@@ -30,11 +31,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIT="${AGENT_KIT:-${SHAI_KIT:-$(dirname "$HERE")}}"
 DIR="${BRIDGE_DIR:-$HOME/.agent-bridge}"
-PREFIX=""; S="main"; DRY=0; WAIT=120; WATCH=0
+PREFIX=""; S="main"; DRY=0; WAIT=120; WATCH=0; CLAUDES="claude"
 while [ $# -gt 0 ]; do case "$1" in
-  --prefix) PREFIX="${2:?}"; shift 2 ;; --session) S="${2:?}"; shift 2 ;;
+  --prefix) PREFIX="${2:?}"; shift 2 ;; --session) S="${2:?}"; shift 2 ;; --claude) CLAUDES="${2:?}"; shift 2 ;;
   --dry-run) DRY=1; shift ;; --wait) WAIT="${2:?}"; shift 2 ;; --watch) WATCH="${2:?}"; shift 2 ;;
-  *) echo "usage: $0 --prefix NAME [--session S] [--dry-run] [--wait SEC | --watch SEC]" >&2; exit 2 ;; esac; done
+  *) echo "usage: $0 --prefix NAME [--session S] [--claude LABEL[,LABEL]] [--dry-run] [--wait SEC | --watch SEC]" >&2; exit 2 ;; esac; done
+case ",$CLAUDES," in *,codex,*|*[!A-Za-z0-9_,-]*|,,) echo "agent-bridge-start: --claude takes pane labels, e.g. claude or claude,review" >&2; exit 2 ;; esac
 [ -n "$PREFIX" ] || { echo "agent-bridge-start: --prefix is required (e.g. lap, desk)" >&2; exit 2; }
 [ "$WATCH" = 0 ] || [ "$DRY" = 0 ] || { echo "agent-bridge-start: --watch and --dry-run exclude each other" >&2; exit 2; }
 export PATH="$HOME/.local/bin:$PATH"
@@ -104,7 +106,7 @@ PY
 discover() {  # sets MAPS (array), TID (codex thread or ""), MISSING (array)
   MAPS=(); MISSING=(); TID=""
   local label pane pc pid cwd t
-  for label in claude rc; do
+  for label in ${CLAUDES//,/ }; do
     pane="$(pane_of $label)"; [ -n "$pane" ] || { MISSING+=("$label(no pane)"); continue; }
     peer_ok "$label" || { MISSING+=("$label(no unique live session)"); continue; }
     pc="$(proc_of "$pane" claude)"; pid="${pc%%$'\t'*}"

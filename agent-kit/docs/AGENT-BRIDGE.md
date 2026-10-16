@@ -135,14 +135,13 @@ the hub: `NOT DELIVERED <name> (id=<id>): <reason>`. Notices are never answered 
 
 ## 4. Example: a 6-pane herdr layout on two machines
 
-One herdr session per machine. Same six panes on each:
+One herdr session per machine. Same panes on each:
 
 | Pane | Runs | Hub name (desk / lap) | Delivery path |
 |---|---|---|---|
 | `agent` | the hub ear + adapter for this machine's names | none (not a target) | n/a |
 | `claude` | Claude Code | `desk-claude` / `lap-claude` | 2a native |
 | `codex` | Codex TUI, thread exposed with `pb expose --thread <id>` | `desk-codex` / `lap-codex` | 2b native |
-| `rc` | a second Claude Code session (remote-control use) | `desk-rc` / `lap-rc` | 2a native |
 | `who` | `hub.py who` on a refresh loop | none | n/a |
 | `shell` | plain shell for the owner | none | **never a target** |
 
@@ -156,8 +155,7 @@ Example `bridge.json` for `hub/agent-bridge.py` (object form; a list form with `
   "herdr_session": "work",
   "agents": {
     "desk-claude": {"harness": "claude", "peer": "desk-claude", "pane": "claude"},
-    "desk-codex":  {"harness": "codex",  "peer": "<codex thread id>", "pane": "codex"},
-    "desk-rc":     {"harness": "claude", "peer": "desk-rc",     "pane": "rc"}
+    "desk-codex":  {"harness": "codex",  "peer": "<codex thread id>", "pane": "codex"}
   }
 }
 ```
@@ -185,7 +183,7 @@ hub/agent-bridge-start.sh --prefix desk [--session main] [--dry-run] [--wait 120
 hub/agent-bridge-start.sh --prefix desk [--session main] --watch 60                 # keep matching the panes
 ```
 
-- `<prefix>-claude` / `<prefix>-rc` = the Claude Code session named like its herdr pane, only if exactly one live match. `+bypass` only when that claude process really runs bypassPermissions (read from `/proc/<pid>/cmdline`).
+- `<prefix>-claude` (and `<prefix>-<label>` for each extra pane in `--claude claude,<label>`) = the Claude Code session named like its herdr pane, only if exactly one live match. `+bypass` only when that claude process really runs bypassPermissions (read from `/proc/<pid>/cmdline`).
 - `<prefix>-codex` = the thread the managed Codex daemon holds open for the herdr pane labelled `codex` (same cwd, created after that codex process started, any originator). Several candidates: the one pb already exposes; still ambiguous: no codex route, logged, never a guess. It runs `pb expose --thread <id>` for it, and `pb hide` for the thread it exposed before when the thread changes. No thread yet (Codex creates one at the pane's first prompt): the route is `herdr:<session>:<pane>` (typed, idle + dialog guarded) until the thread appears.
 - One shot: missing peers are retried for `--wait` seconds, then it starts with what exists and logs what is missing.
 - `--watch SEC`: rediscovers every SEC seconds and restarts the bridge only when the map differs on two checks in a row (one failed lookup never drops a route), or at once when no bridge runs. Covers reboots, pane restarts and the lazy Codex thread. One watcher per `$BRIDGE_DIR` (flock). Use this one from your logon script.
@@ -243,7 +241,7 @@ A `tunnel` entry is added only with the owner's explicit approval, and every cha
 ## 6. Verify: the matrix
 
 ```
-python3 hub/hub.py matrix --names desk-claude,desk-codex,desk-rc --pairs     # every local pair, both ways
+python3 hub/hub.py matrix --names desk-claude,desk-codex --pairs     # every local pair, both ways
 python3 hub/hub.py matrix --names lap-claude@lap,lap-codex@lap               # from a throwaway sender
 ```
 
