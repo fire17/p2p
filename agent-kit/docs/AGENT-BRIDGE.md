@@ -176,6 +176,20 @@ by module name can pick up the wrong one.
 
 ---
 
+### 4a. Start at logon, routes found at start
+
+Fixed ids go stale: a restarted Codex pane gets a new thread id. `hub/agent-bridge-start.sh` (WSL/Linux, needs herdr, jq, pb, python3) finds the routes each time and (re)starts the bridge detached:
+
+```
+hub/agent-bridge-start.sh --prefix desk [--session main] [--dry-run] [--wait 120]
+```
+
+- `<prefix>-claude` = the Claude Code session named `claude` (+bypass), `<prefix>-rc` = the session named `rc`, each only if exactly one live match.
+- `<prefix>-codex` = the thread the managed Codex daemon holds open for the herdr pane labelled `codex` (originator codex-tui, same cwd, created after that codex process started). Several candidates: the one pb already exposes; still ambiguous: no codex route, logged, never a guess. It runs `pb expose --thread <id>` for it.
+- Missing peers are retried for `--wait` seconds, then it starts with what exists and logs what is missing.
+- Idempotent: a live bridge with the same routes is left alone. `--dry-run` prints the map and the command and changes nothing. Pid and log: `$BRIDGE_DIR` (default `~/.agent-bridge`).
+- Call it from the script that starts your herdr session, after the panes are up, so a logon brings the bridge back too.
+
 ## 5. Trust: `trusted.json` and `--gate`
 
 `--gate` decides when the bridge claims `from-mode="bypass"` (only ever into `+bypass` routes):

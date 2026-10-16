@@ -30,6 +30,7 @@ codex-bridge/xtest.py
 docs/AGENT-BRIDGE.md
 docs/MESH-THREATS.md
 docs/MESH.md
+hub/agent-bridge-start.sh
 hub/agent-bridge.py
 hub/hub.ps1
 hub/hub.py
