@@ -260,10 +260,18 @@ function Get-HubArgv($cfg, $l, [string]$verb) {
 function Start-HubChild([string[]]$argv, [string]$link) {
   [void][IO.Directory]::CreateDirectory($LogDir)
   $out = Join-Path $LogDir ($link + '.hub.log'); $err = Join-Path $LogDir ($link + '.hub.err.log')
-  # Each start truncates the logs: keep the previous run's as *.prev.log, so a link exit can be diagnosed.
+  # Each start truncates the logs: keep the last 5 runs as *.prev.log, *.prev.2.log .. *.prev.5.log (newest first),
+  # so a link exit can still be diagnosed after a few more restarts.
   foreach ($f in @($out, $err)) {
     if (Test-Path -LiteralPath $f) {
-      try { Move-Item -LiteralPath $f -Destination ($f -replace '\.log$', '.prev.log') -Force }
+      try {
+        $base = $f -replace '\.log$', ''
+        for ($i = 4; $i -ge 1; $i--) {
+          $from = if ($i -eq 1) { "$base.prev.log" } else { "$base.prev.$i.log" }
+          if (Test-Path -LiteralPath $from) { Move-Item -LiteralPath $from -Destination "$base.prev.$($i + 1).log" -Force }
+        }
+        Move-Item -LiteralPath $f -Destination "$base.prev.log" -Force
+      }
       catch { Log-Line $link "could not keep $f as .prev.log ($($_.Exception.Message)); it is overwritten" }
     }
   }

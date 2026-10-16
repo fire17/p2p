@@ -8,9 +8,12 @@ stops nothing, runs nothing it reads, reads no pane screens and no project files
                                         follow DIR/*.log (keeper, hub, hub.err, agent-bridge logs)
   ledger.py replay --logs DIR [--out DIR]   read every log once from the start, print the incidents, exit
   ledger.py show   [--out DIR] [--open]     the incidents so far, one line each
+  ledger.py plan   [--out DIR] --minutes N --why TEXT
+                                        a planned change (restart, deploy): for N minutes hits are only counted as
+                                        planned, never opened. Say it BEFORE you restart our own links.
   ledger.py selftest                        offline test on made-up logs
 
-Out dir (default ~/.agent-sentinel): incidents.jsonl (one line per NEW incident), state.json (offsets,
+Out dir (default ~/.agent-sentinel): planned.json (windows from `plan`), incidents.jsonl (one line per NEW incident), state.json (offsets,
 counters: a known fingerprint only bumps its counter, so a crash loop is one incident with a count).
 
 Incident: {ts_utc, mono, host, cls, fp, count, evidence, file, state:"open"}. Classes:
@@ -25,6 +28,8 @@ Incident: {ts_utc, mono, host, cls, fp, count, evidence, file, state:"open"}. Cl
   log_reset      a log got shorter and no .prev.log kept the old run             hard
   clock_step     wall clock moved > 5 s against the monotonic clock (watch only) hard
   deadline       a --deadline FILE was not touched for SEC seconds (watch only)  hard
+A link killed on purpose exits with code -1 and writes no error: that is a link_exit, never an err_empty.
+Rotated logs (*.prev.log, *.prev.N.log) are history, not followed.
 Soft classes open at 3 hits in 10 minutes. Any class closes after 20 minutes without a hit, so it can open again.
 """
 import argparse, calendar, glob, hashlib, json, os, re, socket, sys, tempfile, time
@@ -51,10 +56,15 @@ class Ledger:
         self.sf, self.inc = os.path.join(out, "state.json"), os.path.join(out, "incidents.jsonl")
         try: self.st = json.load(open(self.sf, encoding="utf-8"))
         except (OSError, ValueError): self.st = {}
-        self.st.setdefault("offsets", {}); self.st.setdefault("fps", {}); self.st.setdefault("hits", {})
+        for k in ("offsets", "fps", "hits", "planned_hits"): self.st.setdefault(k, {})
+        self.pf = os.path.join(out, "planned.json"); self.load_planned()
         self.pending_down = {}   # link -> (t, file, line): a DOWN waiting for its UP
         self.tb = {}             # file -> lines of a traceback in progress
         self.new = []
+
+    def load_planned(self):   # its own file: `plan` (another process) never races the watcher's state.json
+        try: self.planned = json.load(open(self.pf, encoding="utf-8"))
+        except (OSError, ValueError): self.planned = []
 
     def save(self):
         fd, tmp = tempfile.mkstemp(dir=self.out, prefix=".state.")
@@ -66,6 +76,8 @@ class Ledger:
 
     def hit(self, cls, key, evidence, path, t):
         fp = hashlib.sha1(f"{self.host}|{cls}|{key}".encode()).hexdigest()[:12]
+        if any(p["from"] <= t <= p["to"] for p in self.planned):   # inside a planned change: count only
+            self.st["planned_hits"][cls] = self.st["planned_hits"].get(cls, 0) + 1; return None
         if cls in SOFT:
             h = [x for x in self.st["hits"].get(fp, []) if t - x < SOFT_WIN] + [t]
             self.st["hits"][fp] = h
@@ -106,7 +118,7 @@ class Ledger:
             if code == "": self.hit("keeper_lint", link, line.strip(), path, t)
             elif code != "0":
                 self.hit("link_exit", f"{link}|{code}", line.strip(), path, t)
-                if self.err_empty(os.path.dirname(path), link): self.hit("err_empty", link, line.strip(), path, t)
+                if code != "-1" and self.err_empty(os.path.dirname(path), link): self.hit("err_empty", link, line.strip(), path, t)
         m = LINK_RE.search(line)
         if m:
             me, state = m.group(1), m.group(2)
@@ -126,7 +138,7 @@ class Ledger:
     def scan(self, logdir, from_start=False, now=None):
         now = time.time() if now is None else now
         for p in sorted(glob.glob(os.path.join(logdir, "*.log"))):
-            if p.endswith(".prev.log"): continue
+            if ".prev." in os.path.basename(p): continue
             try: size = os.path.getsize(p)
             except OSError: continue
             off = self.st["offsets"].get(p)
@@ -153,6 +165,7 @@ def watch(a):
     w0, m0 = time.time(), time.monotonic()
     print(f"{iso()} LEDGER watching {a.logs} every {a.every}s -> {lg.inc} (read-only)", flush=True)
     while True:
+        lg.load_planned()
         lg.scan(a.logs, from_start=a.from_start and first); first = False
         w1, m1 = time.time(), time.monotonic()
         step = (w1 - w0) - (m1 - m0)
@@ -164,6 +177,19 @@ def watch(a):
             if age > sec: lg.hit("deadline", f, f"{f} not touched for {age:.0f} s (limit {sec:.0f})", f, w1)
         for i in lg.new: print(f"{i['ts_utc']} INCIDENT {i['cls']} {i['fp']}: {i['evidence']}", flush=True)
         lg.new = []; lg.save(); time.sleep(a.every)
+
+
+def plan(a):
+    os.makedirs(a.out, exist_ok=True); pf, now = os.path.join(a.out, "planned.json"), time.time()
+    try: cur = json.load(open(pf, encoding="utf-8"))
+    except (OSError, ValueError): cur = []
+    cur = [p for p in cur if p["to"] > now - 86400] + [{"from": now, "to": now + a.minutes * 60, "why": a.why[:200]}]
+    fd, tmp = tempfile.mkstemp(dir=a.out, prefix=".planned.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(cur, f)
+    for i in range(20):
+        try: os.replace(tmp, pf); break
+        except PermissionError: time.sleep(0.05)
+    print(f"{iso()} PLANNED {a.minutes} min: {a.why}")
 
 
 def show(a):
@@ -239,6 +265,21 @@ def selftest():
     before = {p: os.path.getmtime(p) for p in glob.glob(os.path.join(logs, "*"))}
     Ledger(os.path.join(d, "out4"), host="t").scan(logs, from_start=True)
     check(before == {p: os.path.getmtime(p) for p in glob.glob(os.path.join(logs, "*"))}, "logs are never written")
+    # a link killed on purpose (code -1): link_exit, no err_empty
+    lg5 = Ledger(os.path.join(d, "out5"), host="t"); w("k5.keeper.log", "2026-10-16 12:00:00  hub link exited (code -1); restarting\n")
+    lg5.scan(logs, from_start=True); c5 = [i["cls"] for i in lg5.new if i["file"] == "k5.keeper.log"]
+    check(c5 == ["link_exit"], "code -1 = link_exit only, no err_empty")
+    # rotated history is not followed
+    w("k6.hub.prev.2.log", "2026-10-16 12:00:00  hub link exited (code 9); restarting\n")
+    lg6 = Ledger(os.path.join(d, "out6"), host="t"); lg6.scan(logs, from_start=True)
+    check(not any(i["file"].startswith("k6.") for i in lg6.new), "*.prev.N.log is history, not followed")
+    # planned window: hits inside are counted, not opened; after it, they open again
+    o7 = os.path.join(d, "out7"); lg7 = Ledger(o7, host="t"); lg7.save()
+    plan(argparse.Namespace(out=o7, minutes=10, why="test restart"))
+    lg7 = Ledger(o7, host="t"); lg7.hit("link_exit", "k|1", "x", "k.keeper.log", time.time())
+    check(lg7.new == [] and lg7.st["planned_hits"].get("link_exit") == 1, "inside a planned window: counted, not opened")
+    lg7.hit("link_exit", "k|1", "x", "k.keeper.log", time.time() + 700)
+    check(len(lg7.new) == 1, "after the window: opens again")
     shutil.rmtree(d)
     print(f"{ok[0]} ok, {ok[1]} failed"); return 0 if ok[1] == 0 else 1
 
@@ -253,10 +294,13 @@ def main():
             p.add_argument("--every", type=float, default=5); p.add_argument("--from-start", action="store_true")
             p.add_argument("--deadline", action="append", default=[], help="FILE=SEC")
     p = sp.add_parser("show"); p.add_argument("--out", default=default_out); p.add_argument("--open", action="store_true")
+    p = sp.add_parser("plan"); p.add_argument("--out", default=default_out)
+    p.add_argument("--minutes", type=float, required=True); p.add_argument("--why", required=True)
     sp.add_parser("selftest")
     a = ap.parse_args()
     if a.cmd == "selftest": return selftest()
     if a.cmd == "show": return show(a)
+    if a.cmd == "plan": return plan(a)
     if a.cmd == "replay":
         lg = Ledger(a.out); lg.scan(a.logs, from_start=True); lg.settle(time.time()); lg.save()
         for i in lg.new: print(f"{i['ts_utc']} {i['cls']:<11} {i['fp']} {i['evidence']}")
