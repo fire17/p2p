@@ -310,16 +310,23 @@ function Install-Autostart([string]$link, [string]$mode) {
   $psArgs = Get-KeeperArgs $link
   if ($mode -eq 'Task') {
     $line = Join-Args $psArgs
+    # Win11's default terminal (Windows Terminal) ignores -WindowStyle Hidden and leaves an empty window open.
+    # conhost.exe --headless (Windows 10 1903+) runs the keeper without any window.
+    $exe = 'powershell.exe'
+    $conhost = Join-Path ([string]$env:SystemRoot) 'System32\conhost.exe'
+    if ($OnWindows -and [Environment]::OSVersion.Version.Build -ge 18362 -and (Test-Path -LiteralPath $conhost)) {
+      $exe = $conhost; $line = '--headless powershell.exe ' + $line
+    }
     if ($DryRun) {
       Plan "register Scheduled Task $TaskPath$taskName (user $(Get-UserId), at logon, RunLevel Limited, no time limit, restart every 1 min on failure)"
-      Plan "  action: powershell.exe $line"
+      Plan "  action: $exe $line"
       Plan "  start it now: Start-ScheduledTask -TaskPath $TaskPath -TaskName $taskName"
       return @{ kind = 'task'; name = $taskName; path = $TaskPath }
     }
     $old = Get-ScheduledTask -TaskPath $TaskPath -TaskName $taskName -ErrorAction SilentlyContinue
     if ($old -and ([string]$old.Description) -ne $Marker) { throw "a task $TaskPath$taskName exists that this script did not add; not touching it" }
     $user = Get-UserId
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $line -WorkingDirectory $KitRoot
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $line -WorkingDirectory $KitRoot
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
