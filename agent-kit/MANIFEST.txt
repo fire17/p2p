@@ -38,6 +38,8 @@ hub/test_agent_bridge.sh
 hub/test_bridge_gate.sh
 hub/test_matrix.sh
 hub/trusted.example.json
+sentinel/README.md
+sentinel/ledger.py
 windows/admin-runner/README.md
 windows/admin-runner/approve.ps1
 windows/admin-runner/common.ps1
