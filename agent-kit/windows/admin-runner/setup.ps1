@@ -11,17 +11,17 @@ Running it elevated at the PC IS the owner's decision: policy.json can only be w
 #>
 param([switch]$Off)
 $ErrorActionPreference = 'Stop'
-$Commit = '725767736cec2e50a3aa81518b52560c21c367aa'
+$Commit = '5d421cdbf3147efa5542254b0a296f57e9d74345'
 $Base = "https://raw.githubusercontent.com/fire17/p2p/$Commit/agent-kit/windows/admin-runner"
 $Files = [ordered]@{
-  'README.md'        = 'dcff1630e7171ce08151988b3e04830a60c689b47058faf0d6bf0652760ca02c'
-  'approve.ps1'      = '74cb47d187503bb694f9df747ce6396ca4a107b02addf281f4faa8b5b2a46df7'
-  'common.ps1'       = '3ea506d47b5e731fcc0b3a713e6b85d09b0ae9ce1ecb0f25862442744f9ddd5a'
-  'install.ps1'      = '972c339090d0d2bc48e14f14d7c57cc02caa1c9f4942984da2fce84ec30823ab'
-  'request.ps1'      = '090f5a41d46898c1ae84070191bd724f74f5f363b4f226338345b8ece4c773d3'
-  'runner.ps1'       = '7af5104072766592baab692599d6834add3764661ac56c7410d9630588832411'
-  'status.ps1'       = 'a5d8b747417007b1cc80259ed0892113befffeb8447226b9cdd410ffca370b0e'
-  'tests.ps1'        = 'a3ec91dcdc28cc3cb117f3a441095266028acf55182da7e873945066bd1ba1be'
+  'README.md'        = '8eb9ad7cf85abb59d850827414205dc7a30ea7b02185eaca8f1f78240a92856e'
+  'approve.ps1'      = 'fc7361d682132b14aa95e0143af988e1f526e017c3429f216204e6a8e754e8ab'
+  'common.ps1'       = 'ac7ad1737db43321604655cea933fbce52825eff8d4cfc029956f5a6c24d0e30'
+  'install.ps1'      = 'cb65574fcecbc208be4b25438227900ce3e5b7d8f16c461930386961a7a51114'
+  'request.ps1'      = '64d9f3caea947d95b02f8217bae0d05d19237feb1cd782ec96b6ce6026af7071'
+  'runner.ps1'       = '7686f08366cd9d88e054da8fc3ddf75132f41b92e8958211644f7d68b1c76f07'
+  'status.ps1'       = '14a5712a66bf3ee98c43bb61be6ee7ecb34098c0f30e6d568928259694d18192'
+  'tests.ps1'        = '091e35ae0c20e288f7c6ed1648a3f9f9c306760a49628aec6ddb319784a37804'
   'test-vector.json' = 'd387b28cd545ba1448788e9ca75912845d0766e6e2ff658a74719ee372025149'
 }
 
