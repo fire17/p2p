@@ -116,6 +116,7 @@ Expect the machines to see each other again within about **5 minutes** of both b
 | Remove everything the script added | `... mesh-setup.ps1 -Uninstall` |
 | Run a keeper by hand (to watch it) | `... mesh-setup.ps1 -Keep -Link laptop` (Ctrl+C stops it) |
 | Logs | `%USERPROFILE%\.agent-mesh\logs\<link>.keeper.log` and `<link>.hub.log` (the previous link run: `<link>.hub.prev.log`, `<link>.hub.err.prev.log`) |
+| Watching those logs from WSL | `tail -F` on `/mnt/c/...` never fires for writes made by Windows processes (no inotify events on drvfs), and an open handle can make Windows writes or the `.prev.log` move fail. Poll the size instead (`stat -c %s` every few seconds, read only the new bytes), or use `tail ---disable-inotify -F`. |
 
 `-Uninstall` stops the keeper, removes its logon task (only a task this script created), stops the tunnel, and deletes `%USERPROFILE%\.agent-mesh`. It keeps your p2p keys and message history under `%USERPROFILE%\.p2p`, so a later setup gets the same keys. Delete those yourself if you want fresh keys.
 

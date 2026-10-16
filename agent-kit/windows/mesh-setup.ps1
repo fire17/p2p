@@ -173,8 +173,12 @@ function Log-Line([string]$link, [string]$s) {
     [void][IO.Directory]::CreateDirectory($LogDir)
     $f = Join-Path $LogDir ($link + '.keeper.log')
     if ((Test-Path -LiteralPath $f) -and (Get-Item -LiteralPath $f).Length -gt 2MB) { Move-Item -LiteralPath $f -Destination ($f + '.1') -Force }
-    [IO.File]::AppendAllText($f, $line + [Environment]::NewLine, $Utf8)
-  } catch {}
+    # Another process (e.g. a WSL tail on /mnt/c) can hold the file for a moment: retry, then say so on stderr.
+    for ($i = 0; ; $i++) {
+      try { [IO.File]::AppendAllText($f, $line + [Environment]::NewLine, $Utf8); break }
+      catch { if ($i -ge 4) { throw }; Start-Sleep -Milliseconds 200 }
+    }
+  } catch { [Console]::Error.WriteLine("keeper log write failed ($($_.Exception.Message)): $line") }
 }
 
 # ------------------------------------------------------------------ tools: p2p and python
