@@ -91,6 +91,7 @@ try {
       if ($atStr -notmatch $AA_AtPattern) { Refuse $id $sha8 $by 'signed mode: at must be yyyy-MM-ddTHH:mm:ssZ' $cmd $false; continue }
       if (-not (AA-VerifySig $pubXml (AA-SignedPayload $id $apSha $by $atStr) $sig)) { Refuse $id $sha8 $by 'signature invalid' $cmd $false; continue }
     } elseif ($cmdSha.Substring(0, 8) -ne $sha8) { Refuse $id $sha8 $by 'sha8 does not match the command' $cmd $false; continue }
+    elseif ($by -like 'self:*' -and -not (AA-SelfApproveOn $d)) { Refuse $id $sha8 $by 'self-approval is off (no owner policy.json)' $cmd $false; continue }
     try { $at = [DateTime]::Parse([string]$ap.at).ToUniversalTime(); $created = [DateTime]::Parse([string]$req.created).ToUniversalTime() }
     catch { Refuse $id $sha8 $by 'bad timestamps' $cmd $false; continue }
     if (($now - $at).TotalSeconds -gt $AA_ApprovalMaxAgeSec -or $at -gt $now.AddMinutes(1)) { Refuse $id $sha8 $by 'approval stale (>10 min) or in the future' $cmd $false; continue }

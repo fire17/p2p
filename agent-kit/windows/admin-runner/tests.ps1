@@ -58,6 +58,18 @@ try {
   Check (($a | ? { $_ -match "id=$id1 .* RAN status=ok exit=3" }).Count -eq 1 -and ($a | ? { $_ -match 'REFUSED' }).Count -ge 5) "audit.log: 1 RAN line for the run, a REFUSED line per refusal ($($a.Count) lines)"
   Check (-not @(Get-ChildItem $d.approved -File).Count) "approved\ is empty after the runner pass (nothing left to retry)"
 
+  # ================= SELF-APPROVE: only with the owner's policy.json (install.ps1 -SelfApprove)
+  $sb = (Get-Content $runs).Count
+  $p1 = Req $probe; $threw = $false
+  try { & (Join-Path $here 'approve.ps1') -Id $p1 -Sha8 (Sha8Of $p1) -By 'self:test-agent' -Root $T -NoStart | Out-Null } catch { $threw = $_.Exception.Message -match 'self-approval is off' }
+  Check $threw "self-approve: approve.ps1 refuses -By self:* without the owner's policy.json"
+  AA-WriteJson (Join-Path $d.approved "$p1.json") ([ordered]@{ id = $p1; sha8 = (Sha8Of $p1); by = 'self:test-agent'; at = (Get-Date).ToUniversalTime().ToString('o') })
+  $o = Runner; Check ((Get-Content $runs).Count -eq $sb -and ($o -match "REFUSED $p1 : self-approval is off")) "self-approve: runner refuses a hand-written self:* approval without policy.json"
+  AA-WriteJson (Join-Path $T 'policy.json') ([ordered]@{ self_approve = $true; set_by = 'test'; set_at = (Get-Date).ToUniversalTime().ToString('o'); note = 'test' })
+  $p2 = Req $probe; & (Join-Path $here 'approve.ps1') -Id $p2 -Sha8 (Sha8Of $p2) -By 'self:test-agent' -Root $T -NoStart | Out-Null
+  $o = Runner; Check ((Get-Content $runs).Count -eq $sb + 1 -and ($o -match "RAN $p2 status=ok")) "self-approve: with the owner's policy.json, a self-approved request runs once"
+  Remove-Item -LiteralPath (Join-Path $T 'policy.json')
+
   # ================= SIGNED MODE: <T>\bin\approver.pub.xml present -> every approval needs a valid signature
   [void][IO.Directory]::CreateDirectory((Join-Path $T 'bin'))
   $key = New-Object Security.Cryptography.RSACryptoServiceProvider(3072)

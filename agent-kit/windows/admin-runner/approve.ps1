@@ -52,6 +52,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Signed') {
 } else {
   if ($signedInstall) { throw 'this install requires signed approvals: use -ApprovalJson' }
   $req = Load-Request $Id
+  if ($By -like 'self:*' -and -not (AA-SelfApproveOn $d)) { throw 'self-approval is off: the owner enables it with install.ps1 -SelfApprove, elevated, on this PC' }
   if ($Sha8 -notmatch '^[0-9a-f]{8}$') { throw "sha8 must be 8 lower-case hex chars, got '$Sha8'" }
   if (-not $By.Trim()) { throw '-By (the approval reference) is required' }
   if ((AA-Sha256 $req.command).Substring(0, 8) -ne $Sha8) { throw "sha8 $Sha8 does not match request ${Id}: refusing to approve" }

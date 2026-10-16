@@ -42,6 +42,13 @@ function AA-ReadJson([string]$path) {
   Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+function AA-SelfApproveOn($d) {
+  # the owner's own elevated choice (install.ps1 -SelfApprove), in an admin-write file the user can only read
+  $p = Join-Path $d.root 'policy.json'
+  if (-not (Test-Path -LiteralPath $p)) { return $false }
+  try { return [bool](AA-ReadJson $p).self_approve } catch { return $false }
+}
+
 function AA-CheckId([string]$id) {
   if ($id -notmatch $AA_IdPattern) { throw "bad id '$id' (expected yyyyMMdd-HHmmss-xxxxxx)" }
 }

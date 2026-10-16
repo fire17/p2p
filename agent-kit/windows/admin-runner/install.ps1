@@ -13,6 +13,8 @@ So a user-level process can queue and approve, but cannot change what runs eleva
 param(
   [string]$Root,
   [string]$ApproverKey,      # path to the approver's PUBLIC key (RSA XML); installs signed mode (no unsigned fallback)
+  [switch]$SelfApprove,       # the owner's temporary choice: agents approve their own requests (writes policy.json)
+  [string]$Note,
   [switch]$Uninstall,
   [switch]$WhatIf
 )
@@ -32,7 +34,10 @@ function Run([string]$what, [scriptblock]$do) {
   if ($WhatIf) { "WHATIF $what" } else { & $do; "done   $what" }
 }
 
+if ($SelfApprove -and $ApproverKey) { throw '-SelfApprove and -ApproverKey exclude each other' }
+$policy = Join-Path $d.root 'policy.json'
 if ($Uninstall) {
+  Run "remove $policy" { if (Test-Path -LiteralPath $policy) { Remove-Item -LiteralPath $policy -Force } }
   Run "unregister task $TaskPath$TaskName" { if (Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Confirm:$false } }
   Run "remove $($d.bin)" { if (Test-Path -LiteralPath $d.bin) { Remove-Item -LiteralPath $d.bin -Recurse -Force } }
   "kept: $($d.audit), $($d.results), $($d.done)"
@@ -77,4 +82,12 @@ Run "register $TaskPath$TaskName (user $user, RunLevel Highest, no trigger): con
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
   Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Action $action -Principal $principal -Settings $settings `
     -Description 'admin-runner: runs owner-approved commands from <root>\approved, one pass. See README.md.' -Force | Out-Null
+}
+if ($SelfApprove) {
+  $n = if ($Note) { $Note } else { 'temporary: until the owner has his own approval channel' }
+  Run "write $policy (self_approve = true, set by $user; agents may approve their own requests, every run in audit.log)" {
+    AA-WriteJson $policy ([ordered]@{ self_approve = $true; set_by = $user; set_at = (Get-Date).ToUniversalTime().ToString('o'); note = $n })
+  }
+} else {
+  Run "remove $policy (self-approve off)" { if (Test-Path -LiteralPath $policy) { Remove-Item -LiteralPath $policy -Force } }
 }
