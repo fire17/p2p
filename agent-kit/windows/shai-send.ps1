@@ -139,11 +139,12 @@ function Invoke-P2P([string[]]$argList, [int]$timeoutSec) {
 }
 function Field($o, [string]$f) { if ($null -eq $o) { return $null }; $p = $o.PSObject.Properties[$f]; if ($null -eq $p) { return $null }; return $p.Value }
 
+# mesh-* sessions belong to mesh-setup.ps1 hub links (machine-to-machine), never to Shai: skip them.
 function Find-Session {
   if ($Name) { return $Name }
   if (-not (Test-Path -LiteralPath $TunnelRoot)) { return '' }
   $cands = @(Get-ChildItem -LiteralPath $TunnelRoot -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match $NameRe -and (Test-Path -LiteralPath (Join-Path $_.FullName 'current.json')) } |
+    Where-Object { $_.Name -match $NameRe -and $_.Name -notlike 'mesh-*' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'current.json')) } |
     Sort-Object LastWriteTime -Descending | Select-Object -First 16)
   $fallback = ''
   foreach ($c in $cands) {

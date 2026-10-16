@@ -168,12 +168,13 @@ function Get-Link([string]$n) {
 }
 
 # Session discovery: explicit -Name, else the live+connected session, else live, else newest.
+# mesh-* sessions belong to mesh-setup.ps1 hub links (machine-to-machine), never to Shai: skip them.
 function Find-Session {
   if ($Name) { return $Name }
   $cands = @()
   if (Test-Path -LiteralPath $TunnelRoot) {
     $cands = @(Get-ChildItem -LiteralPath $TunnelRoot -Directory -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -match $NameRe -and (Test-Path -LiteralPath (Join-Path $_.FullName 'current.json')) } |
+      Where-Object { $_.Name -match $NameRe -and $_.Name -notlike 'mesh-*' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'current.json')) } |
       Sort-Object LastWriteTime -Descending | Select-Object -First 16)
   }
   if ($cands.Count -eq 0) { return '' }
