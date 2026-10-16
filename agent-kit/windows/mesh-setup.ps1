@@ -284,8 +284,8 @@ function Stop-Keeper([string]$name) {
   if ($DryRun) { Plan "ask the keeper to stop: create $stop, wait up to 20 s for $pidFile to go"; return }
   if (-not (Test-Path -LiteralPath $pidFile)) { Say '  keeper: not running'; return }
   Write-Atomic $stop 'stop'
-  $end = (Get-Date).AddSeconds(20)
-  while ((Test-Path -LiteralPath $pidFile) -and (Get-Date) -lt $end) { Start-Sleep -Milliseconds 500 }
+  $end = [DateTime]::UtcNow.AddSeconds(20)
+  while ((Test-Path -LiteralPath $pidFile) -and [DateTime]::UtcNow -lt $end) { Start-Sleep -Milliseconds 500 }
   if (Test-Path -LiteralPath $pidFile) { Say '  keeper did not confirm within 20 s (it may have been killed earlier)' } else { Say '  keeper stopped' }
 }
 # A keeper that was killed outright (task stopped, crash) leaves its hub link running. The next keeper
@@ -558,15 +558,15 @@ function Run-Keeper {
   Log-Line $name "KEEPER $name up (pid $PID): tunnel $($l.session), hub name @$($l.as). Text only; nothing received is run."
   try {
     while (-not (Test-Path -LiteralPath $stop)) {
-      if ((Get-Date) -ge $next) {
-        $next = (Get-Date).AddSeconds(30)
+      if ([DateTime]::UtcNow -ge $next) {
+        $next = [DateTime]::UtcNow.AddSeconds(30)
         $st = Get-TunnelStatus $cfg $l.session
         if (-not $st.alive) {
           $r = Start-Tunnel $cfg $l
           if ($r.rc -eq 0) { Log-Line $name "tunnel $($l.session) started ($($l.role))"; $wait = 30; $st = Get-TunnelStatus $cfg $l.session }
           else {
             Log-Line $name "tunnel $($l.session) start failed rc=$($r.rc): $(([string]$r.err).Trim()); retry in $wait s"
-            $next = (Get-Date).AddSeconds($wait); $wait = [Math]::Min(300, $wait * 2)
+            $next = [DateTime]::UtcNow.AddSeconds($wait); $wait = [Math]::Min(300, $wait * 2)
           }
           $downTicks = 0
         } elseif ($l.role -eq 'join' -and -not $st.connected) {
@@ -574,7 +574,7 @@ function Run-Keeper {
           $downTicks++
           if ($downTicks -ge 6) {
             Log-Line $name "tunnel $($l.session) not connected for ~3 min; rejoining"
-            [void](Stop-Tunnel $cfg $l.session); $downTicks = 0; $next = (Get-Date).AddSeconds(2)
+            [void](Stop-Tunnel $cfg $l.session); $downTicks = 0; $next = [DateTime]::UtcNow.AddSeconds(2)
           }
         } else { $downTicks = 0 }
         if (($null -eq $child -or $child.HasExited) -and $st.alive) {
