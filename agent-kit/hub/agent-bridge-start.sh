@@ -11,7 +11,9 @@
 #        bypassPermissions); herdr reports no argv for claude, so /proc is read directly.
 #   <prefix>-codex  peer:<thread id>, the codex pane's CURRENT thread: a rollout the managed Codex daemon holds open
 #        (any originator), cwd = the pane's cwd, created no earlier than 120 s before the pane's codex process
-#        started (the thread can be created 30 s before it, or hours after it at the first prompt). Several: the one pb
+#        started (the thread can be created 30 s before it, or hours after it at the first prompt). No such thread,
+#        but the one chosen before (agent-bridge.codex-thread) is still open with that cwd: keep it (start = now -
+#        etimes moves when WSL steps its clock). A new thread always wins. Several: the one pb
 #        already exposes wins; still ambiguous: no codex route (logged, never a guess). The thread is `pb expose`d;
 #        the thread this script exposed before is `pb hide`n when it changes.
 #        No thread yet (Codex makes one only at the pane's first prompt): herdr:<session>:<pane>, i.e. the bridge
@@ -63,24 +65,31 @@ codex_thread() {  # thread id on stdout; "" = the pane has no thread yet; exit 1
   start=$(( $(date +%s) - $(ps -o etimes= -p "$pid" | tr -d ' ') ))
   daemons="$(pgrep -f 'app-server.*--managed-daemon' | tr '\n' ' ')"
   [ -n "$daemons" ] || { echo "no managed Codex daemon running" >&2; return 1; }
-  python3 - "$start" "$cwd" $daemons <<'PY'
+  python3 - "$start" "$cwd" "$TIDF" $daemons <<'PY'
 import glob, json, os, sys
 from datetime import datetime
-start, cwd, daemons = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
+start, cwd, tidf, daemons = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4:]
+try: prev = open(tidf).read().strip()
+except OSError: prev = ""
 open_files = set()
 for d in daemons:
     for fd in glob.glob(f"/proc/{d}/fd/*"):
         try: t = os.readlink(fd)
         except OSError: continue
         if "/sessions/" in t and os.path.basename(t).startswith("rollout-") and t.endswith(".jsonl"): open_files.add(t)
-cands = []
+cands, prev_open = [], False
 for f in open_files:
     try: meta = json.loads(open(f, encoding="utf-8").readline()).get("payload", {})
     except (OSError, ValueError): continue
     if meta.get("cwd") != cwd: continue
+    if prev and meta.get("id") == prev: prev_open = True
     try: created = datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00")).timestamp()
     except (KeyError, ValueError): continue
     if created >= start - 120: cands.append((created, meta["id"]))
+if not cands and prev_open:
+    # No thread created since the pane started, but the one chosen before is still open with this cwd: keep it.
+    # (start = now - etimes moves when WSL steps its wall clock, which can push that thread out of the window.)
+    cands = [(0, prev)]
 if len(cands) > 1:
     try: exposed = set(json.load(open(os.path.expanduser("~/.peerbridge/policy.json"))).get("threads", []))
     except (OSError, ValueError): exposed = set()
