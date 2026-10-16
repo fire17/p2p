@@ -1,7 +1,8 @@
 #!/bin/sh
 # agent-bridge.py against fakes: a fake ccpeer module (PYTHONPATH) and a fake herdr (PATH). Offline, any POSIX box.
 # Proves: ccpeer is used first, herdr is the fallback, a blocked (or dialog-showing "idle") pane is never typed
-# into, --dry-run sends nothing, presence is kept, typed text is control-free.
+# into, --dry-run sends nothing, presence is kept, typed text is control-free. Also agent-bridge-start.sh --dry-run:
+# a label on several panes is never guessed, --workspace scopes it, a stale (reused) pid is not taken for the bridge.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/agent-bridge-test.XXXXXX"); trap 'rm -rf "$T"' EXIT
@@ -49,6 +50,10 @@ elif a[:2] == ["agent", "read"]:
     print(json.dumps({"id": "cli:agent:read", "result": {"text": rd(a[2], "screen") or ""}}))
 elif a[:2] in (["agent", "prompt"], ["pane", "run"]):
     with open(os.path.join(d, "typed.log"), "a") as f: f.write(json.dumps({"pane": a[2], "text": a[3]}) + "\n")
+elif a[:2] == ["pane", "list"]:
+    panes = json.loads(rd("panes", "json") or "[]")
+    if a[2:3] == ["--workspace"]: panes = [p for p in panes if p.get("workspace_id") == a[3]]
+    print(json.dumps({"id": "cli:pane:list", "result": {"panes": panes}}))
 else:
     sys.exit(9)
 EOF
@@ -152,6 +157,26 @@ echo "$OUT" | sed 's/^/    /'
 echo "$OUT" | grep -q "^DRY a-dry .*via=ccpeer .*not sent" && echo "$OUT" | grep -q "^DRY a-dry2 .*via=herdr .*not typed"; ok $? "dry-run: reports the route it would take"
 [ -z "$(ccsent)" ] && [ -z "$(typed)" ] && ! grep -q '"prompt"' "$T/herdr/calls.log" 2>/dev/null; ok $? "dry-run: nothing sent, nothing typed"
 [ "$(waiting a-dry)" = 1 ] && [ "$(waiting a-dry2)" = 1 ] && [ ! -e "$T/hub/agents/a-dry2.json" ]; ok $? "dry-run: messages left unclaimed, no presence written"
+
+# ---- 4b. agent-bridge-start.sh --dry-run against the fake herdr + a fake kit (ccpeer, pb, flock)
+mkdir -p "$T/kit/codex-bridge/peerbridge" "$T/home"
+cp "$T/fakepy/ccpeer.py" "$T/kit/codex-bridge/peerbridge/ccpeer.py"
+for c in pb flock; do printf '#!/bin/sh\nexit 0\n' > "$T/bin/$c"; chmod +x "$T/bin/$c"; done
+ABS() { HOME="$T/home" AGENT_KIT="$T/kit" BRIDGE_DIR="$T/abr" FAKE_PEERS=claude bash "$HERE/agent-bridge-start.sh" --prefix t --wait 0 --dry-run "$@" 2>&1; }
+echo '[{"pane_id": "p1", "label": "claude", "workspace_id": "w1"}, {"pane_id": "p9", "label": "shell", "workspace_id": "w2"}]' > "$T/herdr/panes.json"
+OUT=$(ABS); RC=$?
+echo "$OUT" | sed 's/^/    /'
+[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:claude$"; ok $? "start: one claude pane -> peer route"
+echo '[{"pane_id": "p5", "label": "claude", "workspace_id": "w2"}, {"pane_id": "p1", "label": "claude", "workspace_id": "w1"}]' > "$T/herdr/panes.json"
+OUT=$(ABS); RC=$?
+echo "$OUT" | sed 's/^/    /'
+[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:claude$"; ok $? "start: claude label on 2 panes -> route kept (it reaches the ccpeer session, not a pane)"
+grep -q "pane label claude: 2 panes p5 p1" "$T/abr/agent-bridge.log"; ok $? "start: ambiguity logged with the pane ids"
+OUT=$(ABS --workspace w1); RC=$?
+[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:claude$" && grep -q '"--workspace", "w1"' "$T/herdr/calls.log"; ok $? "start: --workspace scopes the pane lookup"
+echo $$ > "$T/abr/agent-bridge.pid"   # a live process that is not the bridge (a reused pid)
+OUT=$(ABS --workspace w1)
+echo "$OUT" | grep -q "^live bridge: none$"; ok $? "start: a reused pid is not taken for the live bridge"
 
 # ---- 5. source hygiene
 python3 -c "import sys; sys.exit(0 if all(b < 128 for b in open(sys.argv[1],'rb').read()) else 1)" "$HERE/agent-bridge.py"; ok $? "source: ASCII only"

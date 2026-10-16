@@ -3,23 +3,29 @@
 #
 #   agent-bridge-start.sh --prefix lap [--session main] [--claude claude] [--dry-run] [--wait 120]   one shot
 #   agent-bridge-start.sh --prefix lap [--session main] [--claude claude] --watch 60                 keep it matching
+#   --workspace W (either mode): look for the labelled panes only in herdr workspace W (default: the whole session)
 #
 # Routes (hub name -> route), discovered every time, never fixed ids. For the herdr pane labelled codex and each pane
-# named in --claude (comma list, default "claude"; e.g. --claude claude,review for a second Claude pane):
+# named in --claude (comma list, default "claude"; e.g. --claude claude,review for a second Claude pane), each label
+# on exactly ONE pane (codex: several = no new route, logged, never a guess, a live bridge keeps its route; claude:
+# only logged, since its route reaches the ccpeer session, not the pane):
 #   <prefix>-<label>  peer:<label>, the Claude Code session named like the pane (`claude -n <label>`); it
 #        must resolve to exactly one live session (ccpeer.resolve). +bypass only when that claude process really runs
 #        bypassPermissions (its /proc/<pid>/cmdline has --dangerously-skip-permissions or --permission-mode
-#        bypassPermissions); herdr reports no argv for claude, so /proc is read directly.
+#        bypassPermissions); herdr reports no argv for claude, so /proc is read directly, for the pid of the session
+#        ccpeer resolved (the one the route reaches), not for whatever runs in the pane.
 #   <prefix>-codex  peer:<thread id>, the codex pane's CURRENT thread: a rollout the managed Codex daemon holds open
 #        (any originator), cwd = the pane's cwd, created no earlier than 120 s before the pane's codex process
 #        started (the thread can be created 30 s before it, or hours after it at the first prompt). No such thread,
 #        but the one chosen before (agent-bridge.codex-thread) is still open with that cwd: keep it (start = now -
 #        etimes moves when WSL steps its clock). A new thread always wins. Several: the one pb
-#        already exposes wins; still ambiguous: no codex route (logged, never a guess). The thread is `pb expose`d;
-#        the thread this script exposed before is `pb hide`n when it changes.
+#        already exposes wins; still ambiguous: no codex route (logged, never a guess). The thread is `pb expose`d
+#        (re-tried on the next pass if that failed; never again once it worked, so the owner's `pb hide` sticks);
+#        once that worked, the thread this script exposed before is `pb hide`n.
 #        No thread yet (Codex makes one only at the pane's first prompt): herdr:<session>:<pane>, i.e. the bridge
 #        types into the pane, guarded by its idle + dialog check. That first message creates the thread; --watch then
 #        switches to the native peer.
+#        Both codex routes carry +trusted: only senders in trusted.json reach Codex (it runs its turns unattended).
 # One shot: missing peers are retried for --wait s, then the bridge starts with what exists (WARNING in the log).
 # --watch SEC: rediscover every SEC s and restart the bridge only when the map differs from the live one on two
 #   checks in a row (one failed lookup never drops a route). Covers reboot, pane restarts and the lazy codex thread.
@@ -31,11 +37,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIT="${AGENT_KIT:-${SHAI_KIT:-$(dirname "$HERE")}}"
 DIR="${BRIDGE_DIR:-$HOME/.agent-bridge}"
-PREFIX=""; S="main"; DRY=0; WAIT=120; WATCH=0; CLAUDES="claude"
+PREFIX=""; S="main"; DRY=0; WAIT=120; WATCH=0; CLAUDES="claude"; WS=""
 while [ $# -gt 0 ]; do case "$1" in
   --prefix) PREFIX="${2:?}"; shift 2 ;; --session) S="${2:?}"; shift 2 ;; --claude) CLAUDES="${2:?}"; shift 2 ;;
   --dry-run) DRY=1; shift ;; --wait) WAIT="${2:?}"; shift 2 ;; --watch) WATCH="${2:?}"; shift 2 ;;
-  *) echo "usage: $0 --prefix NAME [--session S] [--claude LABEL[,LABEL]] [--dry-run] [--wait SEC | --watch SEC]" >&2; exit 2 ;; esac; done
+  --workspace) WS="${2:?}"; shift 2 ;;
+  *) echo "usage: $0 --prefix NAME [--session S] [--workspace W] [--claude LABEL[,LABEL]] [--dry-run] [--wait SEC | --watch SEC]" >&2; exit 2 ;; esac; done
 case ",$CLAUDES," in *,codex,*|*[!A-Za-z0-9_,-]*|,,) echo "agent-bridge-start: --claude takes pane labels, e.g. claude or claude,review" >&2; exit 2 ;; esac
 [ -n "$PREFIX" ] || { echo "agent-bridge-start: --prefix is required (e.g. lap, desk)" >&2; exit 2; }
 [ "$WATCH" = 0 ] || [ "$DRY" = 0 ] || { echo "agent-bridge-start: --watch and --dry-run exclude each other" >&2; exit 2; }
@@ -45,19 +52,31 @@ mkdir -p "$DIR"; LOG="$DIR/agent-bridge.log"; PIDF="$DIR/agent-bridge.pid"; TIDF
 say() { echo "$(date +%FT%T) START $*" | tee -a "$LOG"; }
 
 h() { herdr --session "$S" "$@"; }
-pane_of() { h pane list 2>/dev/null | jq -r --arg l "$1" '[.result.panes[]|select(.label==$l)][0].pane_id // empty'; }
+pane_of() {  # the ONE pane labelled $1 ("" = none); several: nothing on stdout, ids on stderr, exit 2 (never a guess)
+  local ids n
+  ids="$(h pane list ${WS:+--workspace "$WS"} 2>/dev/null | jq -r --arg l "$1" '.result.panes[]?|select(.label==$l)|.pane_id // empty')"
+  n=$(grep -c . <<<"$ids")
+  [ "$n" -le 1 ] && { echo "$ids"; return 0; }
+  echo "$(date +%FT%T) START pane label $1: $n panes" $ids "(want exactly 1)" >&2; return 2
+}
+keep() {  # several panes carry the label: keep the live bridge's route for hub name $1, if it has one
+  local w; for w in $(live_cmd); do case "$w" in "$1="*) MAPS+=(--map "$w"); return ;; esac; done
+}
 proc_of() {  # pid and cwd ("pid<TAB>cwd") of the process named $2 in the foreground of pane $1
   h pane process-info --pane "$1" 2>/dev/null \
     | jq -r --arg n "$2" '[.result.process_info.foreground_processes[]|select(.name==$n)][0] | "\(.pid // "")\t\(.cwd // "")"'; }
 
-peer_ok() { python3 - "$KIT/codex-bridge/peerbridge" "$1" <<'PY'
+peer_ok() {  # exactly one live Claude session named $1? its pid on stdout (the process the route reaches)
+python3 - "$KIT/codex-bridge/peerbridge" "$1" <<'PY'
 import sys; sys.path.insert(0, sys.argv[1]); import ccpeer
-sys.exit(0 if len(ccpeer.resolve(sys.argv[2])) == 1 else 1)
+r = ccpeer.resolve(sys.argv[2])
+if len(r) != 1: sys.exit(1)
+print(r[0].get("pid") or "")
 PY
 }
 
 is_bypass() {  # the claude process really runs bypassPermissions?
-  local a; a="$(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null)" || return 1
+  local a; a="$(tr '\0' '\n' 2>/dev/null < "/proc/$1/cmdline")" || return 1
   grep -qx -- '--dangerously-skip-permissions' <<<"$a" && return 0
   grep -A1 -x -- '--permission-mode' <<<"$a" | grep -qx bypassPermissions
 }
@@ -107,35 +126,52 @@ discover() {  # sets MAPS (array), TID (codex thread or ""), MISSING (array)
   MAPS=(); MISSING=(); TID=""
   local label pane pc pid cwd t
   for label in ${CLAUDES//,/ }; do
-    pane="$(pane_of $label)"; [ -n "$pane" ] || { MISSING+=("$label(no pane)"); continue; }
-    peer_ok "$label" || { MISSING+=("$label(no unique live session)"); continue; }
-    pc="$(proc_of "$pane" claude)"; pid="${pc%%$'\t'*}"
+    # the claude route reaches the ccpeer session, not a pane: several panes with the label are only logged
+    pane="$(pane_of "$label" 2>>"$LOG")" || pane="several"
+    [ -n "$pane" ] || { MISSING+=("$label(no pane)"); continue; }
+    pid="$(peer_ok "$label")" || { MISSING+=("$label(no unique live session)"); continue; }
     if [ -n "$pid" ] && is_bypass "$pid"; then MAPS+=(--map "$PREFIX-$label=peer:$label+bypass")
     else MAPS+=(--map "$PREFIX-$label=peer:$label"); fi
   done
-  pane="$(pane_of codex)"; [ -n "$pane" ] || { MISSING+=("codex(no pane)"); return; }
+  pane="$(pane_of codex 2>>"$LOG")" || { MISSING+=("codex(several panes, see log)"); keep "$PREFIX-codex"; return; }
+  [ -n "$pane" ] || { MISSING+=("codex(no pane)"); return; }
   pc="$(proc_of "$pane" codex)"; pid="${pc%%$'\t'*}"; cwd="${pc#*$'\t'}"
   [ -n "$pid" ] || { MISSING+=("codex(no codex process)"); return; }
   if t="$(codex_thread "$pid" "$cwd" 2>>"$LOG")"; then
-    if [ -n "$t" ]; then TID="$t"; MAPS+=(--map "$PREFIX-codex=peer:$t")
-    else MAPS+=(--map "$PREFIX-codex=herdr:$S:$pane"); fi   # no thread yet: typed until the first prompt makes one
+    if [ -n "$t" ]; then TID="$t"; MAPS+=(--map "$PREFIX-codex=peer:$t+trusted")
+    else MAPS+=(--map "$PREFIX-codex=herdr:$S:$pane+trusted"); fi   # no thread yet: typed until the first prompt makes one
   else MISSING+=("codex(thread unclear, see log)"); fi
 }
 
-live_cmd() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null && tr '\0' ' ' < "/proc/$(cat "$PIDF")/cmdline"; }
+live_cmd() {  # cmdline of the live bridge; fails when the pid file is stale (dead, or the pid reused by another process)
+  local p a; p="$(cat "$PIDF" 2>/dev/null)" || return 1
+  case "$p" in ""|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null && a="$(tr '\0' ' ' 2>/dev/null < "/proc/$p/cmdline")" || return 1
+  case "$a" in *"/hub/agent-bridge.py --gate trusted "*) printf '%s' "$a" ;; *) return 1 ;; esac
+}
+
+tid_ok() {  # TID was exposed once already (TIDF is written only after a pb expose worked). Never re-exposed after
+  [ "$(cat "$TIDF" 2>/dev/null)" = "$TID" ]   # that: a `pb hide` by the owner sticks.
+}
+
+expose_tid() {  # pb expose TID; only once that worked: hide the thread exposed before and remember TID
+  local old; old="$(cat "$TIDF" 2>/dev/null || true)"
+  pb expose --thread "$TID" >/dev/null || { say "ERROR pb expose --thread $TID failed (retried next pass)"; return 1; }
+  [ -n "$old" ] && [ "$old" != "$TID" ] && { pb hide --thread "$old" >/dev/null || say "ERROR pb hide --thread $old failed"; }
+  echo "$TID" > "$TIDF"
+}
 
 apply() {  # make the running bridge match MAPS/TID
-  local cmd=(python3 -u "$KIT/hub/agent-bridge.py" --gate trusted "${MAPS[@]}") old
-  if [ -n "$TID" ]; then
-    old="$(cat "$TIDF" 2>/dev/null || true)"
-    if [ "$old" != "$TID" ]; then
-      pb expose --thread "$TID" >/dev/null || say "ERROR pb expose --thread $TID failed"
-      [ -n "$old" ] && { pb hide --thread "$old" >/dev/null || say "ERROR pb hide --thread $old failed"; }
-      echo "$TID" > "$TIDF"
-    fi
-  fi
+  local cmd=(python3 -u "$KIT/hub/agent-bridge.py" --gate trusted "${MAPS[@]}") p
+  [ -n "$TID" ] && ! tid_ok && expose_tid
   [ "$(live_cmd)" = "${cmd[*]} " ] && { say "bridge pid $(cat "$PIDF") already runs these routes"; return; }
-  [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null && sleep 1
+  p="$(cat "$PIDF" 2>/dev/null)"
+  if live_cmd >/dev/null; then   # only ever signal the bridge itself, and let it finish (no -9: it may hold a claim)
+    kill "$p" 2>/dev/null
+    for _ in $(seq 40); do live_cmd >/dev/null || break; sleep 0.25; done
+    live_cmd >/dev/null && say "WARNING old bridge pid $p still running after 10s"
+  fi
+  rm -f "$PIDF"
   setsid nohup "${cmd[@]}" >> "$LOG" 2>&1 < /dev/null &
   echo $! > "$PIDF"; say "bridge pid $(cat "$PIDF") started: ${MAPS[*]}"
 }
@@ -148,14 +184,13 @@ if [ "$WATCH" != 0 ]; then
   pending=""
   while :; do                  # 9>&- below: children (above all the bridge) must not inherit the watcher lock
     discover 9>&-
-    [ -n "$TID" ] && [ ! -s "$TIDF" ] && echo "$TID" > "$TIDF"   # remember the thread already exposed, to hide it later
     want="python3 -u $KIT/hub/agent-bridge.py --gate trusted ${MAPS[*]} "
     if [ ${#MAPS[@]} -gt 0 ] && [ "$(live_cmd)" != "$want" ]; then
       if [ "$pending" = "$want" ] || ! live_cmd >/dev/null; then   # seen twice in a row, or nothing running at all
         [ ${#MISSING[@]} -eq 0 ] || say "WARNING no route for: ${MISSING[*]}"
         apply 9>&-; pending=""
       else pending="$want"; fi
-    else pending=""; fi
+    else pending=""; [ -n "$TID" ] && ! tid_ok 9>&- && expose_tid 9>&-; fi   # routes match: retry a failed/lost expose
     sleep "$WATCH" 9>&-
   done
 fi
