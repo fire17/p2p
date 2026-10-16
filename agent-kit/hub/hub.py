@@ -177,11 +177,22 @@ def open_private(path, mode="w"):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
     return open(fd, mode, encoding="utf-8", errors="replace", newline="\n")
 
+REPLACE_TRIES = 20   # write_atomic: attempts at 50 ms while Windows holds the target open
+
 def write_atomic(path, obj):
     d = os.path.dirname(path); os.makedirs(d, mode=0o700, exist_ok=True)
     tmp = os.path.join(d, ".tmp-" + uuid.uuid4().hex)
     with open_private(tmp) as f: json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    # Windows refuses to replace a file another process has open (WinError 5), e.g. a WSL reader polling
+    # agents/*.json over drvfs. That lasts milliseconds: retry for up to ~1 s, then give up and clean up.
+    for i in range(REPLACE_TRIES):
+        try: os.replace(tmp, path); return
+        except PermissionError:
+            if i == REPLACE_TRIES - 1:
+                try: os.remove(tmp)
+                except OSError: pass
+                raise
+            time.sleep(0.05)
 
 class Hub:
     def __init__(self, root):
@@ -1398,10 +1409,31 @@ def selftest():
         guard_selftest(check, os.path.join(root, "guard-test"))
         matrix_selftest(check, os.path.join(root, "matrix-test"))
         step_selftest(check, os.path.join(root, "step-test"))
+        replace_selftest(check, os.path.join(root, "replace-test"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
     out(f"{sum(ok)}/{len(ok)} passed")
     return 0 if all(ok) else 1
+
+def replace_selftest(check, root):
+    """write_atomic: a target held open by another process (Windows WinError 5) is retried, not fatal."""
+    real, calls = os.replace, {"n": 0}
+    def flaky(src, dst, fails):
+        calls["n"] += 1
+        if calls["n"] <= fails: raise PermissionError(5, "Access is denied")
+        return real(src, dst)
+    p = os.path.join(root, "agents", "x.json")
+    try:
+        os.replace = lambda s, d: flaky(s, d, 3)
+        write_atomic(p, {"v": 1})
+        check(read_json(p) == {"v": 1} and calls["n"] == 4, "write_atomic: 3 refused replaces are retried, then it lands")
+        calls["n"] = 0; os.replace = lambda s, d: flaky(s, d, REPLACE_TRIES)
+        try: write_atomic(p, {"v": 2}); raised = False
+        except PermissionError: raised = True
+        left = [f for f in os.listdir(os.path.dirname(p)) if f.startswith(".tmp-")]
+        check(raised and read_json(p) == {"v": 1} and not left, "write_atomic: gives up after REPLACE_TRIES, old file kept, no temp left")
+    finally:
+        os.replace = real
 
 def step_selftest(check, root):
     """run_bridge: a failing step is logged and retried; only STEP_FAILS_MAX failures in a row end the link."""
