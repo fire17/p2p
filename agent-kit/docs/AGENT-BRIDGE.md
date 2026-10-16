@@ -4,8 +4,11 @@
 Typing into a terminal pane is the last resort, never the default.
 
 **Status:** the adapter is `hub/agent-bridge.py` (`--config bridge.json [--once] [--dry-run]`; full
-reference in its header). It passes `hub/test_agent_bridge.sh` on macOS with a fake ccpeer and a fake herdr.
-The pieces it builds on are tested on macOS (PRESENCE.md section 7, codex-bridge/README.md). Everything marked **NOT yet verified** below has not run on a real Windows + WSL PC.
+reference in its header). It passes `hub/test_agent_bridge.sh` and `hub/test_bridge_gate.sh` on macOS with a
+fake ccpeer and a fake herdr.
+The design was proven live on two real PCs: 56/56 all-pairs round trips across 8 agents, native adapters only
+(section 8). That run used the field version of this bridge; the kit script carries its rules (whitelist, gate,
+`+bypass`, NOT DELIVERED). Rows marked **NOT yet verified** in section 8 are exactly that.
 
 ---
 
@@ -52,8 +55,11 @@ No typing, no Enter, no screen scraping. The peer key is read only to authentica
 socket. It is never printed or stored.
 
 Honest limits:
-- A receiver running in bypass mode may **hold** a message declared `from-mode="prompting"` until its
-  user approves. That is Claude Code's anti-permission-laundering rule. The adapter never lies about mode.
+- Claude Code **holds** a peer message for its user's approval when the envelope's `from-mode` does not fit
+  the receiving session: no from-mode into a bypass session, **and also** `from-mode="bypass"` into a
+  session that is NOT in bypass (for example auto mode). That is its anti-permission-laundering rule.
+  So the adapter claims bypass only into routes marked `+bypass`, and only for trusted senders (section 5).
+  Everything else goes without a claim. The adapter never claims more than the target runs.
 - Native-Windows Claude Code and WSL Claude Code keep **separate** session registries and transports.
   They cannot reach each other natively. The hub crosses that boundary. The adapter on the target's
   side then delivers natively.
@@ -66,6 +72,10 @@ Honest limits:
    peerbridge turns the frame into a `turn/start` on the Codex daemon: idle thread wakes, busy thread
    is steered.
 3. `pb off` withdraws every Codex peer within about 1 s. The adapter then falls through to 2c or 2d.
+
+The route's `peer` is the **exposed thread id** (`pb list` shows it). Exposure belongs to that thread:
+after a Codex pane restart, run `pb expose --thread <id>` again (and update the route if the id changed).
+Until then the route has no live peer, and the sender gets a NOT DELIVERED notice.
 
 Honest limit: an unattended Codex TUI on Windows may never create a thread while a first-run or
 folder-trust screen is up (codex-bridge/docs/WINDOWS.md). No thread means no native peer.
@@ -87,17 +97,27 @@ herdr 0.7 has no `agent prompt`, use `["pane", "run", "{pane}", "{text}"]` there
 model or theme picker) can be reported **idle** by herdr. Typing there is dangerous: the Enter that
 ends the prompt answers the dialog instead, and can pick the wrong option or **exit the agent**.
 So the adapter:
-- reads `agent get <pane>` and refuses if the state is `blocked`;
+- reads `agent get <pane>` and refuses unless the state is `idle` (config `herdr_ok_states`), so `blocked`
+  is always refused;
 - also refuses if the pane's visible screen shows a dialog, even when herdr says `idle`;
 - when unsure, does **not** type. The message goes back to the hub inbox, is retried with backoff
   (5 s up to 60 s), and the sender gets one `NOT DELIVERED <name> (id=<id>): <reason>` notice through the hub.
 
 Typed text is one line, cleaned of control and invisible characters, and never contains a secret.
+It lands as the pane owner's own input, with no peer-message approval hold. So on a `+bypass` route
+the adapter types only for senders the gate trusts (section 5); anyone else's message waits for the
+native path. On other routes any sender's message can be typed: give a pane a herdr route only if you
+accept that.
 
 ### 2d. Inbox (always there)
 
 If nothing above worked, the message waits in `inbox/<name>/` and the bridge retries it.
 Do not also run `hub.py ear` for a bridged name: two readers of one inbox split its messages.
+
+### 2e. Failures go back to the sender
+
+A delivery error is never dropped silently. The bridge logs `ERROR` and sends the sender one notice over
+the hub: `NOT DELIVERED <name> (id=<id>): <reason>`. Notices are never answered with notices (no ping-pong).
 
 ---
 
@@ -136,19 +156,68 @@ Example `bridge.json` for `hub/agent-bridge.py` (object form; a list form with `
   "herdr_session": "work",
   "agents": {
     "desk-claude": {"harness": "claude", "peer": "desk-claude", "pane": "claude"},
-    "desk-codex":  {"harness": "codex",  "peer": "desk-codex",  "pane": "codex"},
+    "desk-codex":  {"harness": "codex",  "peer": "<codex thread id>", "pane": "codex"},
     "desk-rc":     {"harness": "claude", "peer": "desk-rc",     "pane": "rc"}
   }
 }
 ```
 
-`peer` is the name `resolve()` / `pb list` knows. `pane` is used only for the 2c fallback.
+`peer` is the name or session id `resolve()` / `pb list` knows (for Codex: the exposed thread id, 2b).
+`pane` is used only for the 2c fallback.
 The laptop has the same file with `lap-*` names. The two hubs are joined once with `hub.py link`
 (PRESENCE.md section 4), after which `who` on either side shows all six agents.
 
+To let trusted senders claim bypass into a session that runs bypassPermissions, mark that route `+bypass`
+(command line: `--map desk-claude=peer:desk-claude+bypass`; in bridge.json: `"bypass": true` on that agent)
+and start the bridge with `--gate trusted`. Never mark a session `+bypass` unless it really runs bypass.
+
+Load the kit's `hub/hub.py` **by path** (as the bridge does). peerbridge ships its own `hub.py`; importing
+by module name can pick up the wrong one.
+
 ---
 
-## 5. Verify: the matrix
+## 5. Trust: `trusted.json` and `--gate`
+
+`--gate` decides when the bridge claims `from-mode="bypass"` (only ever into `+bypass` routes):
+
+| `--gate` | Claims bypass for |
+|---|---|
+| `none` (default) | nobody: every message arrives without a claim |
+| `trusted` | senders that match the whitelist below |
+| `all` | everyone. Testing only: any sender then acts with the target's bypass rights |
+
+The whitelist is `trusted.json` in the hub root. The bridge re-reads it whenever it changes on disk:
+
+```json
+{
+ "log": ["YYYY-MM-DD HH:MM default: my agents here (local) and on my linked hubs. Approved by: <owner>"],
+ "senders": [
+  {"name": "desk-*", "via": "local"},
+  {"name": "lap-*",  "via": "link:*"},
+  {"name": "helper", "via": "tunnel", "session": "join-<KEY>"}
+ ]
+}
+```
+
+- `name` is an fnmatch pattern on the sender's hub name (the part before `@`).
+- `via` is how the message reached this hub: `local` (written here), `link:<name>` or `link:*` (a hub
+  link), `tunnel` (a `join-<KEY>` uplink). A message's via class must equal the entry's class: a tunnel
+  message can never ride on a `local` or `link:*` entry, whatever name it claims.
+- A `tunnel` entry needs `session: "join-<KEY>"` and counts only while the hub uplink of that name has
+  pinned exactly that key (`uplinks/<name>.pin.json`).
+- Missing or broken file: **nobody** is trusted, and the bridge logs `ERROR`. It fails closed.
+- A `link:*` entry trusts whatever the far hub sends under a matching name. If that far hub runs an
+  `uplink` with `--transit-to` reaching this machine, its tunnel peer's messages arrive here as link
+  messages named after that uplink. Keep link patterns to the far hub's own agent names (`lap-*`),
+  never `*`, and never name an uplink so that it matches them.
+
+Who may edit it: **only the machine's owner**, on that machine. An agent never adds itself or a peer.
+A `tunnel` entry is added only with the owner's explicit approval, and every change gets a dated line in
+`log` saying what was added and where the owner approved it.
+
+---
+
+## 6. Verify: the matrix
 
 ```
 python3 hub/hub.py matrix --names desk-claude,desk-codex,desk-rc --pairs     # every local pair, both ways
@@ -162,15 +231,22 @@ machines without `--pairs` (or run `--pairs` on each machine). Options: `--from 
 `--json`. The bridge log (`DELIVER ... via=ccpeer|herdr`) shows which path carried each PING.
 A pair that times out is a finding, not a pass.
 
+Across machines, each machine sees only its own inboxes: a PING is recorded on the target's machine,
+its PONG on the sender's. A table built on one machine proves only its half of each cross-machine pair.
+Check (or merge) both machines' delivery files (`inbox/<name>/read/`) before calling a pair passed.
+
 Run order on a fresh setup: `hub.py selftest` on each side, then `hub.py who`, then the matrix.
 If `matrix` is reported as an unknown verb, this hub.py predates it: update the kit.
 
 ---
 
-## 6. Known limits
+## 7. Known limits
 
 - Native delivery is local to one OS on one machine. Machine to machine, and Windows to WSL, is always
   the hub first.
+- Bypass is claimed only into `+bypass` routes for trusted senders. Untrusted messages into a bypass
+  session are held for its user's approval: that is by design, not a fault.
+- A Codex pane restart drops native delivery until `pb expose --thread <id>` is run again.
 - A sandboxed (default) Codex replying to a bypass-mode Claude can be held for approval
   (codex-bridge/docs/HOLD-OPTIONS.md). The owner chooses; nothing here changes that setting.
 - herdr `idle` is not "ready". The blocked-pane rule makes the fallback refuse rather than guess,
@@ -179,14 +255,15 @@ If `matrix` is reported as an unknown verb, this hub.py predates it: update the 
   16 targets per line.
 - Messages are data. No path in this design executes message text.
 
-## 7. Verification status (honest)
+## 8. Verification status (honest)
 
 | Check | Result |
 |---|---|
+| Real two-PC run: Windows 11 + Windows 10, bridge in WSL, herdr, 4 agents per PC (agent, claude, codex, remote-control), hubs linked | **56/56 all-pairs round trips passed** (8 agents, every ordered pair PING + PONG), checked against the hub's delivery files on **each** machine, not against agent claims |
+| Which path carried them | native adapters only (Claude Code via ccpeer, Codex via exposed thread); the herdr fallback was not used |
+| Rules from that run (whitelist, `--gate`, `+bypass`, re-expose, NOT DELIVERED, load hub.py by path, merge both tables) | proven with the field bridge; the kit's `hub/agent-bridge.py` port is tested by `hub/test_agent_bridge.sh` and `hub/test_bridge_gate.sh` (fakes) and **NOT yet re-run live** |
 | Hub, mesh links, exactly-once claim | tested on macOS (PRESENCE.md section 7) |
-| ccpeer native delivery to Claude Code; Codex via peerbridge | tested on macOS; native Windows EXPERIMENTAL (codex-bridge/README.md) |
-| Adapter choosing native first, herdr only as fallback | tested on macOS with fake ccpeer + fake herdr (`hub/test_agent_bridge.sh`); **NOT yet verified** with real sessions |
-| Blocked-pane refusal against a real herdr dialog | tested with a fake herdr only; **NOT yet verified** on real herdr |
+| Adapter choosing native first, herdr only as fallback | tested on macOS with fake ccpeer + fake herdr (`hub/test_agent_bridge.sh`) |
+| herdr fallback and blocked-pane refusal against a real dialog | tested with a fake herdr only; **NOT yet verified** on real herdr (unused in the live run) |
 | `hub.py matrix` / `--pairs` on one hub | tested offline (`hub.py selftest`, `hub/test_matrix.sh`) |
-| `hub.py matrix` across two machines, 6 panes each | **NOT yet verified** |
-| Any of the above on real Windows + WSL | **NOT yet verified** |
+| Native Windows (non-WSL) Claude Code or Codex as a target | **NOT yet verified** |

@@ -3,9 +3,14 @@
 Python 3.8+, standard library only.
 
   agent-bridge.py --config bridge.json            run forever (heartbeat + deliver, one log line per delivery)
-  agent-bridge.py --config bridge.json --once     one pass, then exit (exit 1 if any message is held)
-  agent-bridge.py --config bridge.json --dry-run  read-only: show what WOULD be delivered and how; claims,
-                                                  sends, types and heartbeats nothing (combine with --once)
+  agent-bridge.py --map NAME=ROUTE [--map ...]    same, routes from the command line instead of (or on top of) a config
+  agent-bridge.py ... --once                      one pass, then exit (exit 1 if any message is held)
+  agent-bridge.py ... --dry-run                   read-only: show what WOULD be delivered and how; claims, sends,
+                                                  types and heartbeats nothing (combine with --once)
+  agent-bridge.py ... --gate none|trusted|all     who may claim from-mode=bypass into +bypass routes (see Gate)
+
+  --map shorthand:  NAME=peer:<peer or session id>[+bypass]   (adapter ccpeer)
+                    NAME=herdr:<herdr session>:<pane>          (adapter herdr; the pane id may itself hold ':')
 
 For every configured name the bridge keeps the name present in the hub (agents/<name>.json heartbeat) and
 claims its inbox (hub.claim, exactly once across readers), then delivers each message as
@@ -16,44 +21,70 @@ claims its inbox (hub.claim, exactly once across readers), then delivers each me
 Adapters, per name:
   ccpeer  Claude Code's own cross-session protocol (codex-bridge/peerbridge/ccpeer.py): resolve(peer) must find
           exactly one live session; the text goes in as a <cross-session-message> user frame on its socket.
-          A Codex thread made reachable with `pb expose --thread <id>` is a ccpeer peer too: same path.
+          A Codex thread made reachable with `pb expose --thread <id>` is a ccpeer peer too: use the thread id
+          as "peer". Restarting that Codex pane drops the exposure: run `pb expose --thread <id>` again.
   herdr   fallback only: type one cleaned line into a herdr pane. Before typing, `herdr agent get` must say
           the pane is in an allowed state (default: idle) AND the pane's visible screen must show no dialog
           (herdr can report a pane idle while a trust/permission/picker dialog is up). Otherwise nothing is
-          typed: the message goes back to the inbox and is retried later (backoff 5 s .. 60 s); the sender
-          gets one NOT DELIVERED notice per message.
+          typed: the message goes back to the inbox and is retried later (backoff 5 s .. 60 s).
   auto    ccpeer first; herdr only when ccpeer is not importable, the peer is not live/unique, or the send fails.
+          Typed text is the pane owner's own input (no peer-message approval hold), so on a +bypass route herdr
+          types only for senders the gate trusts; anyone else's message waits for the native path.
+A message that cannot be delivered is never dropped: it stays in the inbox for a retry, the log says HOLD, and
+the sender gets one "NOT DELIVERED <name> (id=...): <reason>" notice over the hub (an ERROR line if even that fails).
+
+Gate (from-mode). Claude Code holds a peer message behind an approval prompt when the envelope claims more than
+the receiving session runs: from-mode=bypass into a NON-bypass (e.g. auto-mode) session is held too. So the
+bridge claims from-mode=bypass only into routes marked +bypass (the target runs bypassPermissions) and only when
+the gate lets the sender through; otherwise it claims nothing.
+  --gate none     (default) never claim bypass
+  --gate trusted  claim for senders whitelisted in <hub root>/trusted.json (re-read whenever it changes):
+                    {"log": ["<who approved what, when>", ...],
+                     "senders": [{"name": "<fnmatch pattern>", "via": "local" | "link:*" | "link:<link>" | "tunnel",
+                                  "session": "join-<KEY>"   (tunnel entries only, required)}]}
+                  A message's via class ('' = local, 'link:<x>', 'tunnel') must equal the entry's, so a tunnel
+                  message never rides a local/link entry. A tunnel entry counts only while the hub uplink named
+                  <sender> has pinned exactly that peer (uplinks/<sender>.pin.json "peer" == KEY). A missing or
+                  broken file means nobody is trusted, and an ERROR line says so.
+  --gate all      claim for every sender (only for a hub nobody else can write to)
 
 Config (JSON). Either shape works:
-  {"hub_root": "...", "herdr_session": "work",
-   "agents": [{"name": "desk-codex",  "adapter": "ccpeer", "peer": "desk-codex"},
-              {"name": "desk-claude", "adapter": "herdr", "session": "work", "pane": "w1:p2"},
-              {"name": "desk-rc",     "adapter": "auto", "peer": "desk-rc", "pane": "w1:p3"}]}
-  {"herdr_session": "work", "agents": {"desk-rc": {"peer": "desk-rc", "pane": "rc"}}}
+  {"hub_root": "...", "herdr_session": "work", "gate": "trusted",
+   "agents": [{"name": "desk-codex",  "adapter": "ccpeer", "peer": "<codex thread id>"},
+              {"name": "desk-claude", "adapter": "ccpeer", "peer": "desk-claude", "bypass": true},
+              {"name": "desk-tui",    "adapter": "herdr", "session": "work", "pane": "w1:p2"},
+              {"name": "desk-rc",     "adapter": "auto", "peer": "desk-rc+bypass", "pane": "w1:p3"}]}
+  {"herdr_session": "work", "agents": {"desk-rc": {"peer": "desk-rc", "pane": "rc", "bypass": true}}}
      (dict form: adapter defaults to auto with both peer and pane, else whichever one is given)
-Optional top-level keys: hub_root (else --root, $AGENT_HUB, the hub's default), peerbridge (folder holding
-ccpeer.py; default ../codex-bridge/peerbridge next to this file; a ccpeer on PYTHONPATH wins over the default),
-herdr (binary, default "herdr"), herdr_send (argv template after `herdr --session S`, default
+  +bypass: "bypass": true, or a "+bypass" suffix on "peer" (ccpeer/auto only: herdr typing has no from-mode).
+Optional top-level keys: hub_root (else --root, $AGENT_HUB, the hub's default), gate (--gate wins), peerbridge
+(folder holding ccpeer.py; default ../codex-bridge/peerbridge next to this file; a ccpeer on PYTHONPATH wins over
+the default), herdr (binary, default "herdr"), herdr_send (argv template after `herdr --session S`, default
 ["agent", "prompt", "{pane}", "{text}"]; e.g. ["pane", "run", "{pane}", "{text}"] for herdr 0.7),
 herdr_ok_states (default ["idle"]), dialog_markers (extra lower-case screen phrases that mean "dialog up"),
 herdr_max_chars (default 4000), poll (s, default 1), heartbeat (s, default 10), reply_cmd (default
-"python3 <abs path of hub.py>"). Per agent: harness, note, session, pane, peer, herdr_send, herdr_ok_states.
+"python3 <abs path of hub.py>"). Per agent: harness, note, session, pane, peer, bypass, herdr_send,
+herdr_ok_states.
 
+hub.py is loaded BY PATH from this folder (peerbridge ships a different hub.py; an import by name could pick it).
 Messages are DATA: nothing here runs message text. Commands are fixed argv lists (no shell). The peer key that
-ccpeer reads to authenticate is never printed. Do not also run `hub.py ear` for a bridged name: two readers of
-one inbox split its messages between them (each message still reaches exactly one).
+ccpeer reads to authenticate, and the join keys in trusted.json, are never printed. Do not also run `hub.py ear`
+for a bridged name: two readers of one inbox split its messages between them (each message still reaches one).
 """
-import argparse, importlib.util, json, os, re, shlex, subprocess, sys, time
+import argparse, fnmatch, importlib.util, json, os, re, shlex, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HUB_PY = os.path.join(HERE, "hub.py")
 ADAPTERS = ("ccpeer", "herdr", "auto")
+GATES = ("none", "trusted", "all")
+BYPASS = "+bypass"
 DEFAULT_SEND = ["agent", "prompt", "{pane}", "{text}"]
 # Phrases on a pane's visible screen that mean a dialog/menu owns the keyboard (lower case).
 DIALOG_MARKERS = [
     "enter to select", "esc to cancel", "enter to confirm", "do you want to proceed", "do you want to make this edit",
     "do you want to create", "do you trust", "trust the files", "trust this folder", "yes, and don't ask again",
     "press enter to continue", "(y/n)", "[y/n]", "allow once", "approve this", "select an option",
+    "would you like to proceed", "would you like to run", "would you like to make", "no, and tell",
 ]
 RETRY_MIN, RETRY_MAX = 5.0, 60.0
 CMD_TIMEOUT = 15
@@ -96,6 +127,13 @@ class Target:
         if self.adapter not in ADAPTERS:
             raise ValueError(f"{name}: adapter must be one of {', '.join(ADAPTERS)}")
         self.peer = str(spec.get("peer") or "")
+        self.bypass = spec.get("bypass", False)
+        if not isinstance(self.bypass, bool):
+            raise ValueError(f"{name}: \"bypass\" must be true or false")
+        if self.peer.endswith(BYPASS):
+            self.peer, self.bypass = self.peer[:-len(BYPASS)], True
+        if self.bypass and self.adapter == "herdr":
+            raise ValueError(f"{name}: +bypass needs a ccpeer/auto route (herdr typing carries no from-mode)")
         self.session = str(spec.get("session") or top.get("herdr_session") or "")
         self.pane = str(spec.get("pane") or "")
         if self.adapter in ("ccpeer", "auto") and not self.peer:
@@ -116,18 +154,48 @@ class Target:
         return bool(self.session and self.pane)
 
 
-def parse_config(path):
+def parse_map(spec):
+    """--map shorthand -> an agent spec: NAME=peer:<peer>[+bypass] | NAME=herdr:<session>:<pane>."""
+    name, eq, target = str(spec).partition("=")
+    kind, _, rest = target.partition(":")
+    if eq and kind == "peer" and rest:
+        return {"name": name, "adapter": "ccpeer", "peer": rest}      # Target strips a +bypass suffix
+    session, _, pane = rest.partition(":")
+    if eq and kind == "herdr" and session and pane:
+        if pane.endswith(BYPASS):
+            raise ValueError(f"--map {spec!r}: +bypass needs a peer route (herdr typing carries no from-mode)")
+        return {"name": name, "adapter": "herdr", "session": session, "pane": pane}
+    raise ValueError(f"bad --map {spec!r}: want NAME=peer:<peer>[+bypass] or NAME=herdr:<session>:<pane>")
+
+
+def load_config(path):
+    """The config file as a dict ({} when there is none)."""
+    if not path:
+        return {}
     with open(path, encoding="utf-8-sig") as f:
         top = json.load(f)
     if isinstance(top, list):
         top = {"agents": top}
-    agents = top.get("agents")
+    if not isinstance(top, dict):
+        raise ValueError("config must be a JSON object (or a list of agents)")
+    return top
+
+
+def build_targets(top, maps=()):
+    agents = top.get("agents", [])
     if isinstance(agents, dict):
+        if not all(isinstance(v, dict) for v in agents.values()):
+            raise ValueError("every entry of the \"agents\" object must be an object")
         agents = [dict(v, name=k) for k, v in agents.items()]
-    if not isinstance(agents, list) or not agents:
-        raise ValueError("config needs a non-empty \"agents\" list or object")
+    if not isinstance(agents, list):
+        raise ValueError("\"agents\" must be a list or an object")
+    agents = list(agents) + [parse_map(m) for m in maps]
+    if not agents:
+        raise ValueError("no agents: the config needs a non-empty \"agents\" list or object, or give --map")
     targets, seen = [], set()
     for spec in agents:
+        if not isinstance(spec, dict):
+            raise ValueError("every agent must be an object")
         name = str(spec.get("name") or "")
         if not hub.NAME_RE.match(name):
             raise ValueError(f"bad agent name {name!r}")
@@ -135,13 +203,104 @@ def parse_config(path):
             raise ValueError(f"{name} listed twice")
         seen.add(name)
         targets.append(Target(name, spec, top))
-    return top, targets
+    return targets
+
+
+def parse_config(path, maps=()):
+    top = load_config(path)
+    return top, build_targets(top, maps)
+
+
+class Trusted:
+    """The trusted-senders whitelist, <hub root>/trusted.json (format: file header, Gate). Re-read whenever its
+    mtime or size changes; missing or broken = nobody trusted, with one ERROR line per change of that state."""
+
+    def __init__(self, root):
+        self.root, self.path = root, os.path.join(root, "trusted.json")
+        self.stamp, self.senders, self.error = "unread", [], None
+
+    def load(self):
+        try:
+            st = os.stat(self.path)
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except FileNotFoundError:
+            stamp = None
+        except OSError as e:
+            stamp = ("stat failed", type(e).__name__)
+        if stamp == self.stamp:
+            return
+        self.stamp = stamp
+        if stamp is None:
+            return self.fail("missing")
+        try:
+            with open(self.path, encoding="utf-8-sig") as f:
+                self.senders = self.validate(json.load(f))
+        except (OSError, ValueError) as e:
+            return self.fail(f"unreadable ({hub.one_line(e, 200)})")
+        self.error = None
+        rules = ", ".join(f"{hub.one_line(e['name'], 64)}/{hub.one_line(e['via'], 64)}"
+                          + ("/pinned-session" if e["via"] == "tunnel" else "") for e in self.senders)
+        log(f"TRUSTED {self.path}: {len(self.senders)} sender rule(s){': ' + rules if rules else ''}")
+
+    def fail(self, why):
+        self.senders, self.error = [], f"{self.path} {why}: nobody trusted, bypass is claimed for no one"
+        log(f"ERROR trusted.json: {self.error}")
+
+    @staticmethod
+    def validate(d):
+        if not isinstance(d, dict) or not isinstance(d.get("senders"), list):
+            raise ValueError('want {"log": [...], "senders": [...]}')
+        out = []
+        for i, e in enumerate(d["senders"]):
+            if not isinstance(e, dict):
+                raise ValueError(f"senders[{i}] is not an object")
+            name, via = e.get("name"), e.get("via")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"senders[{i}] needs a \"name\" pattern")
+            if not (via in ("local", "tunnel") or (isinstance(via, str) and via.startswith("link:") and len(via) > 5)):
+                raise ValueError(f"senders[{i}] ({name!r}): \"via\" must be local, link:<link or pattern> or tunnel")
+            session = e.get("session")
+            if via == "tunnel" and not (isinstance(session, str) and session.startswith("join-") and len(session) > 5):
+                raise ValueError(f"senders[{i}] ({name!r}): a tunnel entry needs \"session\": \"join-<KEY>\"")
+            out.append({"name": name, "via": via, "session": session if via == "tunnel" else None})
+        return out
+
+    def pinned_peer(self, uplink):
+        """The far-end key the hub uplink <uplink> pinned (uplinks/<uplink>.pin.json "peer"), or None."""
+        if not hub.NAME_RE.fullmatch(uplink):  # fullmatch: NAME_RE's "$" would let a trailing newline through
+            return None
+        p = hub.read_json(os.path.join(self.root, "uplinks", uplink + ".pin.json"))
+        peer = p.get("peer") if isinstance(p, dict) else None
+        return peer if isinstance(peer, str) and peer else None
+
+    def allows(self, m):
+        self.load()
+        via, frm = m.get("via") or "", str(m.get("from") or "").partition("@")[0]
+        if not isinstance(via, str) or not hub.NAME_RE.fullmatch(frm):
+            return False
+        cls = "local" if via == "" else "tunnel" if via == "tunnel" else via if via.startswith("link:") else None
+        if cls is None:  # e.g. via=hub (the hub's own notices): never trusted
+            return False
+        for e in self.senders:
+            ev = e["via"]
+            if not (ev == cls or (cls.startswith("link:") and ev.startswith("link:") and fnmatch.fnmatchcase(cls, ev))):
+                continue
+            if not fnmatch.fnmatchcase(frm, e["name"]):
+                continue
+            if ev == "tunnel" and self.pinned_peer(frm) != e["session"][len("join-"):]:
+                continue
+            return True
+        return False
 
 
 class Bridge:
-    def __init__(self, top, targets, root, dry_run=False):
+    def __init__(self, top, targets, root, dry_run=False, gate="none"):
         self.top, self.targets, self.dry = top, targets, dry_run
+        if gate not in GATES:
+            raise ValueError(f"gate must be one of {', '.join(GATES)}")
+        self.gate = gate
         self.hub = hub.Hub(root)
+        self.trusted = Trusted(self.hub.root)
         self.ccpeer, self.ccpeer_why = load_ccpeer(top.get("peerbridge"))
         self.herdr = str(top.get("herdr") or "herdr")
         self.markers = DIALOG_MARKERS + [str(m).lower() for m in (top.get("dialog_markers") or [])]
@@ -169,12 +328,20 @@ class Bridge:
         except Exception as e:
             return None, f"resolve failed ({type(e).__name__})"
         if len(recs) != 1:
-            return None, f"peer {hub.one_line(t.peer, 64)!r}: {len(recs)} live matches"
+            hint = " (pb list; a restarted Codex pane needs `pb expose --thread <id>` again)" if not recs else ""
+            return None, f"peer {hub.one_line(t.peer, 64)!r}: {len(recs)} live matches{hint}"
         return recs[0], ""
 
-    def send_ccpeer(self, t, rec, m):
+    def from_mode(self, t, m):
+        """"bypass" only into a +bypass route and only when the gate lets this sender through, else None (no claim):
+        Claude Code holds a message whose from-mode claims more than the receiving session runs."""
+        if not t.bypass or self.gate == "none":
+            return None
+        return "bypass" if self.gate == "all" or self.trusted.allows(m) else None
+
+    def send_ccpeer(self, t, rec, m, mode):
         frm = "hub:" + re.sub(r"[^A-Za-z0-9_.-]", "_", str(m.get("from") or "unknown"))[:120]
-        env = self.ccpeer.envelope(self.compose(t, m, one_line=False), frm, str(m.get("from") or ""), None)
+        env = self.ccpeer.envelope(self.compose(t, m, one_line=False), frm, str(m.get("from") or ""), mode)
         self.ccpeer.send_to(rec, [self.ccpeer.user_frame(frm, env, rec.get("sessionId"))])
 
     # ---- herdr ----
@@ -256,16 +423,22 @@ class Bridge:
         if t.adapter in ("ccpeer", "auto"):
             rec, err = self.ccpeer_target(t)
             if rec is not None:
-                peer = f"{hub.one_line(rec.get('name'), 64)}[{str(rec.get('ref', ''))[:6]}]"
+                mode = self.from_mode(t, m)
+                peer = f"{hub.one_line(rec.get('name'), 64)}[{str(rec.get('ref', ''))[:6]}] from-mode={mode or 'none'}"
                 if self.dry:
                     return "ok", "ccpeer", f"peer={peer} (dry-run, not sent)"
                 try:
-                    self.send_ccpeer(t, rec, m)
+                    self.send_ccpeer(t, rec, m, mode)
                     return "ok", "ccpeer", f"peer={peer}"
                 except Exception as e:
                     err = f"ccpeer send failed ({type(e).__name__})"
             why.append(err)
             if t.adapter == "ccpeer" or not t.herdr_ready():
+                return "hold", "; ".join(why), True
+            if t.bypass and self.from_mode(t, m) != "bypass":
+                # typed text is the pane owner's own input: in a bypass session it skips the approval hold that
+                # Claude Code puts on an unclaimed peer message, so only a sender the gate trusts may be typed
+                why.append("herdr typing into a +bypass route is only for senders the gate trusts")
                 return "hold", "; ".join(why), True
         reason = self.pane_check(t)
         if reason:
@@ -295,8 +468,11 @@ class Bridge:
                 self.hub.deliver(name, t.name, text)
             elif kind == "mesh":
                 hub.deliver_mesh(self.hub, row, t.name, text)
-        except (ValueError, OSError):
-            pass
+            else:
+                raise ValueError("sender not on this hub or its mesh")
+        except (ValueError, OSError) as e:
+            log(f"ERROR {t.name} id={hub.one_line(mid, 32)}: NOT DELIVERED notice to {hub.one_line(frm, 130)} failed "
+                f"({hub.one_line(e, 160)}); the message still waits in the inbox")
 
     # ---- passes ----
     def pending(self, t):
@@ -349,25 +525,51 @@ class Bridge:
         for t in self.targets:  # a local agent may not take a tunnel link's name (hub.py exits with the reason)
             self.hub.check_local_name(t.name)
 
+    def check_gate(self):
+        """Startup: load trusted.json (ERROR if missing/broken) and say what the gate does to +bypass routes."""
+        marked = [t.name for t in self.targets if t.bypass]
+        if self.gate == "none":
+            if marked:
+                log(f"NOTE --gate none: no from-mode=bypass claim into {', '.join(marked)} (+bypass); "
+                    "use --gate trusted to claim it for senders in trusted.json")
+            return
+        if not marked:
+            log(f"NOTE --gate {self.gate}: no route is marked +bypass, so no message claims from-mode=bypass")
+        if self.gate == "all":
+            log("WARNING --gate all: every sender claims from-mode=bypass into the +bypass routes")
+            return
+        self.trusted.load()
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="agent-bridge.py", description="deliver hub messages natively (see file header)")
-    p.add_argument("--config", required=True, help="JSON config (see the file header)")
+    p.add_argument("--config", help="JSON config (see the file header)")
+    p.add_argument("--map", action="append", default=[], metavar="NAME=ROUTE",
+                   help="NAME=peer:<peer>[+bypass] | NAME=herdr:<session>:<pane>; repeatable; adds to --config")
+    p.add_argument("--gate", choices=GATES, help="who may claim from-mode=bypass into +bypass routes "
+                   "(default: the config's \"gate\", else none)")
     p.add_argument("--root", help="hub folder (overrides hub_root in the config)")
     p.add_argument("--once", action="store_true", help="one pass, then exit (1 if anything is held)")
     p.add_argument("--dry-run", action="store_true", help="claim, send and write nothing; log what would happen")
     a = p.parse_args(argv)
+    if not a.config and not a.map:
+        print("agent-bridge: give --config and/or --map", file=sys.stderr)
+        return 2
     try:
-        top, targets = parse_config(a.config)
+        top, targets = parse_config(a.config, a.map)
+        gate = a.gate or top.get("gate") or "none"
+        if gate not in GATES:
+            raise ValueError(f"gate must be one of {', '.join(GATES)}")
     except (OSError, ValueError) as e:
         print(f"agent-bridge: config: {e}", file=sys.stderr)
         return 2
     root = a.root or top.get("hub_root") or hub.default_root()
-    br = Bridge(top, targets, root, dry_run=a.dry_run)
+    br = Bridge(top, targets, root, dry_run=a.dry_run, gate=gate)
     br.check_names()
     cc = "ccpeer ok" if br.ccpeer else f"ccpeer unavailable ({br.ccpeer_why})"
-    log(f"BRIDGE {', '.join(f'{t.name}={t.adapter}' for t in targets)} on {br.hub.root}; {cc}"
-        + ("; DRY-RUN" if a.dry_run else ""))
+    routes = ", ".join(f"{t.name}={t.adapter}" + (BYPASS if t.bypass else "") for t in targets)
+    log(f"BRIDGE {routes} on {br.hub.root}; {cc}; gate={gate}" + ("; DRY-RUN" if a.dry_run else ""))
+    br.check_gate()
     poll = float(top.get("poll") or 1)
     every = float(top.get("heartbeat") or 10)
     br.beat()

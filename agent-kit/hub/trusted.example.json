@@ -1,0 +1,11 @@
+{
+ "log": [
+  "YYYY-MM-DD HH:MM default: the owner's agents on this hub (local) and on linked hubs (link:*). Approval: <where/when the owner approved>.",
+  "YYYY-MM-DD HH:MM add a tunnel peer: via=tunnel, ONLY session join-<KEY>, sender = the hub uplink named 'helper' whose pin (uplinks/helper.pin.json peer) is <KEY>. Approval: <ref>."
+ ],
+ "senders": [
+  {"name": "pc1-*",  "via": "local"},
+  {"name": "pc2-*",  "via": "link:*"},
+  {"name": "helper", "via": "tunnel", "session": "join-<KEY>"}
+ ]
+}

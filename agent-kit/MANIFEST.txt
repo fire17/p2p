@@ -27,10 +27,16 @@ codex-bridge/selftest.py
 codex-bridge/selftest.sh
 codex-bridge/uninstall.sh
 codex-bridge/xtest.py
+docs/AGENT-BRIDGE.md
 docs/MESH-THREATS.md
 docs/MESH.md
+hub/agent-bridge.py
 hub/hub.ps1
 hub/hub.py
+hub/test_agent_bridge.sh
+hub/test_bridge_gate.sh
+hub/test_matrix.sh
+hub/trusted.example.json
 windows/mesh-setup.ps1
 windows/shai-ear.ps1
 windows/shai-send.ps1

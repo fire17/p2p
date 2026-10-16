@@ -226,10 +226,13 @@ The hub is the bus. Delivery into each harness is native first, typing last. Ful
 | Harness | How a message arrives |
 |---|---|
 | Claude Code | Native cross-session message through `codex-bridge/peerbridge/ccpeer.py`. It lands as a real turn, with no typing. |
-| Codex | Run `pb expose --thread <id>` once. The thread then shows up as a ccpeer peer and gets the same native path. |
+| Codex | Run `pb expose --thread <id>` once; the route's peer is that thread id. After a pane restart, expose again. |
 | Anything else, or no live peer | herdr typing, **only** if the pane is not blocked. A startup dialog (folder trust, hook review) can look idle, and an Enter there can exit the agent. If unsure, the message waits in the inbox. |
 
 - **Replies** always go through `hub.py send <sender> "<text>" --from <me>`. Answer `MATRIX PING <id>` with `MATRIX PONG <id>` and nothing else.
 - **Run the adapter:** `python3 hub/agent-bridge.py --config bridge.json` (try `--once --dry-run` first). Config format: docs/AGENT-BRIDGE.md section 4.
-- **Check every path at once:** run `python3 hub/hub.py matrix --names a,b,c --pairs` (agents on this hub). Start with `selftest` and `who`.
-- **Status:** **NOT yet verified** on real Windows + WSL, or across two machines with herdr.
+- **Trust:** `trusted.json` in the hub root lists trusted senders by name pattern and via class (`local`, `link:*`, `tunnel` + `join-<KEY>`). Missing or broken file = nobody trusted. Only the machine's owner edits it; tunnel entries only with the owner's explicit approval, logged in the file. Details: docs/AGENT-BRIDGE.md section 5.
+- **Bypass:** Claude Code holds a message that claims bypass into a non-bypass session, so the bridge claims bypass only into routes marked `+bypass`, only for trusted senders, and only with `--gate trusted` (default `none`). The herdr fallback types into a `+bypass` pane only for those same senders.
+- **Failures** come back to the sender as `NOT DELIVERED <name> (id=<id>): <reason>`; nothing is dropped.
+- **Check every path at once:** run `python3 hub/hub.py matrix --names a,b,c --pairs` (agents on this hub). Start with `selftest` and `who`. Across machines, each side sees only its own inboxes: check both machines' delivery files.
+- **Status:** a real two-PC run (Windows 11 + Windows 10, WSL, herdr, 4 agents per PC) passed **56/56** all-pairs round trips with native adapters only (herdr fallback unused), checked against the hub's delivery files on each machine. The herdr fallback on a real dialog is **NOT yet verified**.
