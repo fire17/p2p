@@ -51,6 +51,9 @@ From then on, every approval must be the approver's JSON `{id, sha8, sha256, by,
 
 The runner does not hide the command from the user account: `results\` are user-readable, so do not pass secrets in commands.
 
+## Self-approve mode (the owner's temporary choice)
+An owner may decide, for a limited time, that the machine's own agents approve their elevated commands themselves: install WITHOUT `-ApproverKey`, and the agent runs `approve.ps1 -Id <id> -Sha8 <sha8> -By "self:<agent name> (owner policy <reference>)"` for its own request. Nothing else changes: one command per approval, single use, 10 min / 60 min limits, and every run in `audit.log`, which the owner can read at any time (`Get-Content C:\ProgramData\AgentAdmin\audit.log`). This is full admin for the agents: use it only as a deliberate, temporary step, and move to signed approvals (an approver key the PC never holds, ideally the owner's own) as soon as that exists. Reinstalling with `-ApproverKey` switches signed mode on, with no unsigned fallback.
+
 ## Tests
 `tests.ps1` runs request -> approve -> runner against a temp root without elevation (`-TestRoot <dir> -NoElevate`). It checks:
 - an approved, matching command runs exactly once;
