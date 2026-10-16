@@ -57,6 +57,37 @@ try {
   $a = @(Get-Content $d.audit)
   Check (($a | ? { $_ -match "id=$id1 .* RAN status=ok exit=3" }).Count -eq 1 -and ($a | ? { $_ -match 'REFUSED' }).Count -ge 5) "audit.log: 1 RAN line for the run, a REFUSED line per refusal ($($a.Count) lines)"
   Check (-not @(Get-ChildItem $d.approved -File).Count) "approved\ is empty after the runner pass (nothing left to retry)"
+  # 8. an approval written WHILE a command runs (a 2nd agent) is handled by the same pass, not left to go stale
+  $c0 = (Get-Content $runs).Count
+  $b8 = Req $probe
+  $j8 = [ordered]@{ id = $b8; sha8 = (Sha8Of $b8); by = 'TEST-MSG'; at = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress
+  $a8 = Req ("[IO.File]::WriteAllText('" + (Join-Path $d.approved "$b8.json") + "', '" + $j8 + "'); " + $probe)
+  Approve $a8 (Sha8Of $a8); $o = Runner
+  Check ((Get-Content $runs).Count -eq $c0 + 2 -and ($o -match "RAN $a8 status=ok") -and ($o -match "RAN $b8 status=ok")) "approval written during a run: picked up by the same pass (re-list)"
+  # 9. a failure AFTER the command ran (here audit.log is unwritable) still finishes the id: result written, never re-run
+  $c0 = (Get-Content $runs).Count
+  Move-Item -LiteralPath $d.audit -Destination "$($d.audit).keep"; [void][IO.Directory]::CreateDirectory($d.audit)
+  $x9 = Req $probe; WriteApproval $x9 'deadbeef' (Get-Date)
+  $i9 = Req $probe; $h9 = Sha8Of $i9; Approve $i9 $h9; $o = Runner
+  Remove-Item -LiteralPath $d.audit -Recurse -Force; Move-Item -LiteralPath "$($d.audit).keep" -Destination $d.audit
+  $r9 = AA-ReadJson (Join-Path $d.results "$i9.json")
+  Check ($r9.status -eq 'ok' -and (Test-Path (Join-Path $d.done "$i9.request.json")) -and -not (Test-Path (Join-Path $d.approved "$i9.json"))) "failure after the run (audit.log): result written, request + approval in done\"
+  Check ([string]$r9.audit_failed -and ((& (Join-Path $here 'status.ps1') -Id $i9 -Root $T) -match '^audit.log not written')) "failure after the run (audit.log): audit_failed in the result, shown by status.ps1"
+  Check (($o -match "REFUSED $x9 : sha8") -and [string](AA-ReadJson (Join-Path $d.results "$x9.refused.json")).audit_failed) "audit.log unwritable: a refusal is recorded (audit_failed) and the pass goes on"
+  WriteApproval $i9 $h9 (Get-Date); $o = Runner
+  Check ((Get-Content $runs).Count -eq $c0 + 1 -and ($o -match "REFUSED $i9 : already handled")) "failure after the run: a later pass never runs it again"
+  # 10. a child the command leaves running still holds the stdout file: output is read anyway (Windows sharing)
+  $i10 = Req ("Start-Process -NoNewWindow -FilePath powershell.exe -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 4'; " + $probe)
+  Approve $i10 (Sha8Of $i10); $o = Runner
+  $r10 = AA-ReadJson (Join-Path $d.results "$i10.json")
+  Check ($r10.status -eq 'ok' -and $r10.stdout -match 'hello-ok' -and ($o -match "RAN $i10 status=ok")) "stdout still held by a child: read shared, result written"
+  # 11. approvals already waiting when the pass starts are judged by that time, not when their turn comes
+  $c0 = (Get-Content $runs).Count
+  $a11 = Req ("Start-Sleep 15; " + $probe); Approve $a11 (Sha8Of $a11)
+  $b11 = $a11.Substring(0, 16) + 'ffffff'   # sorts after a11; request + approval written 9m50s ago
+  AA-WriteJson (Join-Path $d.queue "$b11.json") ([ordered]@{ id = $b11; command = $probe; reason = 'test'; created = (Get-Date).AddSeconds(-590).ToUniversalTime().ToString('o'); sha256 = (AA-Sha256 $probe) })
+  WriteApproval $b11 (Sha8Of $b11) ((Get-Date).AddSeconds(-590)); $o = Runner
+  Check ((Get-Content $runs).Count -eq $c0 + 2 -and ($o -match "RAN $b11 status=ok")) "approval 9m50s old at pass start, behind a 15 s command: still runs (age judged at listing)"
 
   # ================= SELF-APPROVE: only with the owner's policy.json (install.ps1 -SelfApprove)
   $sb = (Get-Content $runs).Count
@@ -75,9 +106,12 @@ try {
   $key = New-Object Security.Cryptography.RSACryptoServiceProvider(3072)
   $other = New-Object Security.Cryptography.RSACryptoServiceProvider(3072)
   [IO.File]::WriteAllText((Join-Path $T 'bin\approver.pub.xml'), $key.ToXmlString($false))
+  $iid = -join ((1..16) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
+  [IO.File]::WriteAllText((Join-Path $T 'bin\install_id'), $iid)
   function NowAt { (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
-  function SignedJson([string]$id, [string]$sha, [string]$by, [string]$at, $signer) {
-    $sig = [Convert]::ToBase64String($signer.SignData([Text.Encoding]::UTF8.GetBytes((AA-SignedPayload $id $sha $by $at)), 'SHA256'))
+  function SignedJson([string]$id, [string]$sha, [string]$by, [string]$at, $signer, [string]$forIid = $iid, [string]$payload) {
+    if (-not $payload) { $payload = AA-SignedPayload $forIid $id $sha $by $at }
+    $sig = [Convert]::ToBase64String($signer.SignData([Text.Encoding]::UTF8.GetBytes($payload), 'SHA256'))
     ([ordered]@{ id = $id; sha8 = $sha.Substring(0, 8); sha256 = $sha; by = $by; at = $at; sig = $sig } | ConvertTo-Json -Compress)
   }
   function ShaOf([string]$id) { AA-Sha256 (AA-ReadJson (Join-Path $d.queue "$id.json")).command }
@@ -121,10 +155,23 @@ try {
   $s9 = Req $probe; $bad = SignedJson $s9 ('1' * 64) 'SIG-MSG-9' (NowAt) $key
   $threw = $false; try { ApproveSigned $bad } catch { $threw = $_.Exception.Message -match 'sha256 does not match' }
   Check $threw "signed: approve.ps1 rejects an approval whose sha256 differs from the request"
+  # s11. install binding: same key, approval signed for ANOTHER install (the other PC) or in the old v1 layout
+  $q11 = AA-ReadJson (Join-Path $d.queue "$s9.json")
+  Check ([string]$q11.install_id -eq $iid) "signed: request.ps1 records this PC's install id"
+  $s11 = Req $probe; PutApproval $s11 (SignedJson $s11 (ShaOf $s11) 'SIG-MSG-11' (NowAt) $key ('f' * 32))
+  $o = Runner; Check ($o -match "REFUSED $s11 : signature invalid") "signed: approval signed for another install refused (no cross-PC replay)"
+  $s12 = Req $probe; $sh = ShaOf $s12; $at = NowAt
+  PutApproval $s12 (SignedJson $s12 $sh 'SIG-MSG-12' $at $key $iid "agent-admin-v1|$s12|$sh|SIG-MSG-12|$at")
+  $o = Runner; Check ($o -match "REFUSED $s12 : signature invalid") "signed: old v1 signature (no install id) refused"
+  Remove-Item -LiteralPath (Join-Path $T 'bin\install_id')
+  $s13 = Req $probe; PutApproval $s13 (SignedJson $s13 (ShaOf $s13) 'SIG-MSG-13' (NowAt) $key)
+  $o = Runner; Check ($o -match "REFUSED $s13 : signed mode: no valid bin") "signed: no bin\install_id -> every approval refused"
+  Check ((Get-Content $runs).Count -eq $base + 1) "signed: still only the one valid approval ever ran"
   # s10. cross-platform vector (python cryptography, RSA-3072 PKCS1v15 SHA256)
   $v = Get-Content -LiteralPath (Join-Path $here 'test-vector.json') -Raw | ConvertFrom-Json
   Check ((AA-Sha256 $v.command) -eq $v.sha256) "vector: sha256(command) matches"
-  Check ((AA-SignedPayload '20261016-234500-a1b2c3' $v.sha256 '3A00000001' '2026-10-16T20:45:00Z') -eq $v.payload) "vector: payload layout agent-admin-v1|id|sha256|by|at matches"
+  $vi = '0123456789abcdef0123456789abcdef'   # the vector is v1; v2 is the same fields with the install id after the prefix
+  Check ((AA-SignedPayload $vi '20261016-234500-a1b2c3' $v.sha256 '3A00000001' '2026-10-16T20:45:00Z') -eq ('agent-admin-v2|' + $vi + '|' + $v.payload.Substring('agent-admin-v1|'.Length))) "vector: payload layout agent-admin-v2|install_id|id|sha256|by|at matches"
   Check (AA-VerifySig $v.pub_xml $v.payload $v.sig) "vector: VerifyData(payload) = True (cross-platform signature)"
   Check (-not (AA-VerifySig $v.pub_xml $v.bad_payload $v.sig)) "vector: VerifyData(payload+'x') = False"
   $key.Dispose(); $other.Dispose()

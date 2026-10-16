@@ -1,11 +1,11 @@
 # common.ps1 - shared helpers for the admin-runner scripts (dot-sourced; PowerShell 5.1, ASCII).
 # Layout under the root (default C:\ProgramData\AgentAdmin):
-#   queue\<id>.json      request  {id, command, reason, created, sha256}      written by the user-level agent
+#   queue\<id>.json      request  {id, command, reason, created, sha256, install_id}  written by the user-level agent
 #   approved\<id>.json   approval {id, sha8, by, at}                          written by the user-level agent
 #   done\                handled requests/approvals (moved there by the runner, never run again)
 #   results\<id>.json    {id, status, exit, stdout, stderr, ...}              written by the runner
 #   audit.log            one line per runner decision                         written by the runner
-#   bin\                 runner.ps1 + common.ps1, admin-write only            what actually runs elevated
+#   bin\                 runner.ps1 + common.ps1 + install_id, admin-write only  what actually runs elevated
 
 $AA_DefaultRoot = Join-Path $env:ProgramData 'AgentAdmin'
 $AA_MaxCommandChars = 2000
@@ -54,12 +54,22 @@ function AA-CheckId([string]$id) {
 }
 
 # ---- signed approvals (bin\approver.pub.xml present = signed mode, no unsigned fallback)
-$AA_SigPrefix = 'agent-admin-v1'
+# v2 binds the approval to ONE install (bin\install_id, 32 hex, written by install.ps1): the same approver key on two
+# PCs must not let an approval made for one run on the other. v1 signatures (no install id) never verify.
+$AA_SigPrefix = 'agent-admin-v2'
 $AA_AtPattern = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+$AA_InstallIdPattern = '^[0-9a-f]{32}$'
 
-function AA-SignedPayload([string]$id, [string]$sha256, [string]$by, [string]$at) {
-  # exactly what the approver signs (UTF-8 bytes); at = the approval's "at" string as written
-  "$AA_SigPrefix|$id|$sha256|$by|$at"
+function AA-SignedPayload([string]$installId, [string]$id, [string]$sha256, [string]$by, [string]$at) {
+  # exactly what the approver signs (UTF-8 bytes); at = the approval's "at" string as written;
+  # installId = the runner's own bin\install_id, never a value taken from the request or the approval
+  "$AA_SigPrefix|$installId|$id|$sha256|$by|$at"
+}
+
+function AA-ReadInstallId([string]$path) {
+  # '' when missing or malformed (signed mode then refuses every approval)
+  try { $v = ([IO.File]::ReadAllText($path)).Trim() } catch { return '' }
+  if ($v -match $AA_InstallIdPattern) { $v } else { '' }
 }
 
 function AA-VerifySig([string]$pubXml, [string]$payload, [string]$sigB64) {

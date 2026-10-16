@@ -61,6 +61,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Signed') {
   "approved $Id (sha8 $Sha8) by $By"
 }
 if (-not $NoStart) {
+  # a pass already running re-lists approved\ before it exits, so this approval is not lost
+  $busy = $false
+  try { $busy = [string](Get-ScheduledTask -TaskPath '\AgentAdmin\' -TaskName 'AgentAdmin-Runner').State -eq 'Running' } catch { }
   Start-ScheduledTask -TaskPath '\AgentAdmin\' -TaskName 'AgentAdmin-Runner'
-  'runner started; check: status.ps1 -Id ' + $Id
+  if ($busy) { 'runner busy (a pass is running), it picks this up before it exits; check: status.ps1 -Id ' + $Id }
+  else { 'runner started; check: status.ps1 -Id ' + $Id }
 }

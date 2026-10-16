@@ -3,27 +3,27 @@
 A user-level agent can ask for one elevated PowerShell command. It runs only after the machine's owner approves that exact command (its id and sha8). Every decision is logged.
 
 ## Flow
-1. The agent queues the command: `request.ps1 -Command "<powershell>" -Reason "<why>"`. It prints `id`, `sha8` and the exact command.
+1. The agent queues the command: `request.ps1 -Command "<powershell>" -Reason "<why>"`. It prints `id`, `sha8`, this PC's `install` id (once installed) and the exact command.
 2. The owner sees the id, the sha8, the reason and the exact command, and approves (for example with a chat button).
 3. The agent records that approval and starts the runner: `approve.ps1 -Id <id> -Sha8 <sha8> -By "<approval reference>"`. This starts the on-demand task `\AgentAdmin\AgentAdmin-Runner`.
-4. The runner (elevated, one pass) runs the command only if all of these hold:
+4. The runner (elevated) passes over `approved\`, then lists it again, until a listing finds nothing new, so an approval written while a command runs is handled by the same run. If the task is already running, the new start is queued (`-MultipleInstances Queue`) and `approve.ps1` says `runner busy`. It runs a command only if all of these hold:
    - the approval's sha8 equals sha256 of the command as loaded at run time (a command changed after approval is refused);
-   - the approval is at most 10 min old;
-   - the request is at most 60 min old;
+   - the approval is at most 10 min old, and the request at most 60 min old, when the listing that found it was made (an approval waiting behind a long command does not go stale);
    - the command is at most 2000 chars;
    - the id was never handled before.
 
-   The command runs in a child PowerShell with a 10-minute limit. The runner writes `results\<id>.json` (stdout, stderr, exit code), appends one line to `audit.log`, and moves the request and approval to `done\`. A refusal is also logged and moved, so nothing is retried or run twice.
-5. `status.ps1 -Id <id>` shows the outcome.
+   Before the command runs, the request moves to `done\<id>.request.json` and is made admin-owned and user read-only; that file is what marks the id as handled, so nothing that fails later runs it again. The command runs in a child PowerShell with a 10-minute limit. The runner writes `results\<id>.json` (stdout, stderr, exit code; `error` if the run or the result failed; `audit_failed` if `audit.log` could not be written), appends one line to `audit.log`, and moves the approval to `done\`. A refusal is also logged and moved, so nothing is retried or run twice.
+5. `status.ps1 -Id <id>` shows the outcome, including `error` and `audit_failed`.
 
 Root: `C:\ProgramData\AgentAdmin\` (`queue\ approved\ done\ results\ bin\ audit.log`).
 
 ## Install (once per PC, by the owner, elevated)
 `powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -WhatIf` shows the plan. Run it again without `-WhatIf` from an elevated PowerShell. It does the following:
-- creates the folders;
+- creates the folders and makes Administrators the owner of the whole tree. If an admin-only part already existed and was not admin-owned (a user can create folders under ProgramData first), it was planted: its ACLs are reset and `bin\` is recreated empty. If that planted `bin\` held `approver.pub.xml`, install stops unless `-ApproverKey` or `-SelfApprove` is given, so a signed PC is never silently turned unsigned;
 - sets ACLs: the user may write only `queue\` and `approved\`, and only reads `bin\`, `results\`, `done\` and `audit.log`;
-- copies `runner.ps1` + `common.ps1` into `bin\`, so a user-level process cannot edit what runs elevated;
-- registers the task (RunLevel Highest, no trigger, run headless via `conhost.exe --headless`).
+- copies `runner.ps1` + `common.ps1` into `bin\`, so a user-level process cannot edit what runs elevated, and writes `bin\install_id` (random, kept on reinstall);
+- before registering the task, forces the owner and ACL of `bin\` again and checks every admin-only item: owned by Administrators/SYSTEM, writable by no one else, and `bin\runner.ps1` + `common.ps1` equal to the files being installed. Any failure stops the install with the task not registered;
+- registers the task (RunLevel Highest, no trigger, run headless via `conhost.exe --headless`, queued starts, 2 h limit).
 
 Uninstall: `install.ps1 -Uninstall` removes the task and `bin\`, and keeps `audit.log`, `results\` and `done\`.
 
@@ -31,7 +31,8 @@ Uninstall: `install.ps1 -Uninstall` removes the task and `bin\`, and keeps `audi
 Install with `install.ps1 -ApproverKey <approver.pub.xml>`. The approver's RSA **public** key goes to `bin\approver.pub.xml`, which is admin-write only. `install.ps1` refuses a private key and keys under 2048 bits. The private key stays with the approver and never touches the PC.
 
 From then on, every approval must be the approver's JSON `{id, sha8, sha256, by, at, sig}`, recorded verbatim with `approve.ps1 -ApprovalJson <file|text>`:
-- `sig` is RSA PKCS#1 v1.5 + SHA-256 over the UTF-8 bytes of `agent-admin-v1|<id>|<sha256>|<by>|<at>`, with `at` exactly `yyyy-MM-ddTHH:mm:ssZ`;
+- `sig` is RSA PKCS#1 v1.5 + SHA-256 over the UTF-8 bytes of `agent-admin-v2|<install_id>|<id>|<sha256>|<by>|<at>`, with `at` exactly `yyyy-MM-ddTHH:mm:ssZ`;
+- `install_id` is this PC's `bin\install_id` (request.ps1 prints it as `install:`). The runner uses its own copy, never one from the request or the approval, so an approval made for one PC never runs on another that has the same approver key. v1 signatures (no install id) are refused; the approver must sign v2;
 - `sha256` must equal the sha256 of the command as loaded at run time;
 - all other checks (age, single use, size, lock, audit) still apply;
 - there is no unsigned fallback: a sha8-only approval is refused, and `approve.ps1 -Sha8` refuses on a signed install.
@@ -59,7 +60,9 @@ The owner turns it on HIMSELF, elevated, at the PC: `install.ps1 -SelfApprove` (
 - an approved, matching command runs exactly once;
 - a wrong sha8 is refused;
 - a stale approval is refused;
-- a replay is refused;
+- a replay is refused, also after a failure that happens after the run;
+- an approval written during a run is handled by the same run, and one waiting behind a long command does not go stale;
+- an `audit.log` that cannot be written is recorded as `audit_failed` and does not stop the pass;
 - a command over the limit is refused;
 - a command swapped after approval is refused;
 - the audit lines are written;
@@ -69,5 +72,6 @@ The owner turns it on HIMSELF, elevated, at the PC: `install.ps1 -SelfApprove` (
   - a missing signature is refused;
   - a sha8-only approval is refused;
   - a signature from another key is refused;
+  - an approval signed for another install, a v1 signature, and a missing `bin\install_id` are refused;
   - `approve.ps1` stores the JSON verbatim and rejects a sha256 mismatch;
-- a cross-platform vector (`test-vector.json`, signed with Python `cryptography`): `VerifyData(payload)` is True, and `VerifyData(payload+"x")` is False.
+- a cross-platform vector (`test-vector.json`, signed with Python `cryptography`): `VerifyData(payload)` is True, and `VerifyData(payload+"x")` is False. The vector is still v1: it checks the RSA/SHA-256 interop, and the v2 payload layout is checked against its fields.
