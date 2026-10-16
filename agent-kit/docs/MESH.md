@@ -143,6 +143,12 @@ Expect the machines to see each other again within about **5 minutes** of both b
 - A helper's single uplink (an outside party) sees and reaches only the PC it is on, not your other machines, unless you start it with `--transit-to` / `--share-mesh`.
 - Known risks of linking hubs, and their fixes, are listed in [MESH-THREATS.md](MESH-THREATS.md).
 
+## Known quirks
+
+- The far hub gives each message it stores a new id. A reply cannot quote the sender's original id; quote a few words of the text instead.
+- Run `mesh-setup.ps1` straight in a console, or send its output to a file (`... mesh-setup.ps1 ... *> mesh-setup.log`). If a wrapper captures its output through a pipe, the tunnel daemon it starts can keep that pipe open, so the wrapper waits and the console output is lost. Setup itself still completes; check with `-Status`.
+- `shai-ear.ps1` / `shai-send.ps1` skip `mesh-*` sessions when they pick a session by themselves (kit after 2026-10-16). With an older kit, pass `-Name join-<KEY>` explicitly on any PC that has a mesh link.
+
 ## Verification status (honest)
 
 | Check | Result |
@@ -150,7 +156,7 @@ Expect the machines to see each other again within about **5 minutes** of both b
 | `mesh-setup.ps1` parses; pure ASCII | done (PowerShell 7.6 parser, macOS) |
 | `-WhatIf` for main, extra PC and uninstall: prints the plan, writes no file, runs no command | done (PowerShell 7.6, macOS) |
 | Full run against the **real** p2p v0.3.8 CLI, offline (two throwaway p2p homes, loopback rendezvous), Task Scheduler cmdlets **mocked**: setup on both ends, `who` both ways, message by name, rerun keeps the same key, one keeper per link, a killed hub link restarts, a dead listener restarts, the far end rejoins (about 4.5 min), a hard-killed keeper's leftover link is stopped by the next keeper, uninstall leaves nothing running | **22/22 pass** (macOS, PowerShell 7.6) |
-| Windows PowerShell 5.1; real Task Scheduler registration without admin; hidden window at logon; `-Autostart Startup` | **NOT yet verified** |
+| Real two-PC run (Windows 11 Pro main + Windows 10 Home extra, Windows PowerShell 5.1, real internet, real Task Scheduler without admin): `-WhatIf` then setup on both ends, `who` shows the far machine `up` on both, one `@name` message each way, exactly one copy each, about 2 s one-way | **pass** (2026-10-16) |
+| Hidden window at logon after a real reboot; `-Autostart Startup` | **NOT yet verified** |
 | A link run through WSL (`wsl.exe -e python3 ... --wsl-interop`) when Windows has no Python | **NOT yet verified** |
-| `p2p tunnel listen` on Windows over the real internet | **NOT yet verified** |
 | Re-run after the security pass (hub.py pins, guards, `unpin` on uninstall; plan lines now show the exact `--say WHO?` and `--label` argv): same offline run, plus pins exist after setup, a local agent cannot take a link's name, and uninstall unpins | **25/25 pass** (macOS, PowerShell 7.6, real p2p v0.3.8, mocked Task Scheduler) |
