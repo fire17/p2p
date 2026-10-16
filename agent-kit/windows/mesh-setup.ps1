@@ -259,7 +259,8 @@ function Start-HubChild([string[]]$argv, [string]$link) {
   # Each start truncates the logs: keep the previous run's as *.prev.log, so a link exit can be diagnosed.
   foreach ($f in @($out, $err)) {
     if (Test-Path -LiteralPath $f) {
-      try { Move-Item -LiteralPath $f -Destination ($f -replace '\.log$', '.prev.log') -Force } catch {}
+      try { Move-Item -LiteralPath $f -Destination ($f -replace '\.log$', '.prev.log') -Force }
+      catch { Log-Line $link "could not keep $f as .prev.log ($($_.Exception.Message)); it is overwritten" }
     }
   }
   $sp = @{ FilePath = $argv[0]; PassThru = $true; RedirectStandardOutput = $out; RedirectStandardError = $err }
