@@ -74,21 +74,29 @@ echo "$OUT" | grep -q "^NOTE --gate none: no from-mode=bypass claim into r-yes";
 # ---- 2. --gate trusted: whitelisted local sender -> bypass only into the +bypass route
 inject r-yes t-a "tok-tr-yes" ""
 inject r-no t-a "tok-tr-no" ""
+python3 "$HERE/hub.py" here x-a --harness test >/dev/null   # registered, so the refusal notice can reach it
 inject r-yes x-a "tok-untrusted" ""
 inject r-yes hub "tok-hubnotice" "hub"
 run --gate trusted
 [ "$(mode_of tok-tr-yes)" = bypass ]; ok $? "trusted: local whitelisted sender claims bypass into +bypass route"
 [ "$(mode_of tok-tr-no)" = none ]; ok $? "trusted: never a claim into a route not marked +bypass"
-[ "$(mode_of tok-untrusted)" = none ]; ok $? "trusted: sender not on the whitelist gets no claim"
-[ "$(mode_of tok-hubnotice)" = none ]; ok $? "trusted: via=hub notices are never trusted"
+[ "$(mode_of tok-untrusted)" = MISSING ]; ok $? "trusted: sender not on the whitelist is refused, not sent"
+[ "$(mode_of tok-hubnotice)" = MISSING ]; ok $? "trusted: via=hub notices are never trusted (refused into +bypass)"
 echo "$OUT" | grep -q "^TRUSTED .*1 sender rule"; ok $? "trusted: TRUSTED line on load"
+echo "$OUT" | grep -q "^REFUSE r-yes <- x-a .*sender not in trusted.json"; ok $? "refuse: REFUSE line names route, sender, reason"
+grep -l "NOT DELIVERED r-yes .*It is not retried" "$ROOT"/inbox/x-a/*.json >/dev/null 2>&1; ok $? "refuse: sender gets one NOT DELIVERED notice (not retried)"
+! ls "$ROOT/inbox/r-yes" | grep -q '\.json$'; ok $? "refuse: refused message leaves the inbox (no retry loop)"
+inject r-yes x-b "tok-hol-untrusted" ""
+inject r-yes t-b "tok-hol-trusted" ""
+run --gate trusted
+[ "$(mode_of tok-hol-trusted)" = bypass ] && [ "$(mode_of tok-hol-untrusted)" = MISSING ]; ok $? "refuse: an older untrusted message never blocks a trusted one behind it"
 
 # ---- 3. via class must match: tunnel/link messages never ride a local entry
 inject r-yes t-a "tok-tun-as-local" "tunnel"
 inject r-yes t-a@lap "tok-link-as-local" "link:lap"
 run --gate trusted
-[ "$(mode_of tok-tun-as-local)" = none ]; ok $? "class: tunnel message with a whitelisted local name gets no claim"
-[ "$(mode_of tok-link-as-local)" = none ]; ok $? "class: link message with a whitelisted local name gets no claim"
+[ "$(mode_of tok-tun-as-local)" = MISSING ]; ok $? "class: tunnel message with a whitelisted local name gets no claim"
+[ "$(mode_of tok-link-as-local)" = MISSING ]; ok $? "class: link message with a whitelisted local name gets no claim"
 
 # ---- 4. link entries
 printf '{"log":["test"],"senders":[{"name":"l-*","via":"link:*"},{"name":"m-*","via":"link:lap"}]}\n' | trust
@@ -99,46 +107,46 @@ inject r-yes l-a "tok-local-as-link" ""
 inject r-yes l-a "tok-tunnel-as-link" "tunnel"
 run --gate trusted
 [ "$(mode_of tok-link-any)" = bypass ]; ok $? "link: link:* entry trusts its names over any link"
-[ "$(mode_of tok-link-named)" = bypass ] && [ "$(mode_of tok-link-other)" = none ]; ok $? "link: link:<name> entry trusts only that link"
-[ "$(mode_of tok-local-as-link)" = none ] && [ "$(mode_of tok-tunnel-as-link)" = none ]; ok $? "link: local and tunnel messages never ride a link entry"
+[ "$(mode_of tok-link-named)" = bypass ] && [ "$(mode_of tok-link-other)" = MISSING ]; ok $? "link: link:<name> entry trusts only that link"
+[ "$(mode_of tok-local-as-link)" = MISSING ] && [ "$(mode_of tok-tunnel-as-link)" = MISSING ]; ok $? "link: local and tunnel messages never ride a link entry"
 echo "$OUT" | grep -q "^TRUSTED .*2 sender rule"; ok $? "reload: trusted.json re-read after it changed"
 
 # ---- 5. tunnel entries need the uplink pin of their session
 printf '{"log":["test"],"senders":[{"name":"helper","via":"tunnel","session":"join-SECRETKEY1"}]}\n' | trust
 inject r-yes helper "tok-tun-nopin" "tunnel"
 run --gate trusted
-[ "$(mode_of tok-tun-nopin)" = none ]; ok $? "tunnel: no uplink pin -> no claim"
+[ "$(mode_of tok-tun-nopin)" = MISSING ]; ok $? "tunnel: no uplink pin -> no claim"
 ! echo "$OUT" | grep -q SECRETKEY1; ok $? "tunnel: the join key is never printed"
 mkdir -p "$ROOT/uplinks"; printf '{"peer":"OTHERKEY"}\n' > "$ROOT/uplinks/helper.pin.json"
 inject r-yes helper "tok-tun-wrongpin" "tunnel"
 run --gate trusted
-[ "$(mode_of tok-tun-wrongpin)" = none ]; ok $? "tunnel: uplink pinned to another key -> no claim"
+[ "$(mode_of tok-tun-wrongpin)" = MISSING ]; ok $? "tunnel: uplink pinned to another key -> no claim"
 printf '{"peer":"SECRETKEY1"}\n' > "$ROOT/uplinks/helper.pin.json"
 inject r-yes helper "tok-tun-pinned" "tunnel"
 inject r-yes helper "tok-tun-entry-local" ""
 inject r-yes helper@lap "tok-tun-entry-link" "link:lap"
 run --gate trusted
 [ "$(mode_of tok-tun-pinned)" = bypass ]; ok $? "tunnel: pinned to the entry's key -> bypass"
-[ "$(mode_of tok-tun-entry-local)" = none ] && [ "$(mode_of tok-tun-entry-link)" = none ]; ok $? "tunnel: a tunnel entry never trusts the same name locally or over a link"
+[ "$(mode_of tok-tun-entry-local)" = MISSING ] && [ "$(mode_of tok-tun-entry-link)" = MISSING ]; ok $? "tunnel: a tunnel entry never trusts the same name locally or over a link"
 ! echo "$OUT" | grep -q SECRETKEY1; ok $? "tunnel: the pinned key is never printed"
 
 # ---- 6. fail closed: missing, broken, invalid
 rm -f "$ROOT/trusted.json"
 inject r-yes helper "tok-missing" "tunnel"
 run --gate trusted
-[ "$(mode_of tok-missing)" = none ] && echo "$OUT" | grep -q "^ERROR trusted.json: .*missing: nobody trusted"; ok $? "fail closed: missing file -> nobody trusted + ERROR"
+[ "$(mode_of tok-missing)" = MISSING ] && echo "$OUT" | grep -q "^ERROR trusted.json: .*missing: nobody trusted"; ok $? "fail closed: missing file -> nobody trusted + ERROR"
 printf '{"senders": [ {"name": "t-*", "via": "local"},' | trust
 inject r-yes t-a "tok-broken" ""
 run --gate trusted
-[ "$(mode_of tok-broken)" = none ] && echo "$OUT" | grep -q "^ERROR trusted.json: .*unreadable"; ok $? "fail closed: broken JSON -> nobody trusted + ERROR"
+[ "$(mode_of tok-broken)" = MISSING ] && echo "$OUT" | grep -q "^ERROR trusted.json: .*unreadable"; ok $? "fail closed: broken JSON -> nobody trusted + ERROR"
 printf '{"senders":[{"name":"t-*","via":"local"},{"name":"helper","via":"tunnel"}]}\n' | trust
 inject r-yes t-a "tok-invalid" ""
 run --gate trusted
-[ "$(mode_of tok-invalid)" = none ] && echo "$OUT" | grep -q 'needs "session"'; ok $? "fail closed: tunnel entry without session rejects the whole file"
+[ "$(mode_of tok-invalid)" = MISSING ] && echo "$OUT" | grep -q 'needs "session"'; ok $? "fail closed: tunnel entry without session rejects the whole file"
 printf '{"senders":[{"name":"t-*","via":"anywhere"}]}\n' | trust
 inject r-yes t-a "tok-badvia" ""
 run --gate trusted
-[ "$(mode_of tok-badvia)" = none ] && echo "$OUT" | grep -q '"via" must be'; ok $? "fail closed: unknown via rejects the whole file"
+[ "$(mode_of tok-badvia)" = MISSING ] && echo "$OUT" | grep -q '"via" must be'; ok $? "fail closed: unknown via rejects the whole file"
 
 # ---- 7. --gate all: everyone, but still only into +bypass routes
 inject r-yes x-a "tok-all-yes" "tunnel"
@@ -184,11 +192,13 @@ printf '{"herdr_session":"main","agents":[{"name":"r-fb","adapter":"auto","peer"
 inject r-fb x-a "tok-fb-untrusted" "tunnel"
 OUT=$(PATH="$T/bin:$PATH" FAKE_HERDR_DIR="$T/herdr" BR --config "$T/fb.json" --gate trusted --once 2>&1); RC=$?
 echo "$OUT" | sed 's/^/    /'
-[ $RC = 1 ] && ! grep -q tok-fb-untrusted "$T/herdr/typed.log" 2>/dev/null && echo "$OUT" | grep -q "^HOLD r-fb .*only for senders the gate trusts"
-ok $? "fallback: untrusted sender is never typed into a +bypass pane (held)"
+[ $RC = 0 ] && ! grep -q tok-fb-untrusted "$T/herdr/typed.log" 2>/dev/null && echo "$OUT" | grep -q "^REFUSE r-fb .*sender not in trusted.json"
+ok $? "fallback: untrusted sender is never typed into a +bypass pane (refused)"
+inject r-fb x-a "tok-fb-untrusted-none" "tunnel"
+OUT=$(PATH="$T/bin:$PATH" FAKE_HERDR_DIR="$T/herdr" BR --config "$T/fb.json" --gate none --once 2>&1); RC=$?
+[ $RC = 1 ] && echo "$OUT" | grep -q "^HOLD r-fb .*only for senders the gate trusts"; ok $? "fallback: --gate none holds it instead"
 ls "$ROOT/inbox/r-fb" | grep -q '\.json$'; ok $? "fallback: held message stays in the inbox"
-OUT=$(PATH="$T/bin:$PATH" FAKE_HERDR_DIR="$T/herdr" BR --config "$T/fb.json" --gate none --once 2>&1)
-! grep -q tok-fb-untrusted "$T/herdr/typed.log" 2>/dev/null; ok $? "fallback: --gate none types nothing into a +bypass pane"
+! grep -q tok-fb-untrusted-none "$T/herdr/typed.log" 2>/dev/null; ok $? "fallback: --gate none types nothing into a +bypass pane"
 rm -f "$ROOT"/inbox/r-fb/*.json
 inject r-fb t-a "tok-fb-trusted" ""
 OUT=$(PATH="$T/bin:$PATH" FAKE_HERDR_DIR="$T/herdr" BR --config "$T/fb.json" --gate trusted --once 2>&1)

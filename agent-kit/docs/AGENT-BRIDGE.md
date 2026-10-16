@@ -203,6 +203,12 @@ hub/agent-bridge-start.sh --prefix desk [--session main] --watch 60             
 | `trusted` | senders that match the whitelist below |
 | `all` | everyone. Testing only: any sender then acts with the target's bypass rights |
 
+With `--gate trusted`, a message from a sender that is **not** trusted into a `+bypass` route is **refused**:
+not sent and not retried. Sent without the claim, it would stop that bypass session at Claude Code's
+"deliver this message?" prompt, and the pane would stay blocked until a human answers. The log says
+`REFUSE <route> <- <sender>` and the sender gets one `NOT DELIVERED ... It is not retried.` notice.
+Routes without `+bypass` are not affected. (`--gate none` keeps the old behaviour: no claim, the prompt decides.)
+
 The whitelist is `trusted.json` in the hub root. The bridge re-reads it whenever it changes on disk:
 
 ```json
@@ -240,6 +246,9 @@ A `tunnel` entry is added only with the owner's explicit approval, and every cha
 python3 hub/hub.py matrix --names desk-claude,desk-codex,desk-rc --pairs     # every local pair, both ways
 python3 hub/hub.py matrix --names lap-claude@lap,lap-codex@lap               # from a throwaway sender
 ```
+
+Into `+bypass` routes, send as a trusted name (`--from <a name in trusted.json>`). The default throwaway
+sender `matrix-<pid>` is not trusted, so the bridge refuses those PINGs and the pair shows as not ponged.
 
 Sends `MATRIX PING <id>` (a fresh token per message), waits for each `MATRIX PONG <id>` from the right
 agent, and prints `name | sent | pong | seconds`, then `MATRIX n/m ponged`. Exit 0 only if every one

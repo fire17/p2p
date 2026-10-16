@@ -37,6 +37,9 @@ Gate (from-mode). Claude Code holds a peer message behind an approval prompt whe
 the receiving session runs: from-mode=bypass into a NON-bypass (e.g. auto-mode) session is held too. So the
 bridge claims from-mode=bypass only into routes marked +bypass (the target runs bypassPermissions) and only when
 the gate lets the sender through; otherwise it claims nothing.
+With --gate trusted, a message from an untrusted sender into a +bypass route is REFUSED, not sent: unclaimed, it
+would stop that session at Claude Code's "deliver this message?" prompt and block the pane until a human answers.
+The sender gets one NOT DELIVERED notice; the message is not retried (it stays in the inbox's read/ folder).
   --gate none     (default) never claim bypass
   --gate trusted  claim for senders whitelisted in <hub root>/trusted.json (re-read whenever it changes):
                     {"log": ["<who approved what, when>", ...],
@@ -78,6 +81,8 @@ HUB_PY = os.path.join(HERE, "hub.py")
 ADAPTERS = ("ccpeer", "herdr", "auto")
 GATES = ("none", "trusted", "all")
 BYPASS = "+bypass"
+UNTRUSTED = ("sender not in trusted.json: this route runs bypassPermissions, and an unclaimed message would stop "
+             "it at an approval prompt")
 DEFAULT_SEND = ["agent", "prompt", "{pane}", "{text}"]
 # Phrases on a pane's visible screen that mean a dialog/menu owns the keyboard (lower case).
 DIALOG_MARKERS = [
@@ -339,6 +344,10 @@ class Bridge:
             return None
         return "bypass" if self.gate == "all" or self.trusted.allows(m) else None
 
+    def refuses(self, t, mode):
+        """--gate trusted: an untrusted sender's message into a +bypass route is refused (see Gate)."""
+        return t.bypass and self.gate == "trusted" and mode != "bypass"
+
     def send_ccpeer(self, t, rec, m, mode):
         frm = "hub:" + re.sub(r"[^A-Za-z0-9_.-]", "_", str(m.get("from") or "unknown"))[:120]
         env = self.ccpeer.envelope(self.compose(t, m, one_line=False), frm, str(m.get("from") or ""), mode)
@@ -418,12 +427,14 @@ class Bridge:
 
     # ---- one message ----
     def route(self, t, m, path):
-        """("ok", via, detail) | ("hold", reason, retry) -- 'hold' leaves the message for a later retry."""
+        """("ok", via, detail) | ("hold", reason, retry) | ("refuse", reason, False) -- hold = retry later, refuse = never."""
         why = []
         if t.adapter in ("ccpeer", "auto"):
             rec, err = self.ccpeer_target(t)
             if rec is not None:
                 mode = self.from_mode(t, m)
+                if self.refuses(t, mode):
+                    return "refuse", UNTRUSTED, False
                 peer = f"{hub.one_line(rec.get('name'), 64)}[{str(rec.get('ref', ''))[:6]}] from-mode={mode or 'none'}"
                 if self.dry:
                     return "ok", "ccpeer", f"peer={peer} (dry-run, not sent)"
@@ -435,6 +446,8 @@ class Bridge:
             why.append(err)
             if t.adapter == "ccpeer" or not t.herdr_ready():
                 return "hold", "; ".join(why), True
+            if self.refuses(t, self.from_mode(t, m)):
+                return "refuse", UNTRUSTED, False
             if t.bypass and self.from_mode(t, m) != "bypass":
                 # typed text is the pane owner's own input: in a bypass session it skips the approval hold that
                 # Claude Code puts on an unclaimed peer message, so only a sender the gate trusts may be typed
@@ -454,14 +467,15 @@ class Bridge:
             return "hold", "; ".join(why), True
         return "ok", "herdr", where + (f" (native skipped: {why[0]})" if why else "")
 
-    def notify_sender(self, t, m, reason):
+    def notify_sender(self, t, m, reason, retried=True):
         """One NOT DELIVERED notice per held message, back through the hub (never to a notice: no ping-pong)."""
         mid, frm = str(m.get("id") or ""), str(m.get("from") or "")
         if (self.dry or not frm or frm.partition("@")[0] == t.name or mid in t.noticed
                 or str(m.get("text", "")).startswith("NOT DELIVERED")):
             return
         t.noticed.add(mid)
-        text = f"NOT DELIVERED {t.name} (id={mid}): {reason}. It waits in the hub and is retried."
+        text = f"NOT DELIVERED {t.name} (id={mid}): {reason}. " + (
+            "It waits in the hub and is retried." if retried else "It is not retried.")
         try:
             kind, name, row = hub.resolve(self.hub, frm)
             if kind == "local":
@@ -472,7 +486,7 @@ class Bridge:
                 raise ValueError("sender not on this hub or its mesh")
         except (ValueError, OSError) as e:
             log(f"ERROR {t.name} id={hub.one_line(mid, 32)}: NOT DELIVERED notice to {hub.one_line(frm, 130)} failed "
-                f"({hub.one_line(e, 160)}); the message still waits in the inbox")
+                f"({hub.one_line(e, 160)})" + ("; the message still waits in the inbox" if retried else ""))
 
     # ---- passes ----
     def pending(self, t):
@@ -499,6 +513,10 @@ class Bridge:
                 tag = "DRY" if self.dry else "DELIVER"
                 log(f"{tag} {t.name} <- {frm} id={mid} via={res[1]} {res[2]} ({len(str(m.get('text', '')))} chars)")
                 t.backoff = RETRY_MIN
+                continue
+            if res[0] == "refuse":
+                log(f"REFUSE {t.name} <- {frm} id={mid}: {res[1]}")
+                self.notify_sender(t, m, res[1], retried=False)
                 continue
             if not self.dry:
                 try:
