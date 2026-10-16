@@ -1241,13 +1241,27 @@ def tunnel_args(a):
     cmd = shlex.split(a.p2p, posix=(os.name != "nt")) if a.p2p else default_p2p(interop)
     return home, cmd, interop
 
+STEP_FAILS_MAX = 5   # a link/uplink exits (code 1) only after this many failed steps in a row
+
 def run_bridge(hub, a, br, banner):
     if not br.mailbox()[0]: die(f"no tunnel session {a.session!r} under {br.p2p_home} (look in {os.path.join(br.p2p_home, 'tunnel')})", 5)
     leave_on_signals(); out(banner)
-    last = None
+    last, fails = None, 0
     try:
         while True:
-            link = br.step()
+            try:
+                link = br.step(); fails = 0
+            except Exception as e:
+                # One bad step (a far end that restarts mid-read, a file another reader just moved) must not end
+                # the link: log it with its traceback, back off, retry. Only a step that keeps failing exits 1,
+                # and the keeper restarts the link.
+                fails += 1
+                import traceback
+                print(f"hub: {br.me}: step failed ({fails}/{STEP_FAILS_MAX}):\n" + traceback.format_exc().rstrip(),
+                      file=sys.stderr, flush=True)
+                out(f"STEP ERROR {br.me} ({fails}/{STEP_FAILS_MAX}): {type(e).__name__}: {clean(str(e))[:160]}")
+                if fails >= STEP_FAILS_MAX: raise
+                time.sleep(min(30, a.poll * 2 ** fails)); continue
             if link != last: out(f"LINK {br.me} {link.upper()}"); last = link
             if a.once: return 0
             time.sleep(a.poll)
@@ -1383,10 +1397,37 @@ def selftest():
         mesh_selftest(check, os.path.join(root, "mesh-test"))
         guard_selftest(check, os.path.join(root, "guard-test"))
         matrix_selftest(check, os.path.join(root, "matrix-test"))
+        step_selftest(check, os.path.join(root, "step-test"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
     out(f"{sum(ok)}/{len(ok)} passed")
     return 0 if all(ok) else 1
+
+def step_selftest(check, root):
+    """run_bridge: a failing step is logged and retried; only STEP_FAILS_MAX failures in a row end the link."""
+    import contextlib, io, types
+    hub = Hub(root)
+    class Fake:
+        me = "fake-link"
+        def __init__(self, fails): self.fails, self.steps = fails, 0
+        def mailbox(self): return ("gid", None, None)
+        def step(self):
+            self.steps += 1
+            if self.steps <= self.fails: raise OSError("far end went away mid-read")
+            return "up"
+        def close(self): pass
+    a = types.SimpleNamespace(once=True, poll=0, session="s")
+    buf, ebuf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(ebuf):
+        rc = run_bridge(hub, a, Fake(2), "banner")
+    check(rc == 0 and "STEP ERROR fake-link (2/" in buf.getvalue() and "LINK fake-link UP" in buf.getvalue(),
+          "link: two failed steps are logged and retried, then the link runs")
+    check("Traceback" in ebuf.getvalue() and "far end went away" in ebuf.getvalue(), "link: a failed step's traceback goes to stderr")
+    raised = False
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try: run_bridge(hub, a, Fake(STEP_FAILS_MAX), "banner")
+        except OSError: raised = True
+    check(raised, f"link: {STEP_FAILS_MAX} failed steps in a row end it (exit 1, the keeper restarts it)")
 
 def claim_selftest(check, root):
     """Claim markers: two readers racing on one inbox, a live marker, a dead claimer's marker, a put-back."""
