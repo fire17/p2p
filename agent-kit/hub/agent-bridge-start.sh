@@ -8,7 +8,7 @@
 #   <prefix>-rc     = peer:rc              the Claude Code session named "rc"
 #   <prefix>-codex  = peer:<thread id>     the herdr "codex" pane's CURRENT thread, then `pb expose --thread <id>`
 # A Claude peer must resolve to exactly one live session (ccpeer.resolve). The codex thread is a rollout the managed
-# Codex daemon holds open, originator codex-tui, cwd = the pane's cwd, created no earlier than 120 s before the pane's
+# Codex daemon holds open (any originator), cwd = the pane's cwd, created no earlier than 120 s before the pane's
 # codex process started. Several candidates: the one pb already exposes wins; still ambiguous = no codex route (logged),
 # never a guess. Missing peers are retried for --wait seconds, then the bridge starts with what exists (logged).
 # Idempotent: a live bridge with the same routes is left alone. --dry-run prints the map and command, changes nothing.
@@ -60,7 +60,8 @@ cands = []
 for f in open_files:
     try: meta = json.loads(open(f, encoding="utf-8").readline()).get("payload", {})
     except (OSError, ValueError): continue
-    if meta.get("originator") != "codex-tui" or meta.get("cwd") != cwd: continue
+    # any originator (codex-tui, a peerbridge hub, an IDE): the cwd + created-after-start + held-open-by-the-daemon tests decide
+    if meta.get("cwd") != cwd: continue
     try: created = datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00")).timestamp()
     except (KeyError, ValueError): continue
     if created >= start - 120: cands.append((created, meta["id"]))
