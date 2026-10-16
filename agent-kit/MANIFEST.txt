@@ -50,6 +50,7 @@ windows/admin-runner/setup.ps1
 windows/admin-runner/status.ps1
 windows/admin-runner/test-vector.json
 windows/admin-runner/tests.ps1
+windows/health.ps1
 windows/mesh-setup.ps1
 windows/shai-ear.ps1
 windows/shai-send.ps1
