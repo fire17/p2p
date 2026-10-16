@@ -255,9 +255,14 @@ function Get-HubArgv($cfg, $l, [string]$verb) {
 }
 function Start-HubChild([string[]]$argv, [string]$link) {
   [void][IO.Directory]::CreateDirectory($LogDir)
-  $sp = @{ FilePath = $argv[0]; PassThru = $true
-    RedirectStandardOutput = (Join-Path $LogDir ($link + '.hub.log'))
-    RedirectStandardError = (Join-Path $LogDir ($link + '.hub.err.log')) }
+  $out = Join-Path $LogDir ($link + '.hub.log'); $err = Join-Path $LogDir ($link + '.hub.err.log')
+  # Each start truncates the logs: keep the previous run's as *.prev.log, so a link exit can be diagnosed.
+  foreach ($f in @($out, $err)) {
+    if (Test-Path -LiteralPath $f) {
+      try { Move-Item -LiteralPath $f -Destination ($f -replace '\.log$', '.prev.log') -Force } catch {}
+    }
+  }
+  $sp = @{ FilePath = $argv[0]; PassThru = $true; RedirectStandardOutput = $out; RedirectStandardError = $err }
   $rest = @($argv | Select-Object -Skip 1)
   if ($rest.Count) { $sp.ArgumentList = (Join-Args $rest) }
   if ($OnWindows) { $sp.WindowStyle = 'Hidden' }

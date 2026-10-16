@@ -115,7 +115,7 @@ Expect the machines to see each other again within about **5 minutes** of both b
 | Remove one link | `... mesh-setup.ps1 -Uninstall -Link laptop` |
 | Remove everything the script added | `... mesh-setup.ps1 -Uninstall` |
 | Run a keeper by hand (to watch it) | `... mesh-setup.ps1 -Keep -Link laptop` (Ctrl+C stops it) |
-| Logs | `%USERPROFILE%\.agent-mesh\logs\<link>.keeper.log` and `<link>.hub.log` |
+| Logs | `%USERPROFILE%\.agent-mesh\logs\<link>.keeper.log` and `<link>.hub.log` (the previous link run: `<link>.hub.prev.log`, `<link>.hub.err.prev.log`) |
 
 `-Uninstall` stops the keeper, removes its logon task (only a task this script created), stops the tunnel, and deletes `%USERPROFILE%\.agent-mesh`. It keeps your p2p keys and message history under `%USERPROFILE%\.p2p`, so a later setup gets the same keys. Delete those yourself if you want fresh keys.
 
