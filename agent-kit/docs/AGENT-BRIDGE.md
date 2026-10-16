@@ -181,12 +181,14 @@ by module name can pick up the wrong one.
 Fixed ids go stale: a restarted Codex pane gets a new thread id. `hub/agent-bridge-start.sh` (WSL/Linux, needs herdr, jq, pb, python3) finds the routes each time and (re)starts the bridge detached:
 
 ```
-hub/agent-bridge-start.sh --prefix desk [--session main] [--dry-run] [--wait 120]
+hub/agent-bridge-start.sh --prefix desk [--session main] [--dry-run] [--wait 120]   # one shot
+hub/agent-bridge-start.sh --prefix desk [--session main] --watch 60                 # keep matching the panes
 ```
 
-- `<prefix>-claude` = the Claude Code session named `claude` (+bypass), `<prefix>-rc` = the session named `rc`, each only if exactly one live match.
-- `<prefix>-codex` = the thread the managed Codex daemon holds open for the herdr pane labelled `codex` (same cwd, created after that codex process started, any originator). Several candidates: the one pb already exposes; still ambiguous: no codex route, logged, never a guess. It runs `pb expose --thread <id>` for it.
-- Missing peers are retried for `--wait` seconds, then it starts with what exists and logs what is missing.
+- `<prefix>-claude` / `<prefix>-rc` = the Claude Code session named like its herdr pane, only if exactly one live match. `+bypass` only when that claude process really runs bypassPermissions (read from `/proc/<pid>/cmdline`).
+- `<prefix>-codex` = the thread the managed Codex daemon holds open for the herdr pane labelled `codex` (same cwd, created after that codex process started, any originator). Several candidates: the one pb already exposes; still ambiguous: no codex route, logged, never a guess. It runs `pb expose --thread <id>` for it, and `pb hide` for the thread it exposed before when the thread changes. No thread yet (Codex creates one at the pane's first prompt): the route is `herdr:<session>:<pane>` (typed, idle + dialog guarded) until the thread appears.
+- One shot: missing peers are retried for `--wait` seconds, then it starts with what exists and logs what is missing.
+- `--watch SEC`: rediscovers every SEC seconds and restarts the bridge only when the map differs on two checks in a row (one failed lookup never drops a route), or at once when no bridge runs. Covers reboots, pane restarts and the lazy Codex thread. One watcher per `$BRIDGE_DIR` (flock). Use this one from your logon script.
 - Idempotent: a live bridge with the same routes is left alone. `--dry-run` prints the map and the command and changes nothing. Pid and log: `$BRIDGE_DIR` (default `~/.agent-bridge`).
 - Call it from the script that starts your herdr session, after the panes are up, so a logon brings the bridge back too.
 - Start the Claude panes in a dedicated folder (for example `~/agents`) and trust it once. Claude Code does not keep folder trust for the home folder, so panes started in `~` wait at the trust dialog at every logon and never register.
