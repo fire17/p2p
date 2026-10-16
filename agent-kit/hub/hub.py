@@ -139,6 +139,7 @@ def die(msg, code=2): print("hub: " + msg, file=sys.stderr, flush=True); sys.exi
 def iso(ts=None): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts if ts is not None else time.time()))
 
 def is_wsl():
+    if os.name == "nt": return False   # Windows python: "/proc/..." would resolve on the current drive (a \\wsl$ cwd)
     try:
         with open("/proc/sys/kernel/osrelease") as f: return "microsoft" in f.read().lower()
     except Exception: return False

@@ -66,6 +66,7 @@ function Invoke-Fixed([string[]]$argv, [int]$TimeoutSec = 10) {
   $psi.FileName = $argv[0]
   $psi.Arguments = (@($argv | Select-Object -Skip 1) | ForEach-Object { Format-Arg $_ }) -join ' '
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  if ($env:SystemRoot) { $psi.WorkingDirectory = $env:SystemRoot }   # never a \\wsl$ cwd for Windows children
   $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
   try { $psi.StandardOutputEncoding = $Utf8; $psi.StandardErrorEncoding = $Utf8 } catch {}
   $p = New-Object Diagnostics.Process; $p.StartInfo = $psi
@@ -286,7 +287,7 @@ Run-Check 'tasks' {
     if ($t.state -eq 'Running') { $why += 'running' }
     elseif ($null -eq $t.last) { $st += 'WARN'; $why += "state $($t.state), last result unknown" }
     elseif ($t.last -eq 0) { $why += "$($t.state), last result 0" }
-    elseif ($t.last -eq 267011) { $st += 'WARN'; $why += "$($t.state), never run (0x41303)" }
+    elseif ($t.last -eq 267011) { $st += 'OK'; $why += "$($t.state), not run since it was set up (0x41303: fine until the next logon)" }
     else { $st += 'WARN'; $why += ("{0}, last result 0x{1:X}" -f $t.state, $t.last) }
     if ($t.lastRun -and $t.lastRun.Year -gt 2000) { $why += 'ran ' + (Age ($Now - $t.lastRun).TotalSeconds) + ' ago' }
     Add-Result ("task " + $t.path.TrimStart('\') + $t.name) (Worst $st) ($why -join '; ')
