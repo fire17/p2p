@@ -64,7 +64,8 @@ On-disk protocol (any language can join; hub.ps1 is the PowerShell twin):
                                      written as .tmp-* then renamed, so a reader never sees half a file.
   <root>/inbox/<name>/claims/<fn>.claim  empty claim marker for message <fn>, created with O_CREAT|O_EXCL
                                      (hub.ps1: FileMode.CreateNew). Only the reader that created it moves <fn>
-                                     into inbox/<name>/read/ and prints it, so two readers of one name never
+                                     into inbox/<name>/read/ (a link: inflight/ until the far end has it, then
+                                     read/) and prints it, so two readers of one name never
                                      print the same message twice. (A rename alone is not enough: on Windows two
                                      readers' renames of one file can both report success.) Markers stay until
                                      gc. A marker older than 120 s whose <fn> is still in the inbox means its
@@ -261,6 +262,7 @@ class Hub:
 
     def check_local_name(self, name):
         """A local agent may not take the name of a tunnel link (its messages would leave the machine)."""
+        if name.endswith("-unrouted"): die(f"{name!r}: names ending in -unrouted are reserved (a link's spill folder)")
         r = self.local_row(name)
         if r and r.get("remote") and r["age"] < FORGET_S:
             die(f"{name!r} is the name of a tunnel link on this hub ({clean(r.get('note', ''))[:60]}); pick another "
@@ -342,11 +344,12 @@ class Hub:
     def full_roster(self, include_old=False):
         return self.roster(include_old) + self.mesh_roster()
 
-    def claim(self, name):
-        """Yield (msg, path) for each waiting message, oldest first, each exactly once across readers."""
+    def claim(self, name, into="read"):
+        """Yield (msg, path) for each waiting message, oldest first, each exactly once across readers. A link claims
+        into inflight/ and moves a message on to read/ only once it is sent, so a kill mid-send loses nothing."""
         d = self.inbox(name)
         if not os.path.isdir(d): return
-        done = os.path.join(d, "read"); os.makedirs(done, exist_ok=True)
+        done = os.path.join(d, into); os.makedirs(done, exist_ok=True)
         os.makedirs(os.path.join(d, "claims"), exist_ok=True)
         rows = []
         for fn in os.listdir(d):
@@ -365,7 +368,9 @@ class Hub:
                 except PermissionError: time.sleep(0.05)   # Windows: another reader has it open to read it
             if moved: yield m, dst
             elif os.path.exists(src):                  # still in use after 2 s: give it back to the next poll
-                os.remove(mk); print(f"hub: {src} stayed in use for 2 s; left in the inbox", file=sys.stderr)
+                try: os.remove(mk)
+                except OSError: pass                   # a marker left behind goes stale after CLAIM_STALE_S
+                print(f"hub: {src} stayed in use for 2 s; left in the inbox", file=sys.stderr)
 
     @staticmethod
     def marker(inbox, fn, k):
@@ -387,13 +392,17 @@ class Hub:
             k += 1                                     # its claimer died before the move: take over
 
     def release(self, path):
-        """Put a claimed message (read/<fn>) back in the inbox for a retry: markers first, so no reader
-        ever sees it in the inbox under a stale marker."""
+        """Put a claimed message (read/<fn> or inflight/<fn>) back in the inbox for a retry: markers first, so no
+        reader ever sees it in the inbox under a stale marker."""
         inbox, fn = os.path.dirname(os.path.dirname(path)), os.path.basename(path); k = 0
         while True:
             try: os.remove(self.marker(inbox, fn, k)); k += 1
             except FileNotFoundError: break
-        os.replace(path, os.path.join(inbox, fn))
+        for i in range(40):                            # Windows: a reader (matrix peek) may have it open for a moment
+            try: os.replace(path, os.path.join(inbox, fn)); return
+            except PermissionError:
+                if i == 39: raise                      # (a link's inflight/ copy is requeued when it next starts)
+                time.sleep(0.05)
 
     def prune(self, d, max_files=SPILL_FILES, max_bytes=SPILL_BYTES, known=None):
         """Keep at most max_files messages / max_bytes in folder d, dropping the oldest first. Returns how many went.
@@ -417,14 +426,25 @@ class Hub:
 
     def gc(self, days):
         cut, n = time.time() - days * 86400, 0
+        tmp_cut = time.time() - 3600                   # a .tmp-*/.out-* this old: its writer was killed mid-write
         inbox = os.path.join(self.root, "inbox")
         for base, _, files in os.walk(inbox):
-            spill = os.path.dirname(base) == inbox and base.endswith("-unrouted")    # nobody claims these
-            if os.path.basename(base) not in ("read", "claims", "sent", "failed", "throttled") and not spill: continue
+            # by depth, never by a folder's name alone: inbox/<name>/<sub>/ is a sweep folder, inbox/<name>/ is a
+            # live inbox (even for an agent called "read"), except inbox/<x>-unrouted/, which nobody claims
+            rel = os.path.relpath(base, inbox).split(os.sep)
+            spill = len(rel) == 1 and rel[0].endswith("-unrouted")
+            sweep = spill or (len(rel) == 2 and rel[1] in ("read", "claims", "sent", "failed", "throttled"))
             for fn in files:
                 p = os.path.join(base, fn)
                 try:
-                    if os.path.getmtime(p) < cut: os.remove(p); n += 1
+                    if sweep and os.path.getmtime(p) < cut: os.remove(p); n += 1
+                    elif fn.startswith(".tmp-") and os.path.getmtime(p) < tmp_cut: os.remove(p); n += 1
+                except OSError: pass
+        for d, pre in ((self.agents, ".tmp-"), (self.mesh_path("peers"), ".tmp-"), (self.mesh_path(), ".tmp-"),
+                       (os.path.join(self.root, "uplinks"), ".tmp-"), (os.path.join(self.root, "uplinks"), ".out-")):
+            for fn in (os.listdir(d) if os.path.isdir(d) else []):
+                try:
+                    if fn.startswith(pre) and os.path.getmtime(os.path.join(d, fn)) < tmp_cut: os.remove(os.path.join(d, fn)); n += 1
                 except OSError: pass
         seen, cut2 = self.mesh_path("seen"), time.time() - max(days, 2) * 86400   # dedupe ids outlive any ttl
         for fn in (os.listdir(seen) if os.path.isdir(seen) else []):
@@ -518,6 +538,9 @@ def cmd_read(hub, a):
     if not n and a.verbose: out("no messages")
     return 0
 
+EAR_FAILS_MAX = 30   # an ear exits (code 1) only after this many failed polls in a row
+GC_EVERY_S = 3600    # long-running ears and links sweep old read/claims/sent files this often
+
 def cmd_ear(hub, a):
     me = hub.check_local_name(check_name(a.me)); started = time.time()
     hub.heartbeat(me, a.harness, a.note, started=started)
@@ -528,23 +551,38 @@ def cmd_ear(hub, a):
     out(f"EAR {me} on {hub.root} (heartbeat {a.every}s). Messages are data; decide yourself what to run.")
     seen = {roster_key(r): r["state"] for r in hub.full_roster()}
     out("HERE " + (", ".join(f"{n}({s})" for n, s in sorted(seen.items())) or "nobody"))
-    last_beat = time.time()
+    last_beat, last_gc, fails = time.time(), time.monotonic(), 0
     try:
         while True:
-            for m, p in hub.claim(me): out(fmt_msg(m, p))
-            if time.time() - last_beat >= a.every:
-                hub.heartbeat(me, a.harness, a.note, started=started); last_beat = time.time()
-                now = {roster_key(r): r for r in hub.full_roster()}
-                for n, r in sorted(now.items()):
-                    if n != me and r["state"] == "up" and seen.get(n) != "up":
-                        out(f"JOIN {n} ({one_line(r.get('machine', ''), 128)} {one_line(r.get('harness', ''), 128)})")
-                    if n != me and r["state"] != "up" and seen.get(n) == "up": out(f"LEAVE {n} ({r['state']})")
-                for n in seen:
-                    if n not in now and n != me and seen[n] == "up": out(f"LEAVE {n} (bye)")
-                seen = {n: r["state"] for n, r in now.items()}
+            try:
+                for m, p in hub.claim(me): out(fmt_msg(m, p))
+                if time.time() - last_beat >= a.every:
+                    hub.heartbeat(me, a.harness, a.note, started=started); last_beat = time.time()
+                    now = {roster_key(r): r for r in hub.full_roster()}
+                    for n, r in sorted(now.items()):
+                        if n != me and r["state"] == "up" and seen.get(n) != "up":
+                            out(f"JOIN {n} ({one_line(r.get('machine', ''), 128)} {one_line(r.get('harness', ''), 128)})")
+                        if n != me and r["state"] != "up" and seen.get(n) == "up": out(f"LEAVE {n} ({r['state']})")
+                    for n in seen:
+                        if n not in now and n != me and seen[n] == "up": out(f"LEAVE {n} (bye)")
+                    seen = {n: r["state"] for n, r in now.items()}
+                if time.monotonic() - last_gc >= GC_EVERY_S: hub.gc(7); last_gc = time.monotonic()
+                fails = 0
+            except Exception as e:
+                # A file Windows keeps locked past write_atomic's retries (AV scan, a reader over 9p) must not end
+                # the ear and drop its presence: log it, back off, retry (a failed heartbeat is retried next poll).
+                fails += 1
+                import traceback
+                print(f"hub: ear {me}: poll failed ({fails}/{EAR_FAILS_MAX}):\n" + traceback.format_exc().rstrip(),
+                      file=sys.stderr, flush=True)
+                out(f"EAR ERROR {me} ({fails}/{EAR_FAILS_MAX}): {type(e).__name__}: {clean(str(e))[:160]}")
+                if fails >= EAR_FAILS_MAX: raise
+                time.sleep(min(30, a.poll * 2 ** fails)); continue
             time.sleep(a.poll)
     except KeyboardInterrupt: pass
-    finally: hub.bye(me)
+    finally:
+        try: hub.bye(me)
+        except OSError: pass     # presence file still locked: its beat simply goes stale
     return 0
 
 # ---------------------------------------------------------------- matrix (reachability check)
@@ -587,7 +625,9 @@ def cmd_matrix(hub, a):
         else: hub.check_local_name(frm)
         plan = [(frm, t) for t in names if t != frm]
         if not plan: die("nothing to ping (the only name is the sender)")
-    since_ns = time.time_ns() - 5 * 10**9           # 5 s slack for clock skew between Windows and WSL
+    # Slack for clock skew between Windows and WSL (94 s seen): a PONG's file name carries the REPLIER's clock.
+    # It only saves reads; the per-run token is what matches a PONG, so a wide window cannot match an old run.
+    since_ns = time.time_ns() - 2 * MESH_FRESH_S * 10**9
     rows = []
     try:
         for s, t in plan:
@@ -674,6 +714,27 @@ def matrix_selftest(check, root):
         for t in ts: t.join(2)
 
 # ---------------------------------------------------------------- tunnel uplink
+def run_tree(cmd, timeout, env=None, drain=5):
+    """subprocess.run(capture_output, timeout) that cannot hang past the timeout on Windows. There p2p.cmd is cmd.exe
+    -> node: run() kills only cmd.exe and then waits, without a timeout, for the pipes to close, which node (still
+    alive, holding them) never does. So kill the whole tree (taskkill /T), drain the pipes for at most `drain` s,
+    and give up on the output if they are still held: rc 124, like a timeout."""
+    try: p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
+                              encoding="utf-8", errors="replace")
+    except FileNotFoundError as e: return subprocess.CompletedProcess(cmd, 127, "", str(e))
+    try:
+        o, e = p.communicate(timeout=timeout); return subprocess.CompletedProcess(cmd, p.returncode, o, e)
+    except subprocess.TimeoutExpired: pass
+    if os.name == "nt":
+        try: subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError): pass
+    try: p.kill()
+    except OSError: pass
+    try: p.communicate(timeout=drain)
+    except (subprocess.TimeoutExpired, OSError, ValueError): pass   # a grandchild still holds the pipes: drop them
+    return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+
 class Uplink:
     """Bridges one Agent Tunnel session (a p2p `tunnel join` or `tunnel listen` mailbox) into the hub.
 
@@ -697,6 +758,18 @@ class Uplink:
         self.off, self.held, self.hub_hold, self.last_who, self.who_pending = {}, None, None, 0.0, False
         self.rate, self.throttled = {}, set()
         self.bad_rows, self.spill_files, self.spill_bytes, self.spill_known = 0, SPILL_FILES, SPILL_BYTES, {}
+        self.requeue_inflight()
+
+    def requeue_inflight(self):
+        """Messages a previous run of this link claimed but was killed before it knew they were sent (keeper Kill,
+        logoff) go back to the inbox. One link per name runs at a time; a link's resend reuses its envelope id."""
+        d = os.path.join(self.hub.inbox(self.me), "inflight")
+        try: names = sorted(f for f in os.listdir(d) if f.endswith(".json") and not f.startswith("."))
+        except OSError: return
+        for fn in names:
+            try: self.hub.release(os.path.join(d, fn))
+            except OSError as e: print(f"hub: {self.me}: cannot requeue inflight/{fn}: {e}", file=sys.stderr); continue
+        if names: out(f"{self.tag} {self.me}: {len(names)} message(s) a previous run was sending went back to the queue")
 
     def mailbox(self):
         base = os.path.join(self.p2p_home, "tunnel", self.session)
@@ -731,6 +804,7 @@ class Uplink:
 
     def p2p(self, *args, timeout=60):
         env = dict(os.environ, P2P_HOME=self.p2p_home) if not self.wsl_paths else dict(os.environ)
+        if os.name == "nt": return run_tree(self.p2p_cmd + list(args), timeout, env)
         try: return subprocess.run(self.p2p_cmd + list(args), capture_output=True, text=True, timeout=timeout, env=env,
                                    encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired: return subprocess.CompletedProcess(args, 124, "", "timeout")
@@ -764,7 +838,8 @@ class Uplink:
         """The tunnel peer key seen first is pinned in uplinks/<as>.pin.json. A different key (someone else won the
         race for a leaked key after a listener restart) holds the link: nothing routed in, nothing sent out."""
         key = st.get("peerKey")
-        if not isinstance(key, str) or not key: return True     # not connected yet
+        # not connected yet, or state.json unreadable mid-rewrite: a held link stays held until the pinned key is read
+        if not isinstance(key, str) or not key: return not self.held
         pin = self.pins(); want = pin.get("peer")
         if not want:
             pin["peer"] = key; write_atomic(self.pin_path, pin); self.held = None
@@ -945,19 +1020,31 @@ class Uplink:
         if r and not r.get("remote"):
             self.hub.deliver(frm, self.me, f"UNDELIVERABLE id={mid} to {self.me}: {why}. Kept in inbox/{self.me}/failed/", via="hub")
 
+    def sent(self, p):
+        """inflight/<fn> -> read/<fn>: this message is done (sent, or dropped on purpose)."""
+        d = os.path.join(os.path.dirname(os.path.dirname(p)), "read"); os.makedirs(d, exist_ok=True)
+        try: os.replace(p, os.path.join(d, os.path.basename(p)))
+        except OSError: pass     # still in inflight/: requeued at the next start (a Link resend is de-duplicated)
+
     def flush(self):
-        for m, p in self.hub.claim(self.me):
+        # Sends can take up to 45 s each: keep this link's own heartbeat fresh between them, and leave what is
+        # still waiting after FLUSH_BUDGET_S for the next step (claim() moves a message only when it yields it),
+        # so a backlog after a reconnect never ages the link to stale or starves inbound/push.
+        t0 = last = time.monotonic()
+        for m, p in self.hub.claim(self.me, into="inflight"):
             line = self.outgoing(m)
-            if line is None: continue
+            if line is None: self.sent(p); continue
             if len(line.encode("utf-8")) > MAX_BYTES:
                 self.undeliverable(m, p, "too large for the tunnel once tagged (max 1 MiB)"); continue
             rc, info = self.send_remote(line)
-            if rc == 0: out(f"{self.tag} {one_line(m.get('from'), 130)} -> {self.me}: sent")
+            if rc == 0: self.sent(p); out(f"{self.tag} {one_line(m.get('from'), 130)} -> {self.me}: sent")
             elif rc == 2 and ("exceeds 1 MiB" in info or "UTF-8" in info):    # the tunnel will never take this one
                 self.undeliverable(m, p, f"the tunnel refused it ({clean(info)[-120:]})")
             else:   # no ack, peer gone, daemon down, timeout: put it back; the next step retries it; never lose a message
                 self.hub.release(p)
                 out(f"{self.tag} {self.me}: send failed rc={rc} ({clean(info)[-160:]}); will retry"); break
+            if time.monotonic() - last >= 10: self.beat("up"); last = time.monotonic()
+            if time.monotonic() - t0 >= FLUSH_BUDGET_S: break
 
     def push(self):
         line = self.roster_line()
@@ -968,7 +1055,9 @@ class Uplink:
     def step(self):
         gid, _, st = self.mailbox(); link = self.link_state(st if gid else None)
         if gid and not self.check_peer(st): link = "peer-changed"
-        if link != "peer-changed":
+        if self.held: link = "peer-changed"      # held stays held while the mailbox itself is unreadable, too
+        # An unreadable state.json hides the peer key: once a key is pinned, read no tunnel rows until it is readable.
+        if link != "peer-changed" and not (gid and not st and self.pins().get("peer")):
             for row, end in self.inbound():
                 rid = row.get("id") if row is not None and isinstance(row.get("id"), str) else None
                 if rid and rid in (self.off.get("ids") or []):
@@ -984,7 +1073,9 @@ class Uplink:
                 self.commit(end, rid)
             if self.hub_hold: link = "peer-changed"
         self.beat(link)
-        if link == "up": self.flush(); self.push(); self.answer_who()
+        if link == "up":
+            t = time.monotonic(); self.flush(); self.push(); self.answer_who()
+            if time.monotonic() - t >= 10: self.beat(link)     # a slow push/answer must not age the record either
         return link
 
     def close(self): pass
@@ -1214,7 +1305,11 @@ class Link(Uplink):
                 if mm: to, dstl, text, dst = mm.group(1), mm.group(2), mm.group(3), None
                 else: to, dst, dstl = "*", self.peer_id, None
             frm = m.get("from") if NAME_RE.match(str(m.get("from") or "")) else "unknown"
-            e = {"t": "msg", "id": uuid.uuid4().hex, "src": me, "srcl": self.ident["label"], "from": frm,
+            # A resend of the same hub message (a retry, a requeue after a kill mid-send) keeps the same envelope
+            # id, so the far hub's mark_seen drops the copy instead of delivering it twice.
+            hid = str(m.get("id") or "")
+            eid = uuid.uuid5(uuid.NAMESPACE_OID, f"{me}/{self.me}/{hid}").hex if MSGID_RE.match(hid) else uuid.uuid4().hex
+            e = {"t": "msg", "id": eid, "src": me, "srcl": self.ident["label"], "from": frm,
                  "to": to, "dst": dst, "dstl": dstl, "ttl": self.ttl, "path": [me]}
             self.hub.mark_seen(e["id"])
         e["text"] = text
@@ -1270,16 +1365,19 @@ def tunnel_args(a):
     cmd = shlex.split(a.p2p, posix=(os.name != "nt")) if a.p2p else default_p2p(interop)
     return home, cmd, interop
 
+FLUSH_BUDGET_S = 20  # a step stops sending after this long; the rest of the queue waits for the next step
 LINK_GRACE_S = 20    # an unclear tunnel reading (unreadable state, late beat) keeps "up" this long before "down"
 STEP_FAILS_MAX = 5   # a link/uplink exits (code 1) only after this many failed steps in a row
 
 def run_bridge(hub, a, br, banner):
     if not br.mailbox()[0]: die(f"no tunnel session {a.session!r} under {br.p2p_home} (look in {os.path.join(br.p2p_home, 'tunnel')})", 5)
     leave_on_signals(); out(banner)
-    last, fails = None, 0
+    last, fails, last_gc = None, 0, None
     try:
         while True:
             try:
+                if not a.once and (last_gc is None or time.monotonic() - last_gc >= GC_EVERY_S):
+                    last_gc = time.monotonic(); hub.gc(7)
                 link = br.step(); fails = 0
             except Exception as e:
                 # One bad step (a far end that restarts mid-read, a file another reader just moved) must not end
@@ -1432,10 +1530,75 @@ def selftest():
         step_selftest(check, os.path.join(root, "step-test"))
         grace_selftest(check)
         replace_selftest(check, os.path.join(root, "replace-test"))
+        robust_selftest(check, os.path.join(root, "robust-test"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
     out(f"{sum(ok)}/{len(ok)} passed")
     return 0 if all(ok) else 1
+
+def robust_selftest(check, root):
+    """A send that outlives its timeout, a link killed mid-send, a long backlog, a locked heartbeat, gc."""
+    import contextlib, io, types
+    os.makedirs(root)
+    hold = os.path.join(root, "hold.py")     # a child whose grandchild keeps the pipes open (cmd.exe -> node)
+    with open(hold, "w") as f: f.write("import subprocess,sys,time\nsubprocess.Popen([sys.executable,'-c','import time; time.sleep(8)'])\ntime.sleep(8)\n")
+    t = time.monotonic(); r = run_tree([sys.executable, hold], 0.5, drain=0.5); took = time.monotonic() - t
+    ok = run_tree([sys.executable, "-c", "print('hi')"], 10)
+    check(r.returncode == 124 and took < 4 and ok.returncode == 0 and ok.stdout.strip() == "hi",
+          f"p2p: a send whose grandchild holds the pipes returns rc 124 in {took:.1f} s, not when it exits")
+    hub = Hub(os.path.join(root, "hub")); hub.heartbeat("win-claude", "claude")
+    home, gid = os.path.join(root, "p2p"), uuid.uuid4().hex
+    sess = os.path.join(home, "tunnel", "join-R", gid); os.makedirs(sess)
+    write_atomic(os.path.join(home, "tunnel", "join-R", "current.json"), {"id": gid})
+    write_atomic(os.path.join(sess, "state.json"), {"connected": True, "beat": time.time() * 1000, "peerKey": "AAAA"})
+    open(os.path.join(sess, "inbox.jsonl"), "w").close()
+    sent_log, fake = os.path.join(root, "sent.log"), os.path.join(root, "fake_p2p.py")
+    with open(fake, "w") as f:
+        f.write("import sys\na=sys.argv[1:]\nf=a[a.index('--file')+1]\n"
+                f"open({sent_log!r},'a',encoding='utf-8').write(open(f,encoding='utf-8').read()+'\\n<<END>>\\n')\n")
+    sent = lambda: open(sent_log, encoding="utf-8").read() if os.path.exists(sent_log) else ""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        up = Uplink(hub, "join-R", "rlink", [sys.executable, fake], home); up.step()
+        hub.deliver("rlink", "win-claude", "killed mid-send")
+        list(hub.claim("rlink", into="inflight"))                # a run that claimed it, then was killed
+        up = Uplink(hub, "join-R", "rlink", [sys.executable, fake], home); up.step()
+    box = hub.inbox("rlink")
+    check("[win-claude] killed mid-send" in sent() and not os.listdir(os.path.join(box, "inflight"))
+          and len(os.listdir(os.path.join(box, "read"))) == 1, "link: a message claimed by a killed run is requeued and sent once")
+    for i in range(3): hub.deliver("rlink", "win-claude", f"backlog {i}"); time.sleep(0.002)
+    old = globals()["FLUSH_BUDGET_S"]; globals()["FLUSH_BUDGET_S"] = 0
+    try:
+        with contextlib.redirect_stdout(buf): up.step()
+    finally: globals()["FLUSH_BUDGET_S"] = old
+    left = [f for f in os.listdir(box) if f.endswith(".json")]
+    with contextlib.redirect_stdout(buf): up.step()
+    check(len(left) == 2 and sent().count("backlog") == 3, "link: a backlog is sent within a per-step time budget; the rest next step")
+    calls = {"n": 0}; real = hub.heartbeat
+    def flaky(*k, **kw):
+        calls["n"] += 1
+        if calls["n"] in (2, 3): raise PermissionError(5, "Access is denied")
+        if calls["n"] >= 5: raise KeyboardInterrupt
+        return real(*k, **kw)
+    hub.heartbeat = flaky
+    out_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = cmd_ear(hub, types.SimpleNamespace(me="ear-agent", harness="", note="", once=False, every=0, poll=0))
+    finally: hub.heartbeat = real
+    check(rc == 0 and calls["n"] == 5 and out_buf.getvalue().count("EAR ERROR ear-agent") == 2,
+          "ear: a locked heartbeat (PermissionError) is logged and retried, not the end of the ear")
+    old = time.time() - 8 * 86400
+    hub.deliver("read", "win-claude", "agent named read"); hub.deliver("win-claude", "x", "swept")
+    list(hub.claim("win-claude"))
+    stale_tmp = os.path.join(hub.agents, ".tmp-dead"); open(stale_tmp, "w").close()
+    for d in (hub.inbox("read"), os.path.join(hub.inbox("win-claude"), "read")):
+        for f in os.listdir(d):
+            if f.endswith(".json"): os.utime(os.path.join(d, f), (old, old))
+    os.utime(stale_tmp, (old, old)); hub.gc(7)
+    check([m["text"] for m, _ in hub.claim("read")] == ["agent named read"] and not os.path.exists(stale_tmp)
+          and not [f for f in os.listdir(os.path.join(hub.inbox("win-claude"), "read")) if f.endswith(".json")],
+          "gc: by depth (a live inbox named read/ is kept), old read/ and dead .tmp-* files swept")
 
 def replace_selftest(check, root):
     """write_atomic: a target held open by another process (Windows WinError 5) is retried, not fatal."""
@@ -1576,6 +1739,16 @@ def mesh_selftest(check, root):
     check(lv["s-claude@second"]["hops"] == 2 and lv["m-claude@main"]["hops"] == 1, "mesh: hop counts (direct 1, relayed 2)")
     roster_txt = fmt_roster(L.full_roster())
     check("s-claude@second" in roster_txt and "via main, 2 hops" in roster_txt, "mesh: `who` prints name@machine and the route")
+    texts(L, "l-codex")
+    dup = {"id": "0123456789ab", "from": "m-claude", "text": "only once", "mesh": {"to": "l-codex", "dst": ids["L"], "dstl": "laptop"}}
+    e1, e2 = m_l.outgoing(dict(dup)), m_l.outgoing(dict(dup))
+    other = m_l.outgoing(dict(dup, id="ba9876543210"))
+    with open(inbox(("l", "join-A")), "a", encoding="utf-8") as f:
+        for line in (e1, e2): f.write(json.dumps({"v": 1, "text": line}) + "\n")
+    rounds(2)
+    check(json.loads(e1[len(MESH_TAG):])["id"] == json.loads(e2[len(MESH_TAG):])["id"] != json.loads(other[len(MESH_TAG):])["id"]
+          and texts(L, "l-codex") == [("m-claude@main", "only once")],
+          "mesh: a resent hub message keeps its envelope id, so the far hub delivers it once")
     peer_ids = lambda h: sorted(fn[:-5] for fn in os.listdir(h.mesh_path("peers")))
     check(peer_ids(M) == sorted([ids["L"], ids["S"]]) and peer_ids(L) == sorted([ids["M"], ids["S"]]) and peer_ids(S) == sorted([ids["M"], ids["L"]]),
           "mesh: each hub knows exactly the 2 others, never itself")
@@ -1824,10 +1997,20 @@ def guard_selftest(check, root):
     link = step()
     row = {r["name"]: r for r in hub.roster()}["helper"]
     held = link == "peer-changed" and row["state"] == "peer-changed" and not got("wsl-codex") and sends() == n0 and "PEER-CHANGED" in buf.getvalue()
+    with open(os.path.join(sess, "state.json"), "w") as f: f.write('{"connected": tr')     # mid-rewrite
+    blip = step(); state(peerKey=""); nokey = step()
+    held2 = blip == nokey == "peer-changed" and not got("wsl-codex") and sends() == n0
+    state(peerKey="BBBB")
     with contextlib.redirect_stdout(buf): main(["--root", hub.root, "unpin", "helper"])
     step()
-    check(held and got("wsl-codex") == ["from a stranger"] and "not for strangers" in sent() and up.pins().get("peer") == "BBBB",
-          "guard #5/#9: a new tunnel peer key holds the link (nothing in or out) until `hub.py unpin`")
+    check(held and held2 and got("wsl-codex") == ["from a stranger"] and "not for strangers" in sent() and up.pins().get("peer") == "BBBB",
+          "guard #5/#9: a new tunnel peer key holds the link (nothing in or out) until `hub.py unpin`; "
+          "an unreadable state.json or a missing key never releases it")
+    with open(os.path.join(sess, "state.json"), "w") as f: f.write('{"connected": tr')
+    add("@wsl-codex while state.json is unreadable"); step(); early = got("wsl-codex")
+    state(peerKey="BBBB"); step()
+    check(early == [] and got("wsl-codex") == ["while state.json is unreadable"],
+          "guard #5: with a key pinned, no tunnel row is read while state.json (the peer key) is unreadable")
     up.last_roster, up.last_push, up.last_who = up.roster_line(), time.time(), 0
     n0 = sends()
     for _ in range(30): add("WHO?")
