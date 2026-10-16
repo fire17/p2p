@@ -23,6 +23,10 @@ reaches as /mnt/c/Users/<you>/.agent-hub). No daemon, no port, no firewall rule.
                                                     replaced or re-keyed that machine on purpose)
   hub.py gc    [--days 7]                           delete read/sent/unrouted message files and claim markers older
                                                     than N days
+  hub.py matrix --names a,b,c [--from ME] [--timeout 90] [--json]
+                                                    reachability check: PING each name, wait for its PONG,
+                                                    print name | sent | pong | seconds; exit 0 only if all ponged
+  hub.py matrix --names a,b,c --pairs [...]         every name PINGs every other name (all ordered pairs)
   hub.py selftest                                   offline test of everything above (fake tunnel)
 
 Across linked machines an agent is addressed as name or name@machine (`who` shows both):
@@ -531,6 +535,132 @@ def cmd_ear(hub, a):
     except KeyboardInterrupt: pass
     finally: hub.bye(me)
     return 0
+
+# ---------------------------------------------------------------- matrix (reachability check)
+MATRIX_PONG_RE = re.compile(r"MATRIX PONG ([0-9a-f]{12})\b")
+
+def matrix_peek(hub, name, since_ns, seen):
+    """Messages to `name` written at/after since_ns, read WITHOUT claiming them: still waiting in
+    inbox/<name>/ or already claimed into inbox/<name>/read/. A real agent's ear keeps its own mail."""
+    d = hub.inbox(name)
+    for sub in ("", "read"):
+        try: names = sorted(os.listdir(os.path.join(d, sub)))
+        except OSError: continue
+        for fn in names:
+            if not fn.endswith(".json") or fn.startswith(".") or fn in seen: continue
+            try: ns = int(fn.split("-", 1)[0])
+            except ValueError: continue
+            if ns < since_ns: continue
+            m = read_json(os.path.join(d, sub, fn))
+            if not isinstance(m, dict): continue       # half written, or moved to read/ meanwhile: next poll
+            seen.add(fn); yield m
+
+def cmd_matrix(hub, a):
+    """PING every target (or, with --pairs, every name PINGs every other) and wait for the PONGs."""
+    names = list(dict.fromkeys(n.strip() for n in a.names.split(",") if n.strip()))
+    if not names: die("matrix needs --names a,b,...")
+    if len(names) > MAX_TARGETS: die(f"{len(names)} names; at most {MAX_TARGETS}")
+    if a.pairs and a.frm: die("--pairs sends as each name; drop --from")
+    owned = set()                                   # senders whose inbox this run may claim (it made them)
+    if a.pairs:
+        if len(names) < 2: die("--pairs needs at least two names")
+        for n in names:
+            try: kind, _, _ = resolve(hub, n)
+            except ValueError as e: die(str(e))
+            if kind != "local": die(f"--pairs: {n!r} is not an agent on this hub (its PONGs could not be seen here)")
+        plan = [(s, t) for s in names for t in names if s != t]
+    else:
+        frm = check_name(a.frm or f"matrix-{os.getpid()}")
+        if hub.local_row(frm) is None:              # nobody by that name yet: be it for the run, then leave
+            hub.heartbeat(hub.check_local_name(frm), "matrix", "reachability probe"); owned.add(frm)
+        else: hub.check_local_name(frm)
+        plan = [(frm, t) for t in names if t != frm]
+        if not plan: die("nothing to ping (the only name is the sender)")
+    since_ns = time.time_ns() - 5 * 10**9           # 5 s slack for clock skew between Windows and WSL
+    rows = []
+    try:
+        for s, t in plan:
+            tok = uuid.uuid4().hex[:12]
+            row = {"name": f"{s}->{t}" if a.pairs else t, "from": s, "to": t, "token": tok,
+                   "sent": "no", "pong": False, "seconds": None, "error": "", "t0": time.time()}
+            rows.append(row)
+            try: kind, name, r = resolve(hub, t)
+            except ValueError as e: row["error"] = one_line(str(e), 120); continue
+            if kind is None: row["error"] = "never here"; continue
+            text = f"MATRIX PING {tok} from {s}: reply exactly MATRIX PONG {tok}"
+            try:
+                if kind == "mesh": deliver_mesh(hub, r, s, text)
+                else: hub.deliver(name, s, text)
+            except (OSError, ValueError) as e: row["error"] = one_line(str(e), 120); continue
+            row["sent"] = "yes" if r and r.get("state") == "up" else "queued"
+            row["t0"] = time.time()
+        pending = {(r["from"], r["token"]): r for r in rows if r["sent"] != "no"}
+        senders = sorted({r["from"] for r in pending.values()})
+        seen = {s: set() for s in senders}
+        deadline, last_beat = time.time() + a.timeout, time.time()
+        while pending:
+            for s in senders:
+                msgs = (m for m, _ in hub.claim(s)) if s in owned else matrix_peek(hub, s, since_ns, seen[s])
+                for m in msgs:
+                    mo = MATRIX_PONG_RE.search(str(m.get("text", "")))
+                    r = pending.get((s, mo.group(1))) if mo else None
+                    if not r or str(m.get("from", "")).partition("@")[0] != r["to"].partition("@")[0]: continue
+                    try: at = float(m.get("ts"))
+                    except (TypeError, ValueError): at = time.time()
+                    r["pong"] = True; r["seconds"] = round(max(0.0, at - r["t0"]), 1)
+                    del pending[(s, r["token"])]
+            if not pending or time.time() >= deadline: break
+            if owned and time.time() - last_beat >= 10:
+                for s in owned: hub.heartbeat(s, "matrix", "reachability probe")
+                last_beat = time.time()
+            time.sleep(a.poll)
+    except KeyboardInterrupt: pass
+    finally:
+        for s in owned: hub.bye(s)
+    ok = bool(rows) and all(r["pong"] for r in rows)
+    for r in rows: r.pop("t0", None)
+    if a.json:
+        out(json.dumps({"ok": ok, "rows": json_rows(rows)}, ensure_ascii=False)); return 0 if ok else 1
+    w = max([len("name")] + [len(one_line(r["name"], 130)) for r in rows])
+    out(f"{'name':<{w}} | sent   | pong | seconds")
+    for r in rows:
+        secs = f"{r['seconds']:.1f}" if r["seconds"] is not None else "-"
+        note = f"  ({r['error']})" if r["error"] else ""
+        out(f"{one_line(r['name'], 130):<{w}} | {r['sent']:<6} | {'yes' if r['pong'] else 'NO':<4} | {secs}{note}")
+    out(f"MATRIX {sum(r['pong'] for r in rows)}/{len(rows)} ponged" + ("" if ok else "  FAIL"))
+    return 0 if ok else 1
+
+def matrix_selftest(check, root):
+    import contextlib, io, threading
+    hub = Hub(root)
+    for n in ("m-a", "m-b", "m-quiet"): hub.heartbeat(n, "claude")
+    stop = threading.Event()
+    def responder(name):                            # answers PINGs only, like a well-behaved agent
+        while not stop.is_set():
+            for m, _ in hub.claim(name):
+                mo = re.match(r"MATRIX PING ([0-9a-f]{12}) ", str(m.get("text", "")))
+                if mo: hub.deliver(m["from"], name, f"MATRIX PONG {mo.group(1)}")
+            time.sleep(0.05)
+    ts = [threading.Thread(target=responder, args=(n,), daemon=True) for n in ("m-a", "m-b")]
+    for t in ts: t.start()
+    try:
+        ns = lambda **k: argparse.Namespace(**dict({"frm": None, "pairs": False, "timeout": 5, "poll": 0.05, "json": False}, **k))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): rc = cmd_matrix(hub, ns(names="m-a,m-b"))
+        check(rc == 0 and "MATRIX 2/2 ponged" in buf.getvalue() and not any(r["name"].startswith("matrix-") for r in hub.roster()),
+              "matrix: all targets pong, throwaway sender leaves")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): rc = cmd_matrix(hub, ns(names="m-a,m-quiet,ghost", timeout=0.5))
+        o = buf.getvalue()
+        check(rc == 1 and "m-quiet" in o and "never here" in o and "MATRIX 1/3 ponged" in o, "matrix: silent and unknown targets fail")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): rc = cmd_matrix(hub, ns(names="m-a,m-b", pairs=True, json=True))
+        j = json.loads(buf.getvalue())
+        check(rc == 0 and j["ok"] and sorted(r["name"] for r in j["rows"]) == ["m-a->m-b", "m-b->m-a"],
+              "matrix --pairs: both directions pong (seen in read/ without stealing the ear's mail)")
+    finally:
+        stop.set()
+        for t in ts: t.join(2)
 
 # ---------------------------------------------------------------- tunnel uplink
 class Uplink:
@@ -1252,6 +1382,7 @@ def selftest():
         check(len([f for f in os.listdir(hub.inbox("shai")) if f.endswith(".json")]) == 1, "uplink: failed send kept for retry")
         mesh_selftest(check, os.path.join(root, "mesh-test"))
         guard_selftest(check, os.path.join(root, "guard-test"))
+        matrix_selftest(check, os.path.join(root, "matrix-test"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
     out(f"{sum(ok)}/{len(ok)} passed")
@@ -1663,6 +1794,12 @@ def main(argv=None):
     s.add_argument("--poll", type=float, default=2); s.add_argument("--once", action="store_true")
     s = sub.add_parser("unpin", help="forget the far end a link or uplink pinned (trust the next one on first use)")
     s.add_argument("name")
+    s = sub.add_parser("matrix", help="PING agents and wait for their PONGs; exit 0 only if every one answered")
+    s.add_argument("--names", required=True, help="comma list of agents (name or name@machine)")
+    s.add_argument("--from", dest="frm", help="sender name (default: a throwaway matrix-<pid> that leaves afterwards)")
+    s.add_argument("--pairs", action="store_true", help="every name PINGs every other name (local agents only)")
+    s.add_argument("--timeout", type=float, default=90); s.add_argument("--poll", type=float, default=0.5)
+    s.add_argument("--json", action="store_true")
     sub.add_parser("selftest")
     a = p.parse_args(argv)
     if a.cmd == "selftest": return selftest()
@@ -1680,6 +1817,7 @@ def main(argv=None):
     if a.cmd == "gc": out(f"removed {hub.gc(a.days)} old message files"); return 0
     if a.cmd == "uplink": return cmd_uplink(hub, a)
     if a.cmd == "link": return cmd_link(hub, a)
+    if a.cmd == "matrix": return cmd_matrix(hub, a)
     if a.cmd == "unpin":
         pin = os.path.join(hub.root, "uplinks", check_name(a.name) + ".pin.json")
         old = read_json(pin)

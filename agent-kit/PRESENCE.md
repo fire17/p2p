@@ -216,3 +216,20 @@ The first real run on this PC should be:
 1. `hub.py selftest` on Windows and inside WSL;
 2. then `who` from both sides;
 3. then `WHO?` from Shai.
+
+---
+
+## Agent bridge and matrix test
+
+The hub is the bus. Delivery into each harness is native first, typing last. Full design: [docs/AGENT-BRIDGE.md](docs/AGENT-BRIDGE.md).
+
+| Harness | How a message arrives |
+|---|---|
+| Claude Code | Native cross-session message through `codex-bridge/peerbridge/ccpeer.py`. It lands as a real turn, with no typing. |
+| Codex | Run `pb expose --thread <id>` once. The thread then shows up as a ccpeer peer and gets the same native path. |
+| Anything else, or no live peer | herdr typing, **only** if the pane is not blocked. A startup dialog (folder trust, hook review) can look idle, and an Enter there can exit the agent. If unsure, the message waits in the inbox. |
+
+- **Replies** always go through `hub.py send <sender> "<text>" --from <me>`. Answer `MATRIX PING <id>` with `MATRIX PONG <id>` and nothing else.
+- **Run the adapter:** `python3 hub/agent-bridge.py --config bridge.json` (try `--once --dry-run` first). Config format: docs/AGENT-BRIDGE.md section 4.
+- **Check every path at once:** run `python3 hub/hub.py matrix --names a,b,c --pairs` (agents on this hub). Start with `selftest` and `who`.
+- **Status:** **NOT yet verified** on real Windows + WSL, or across two machines with herdr.
