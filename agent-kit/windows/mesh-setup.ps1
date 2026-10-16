@@ -261,7 +261,10 @@ function Start-HubChild([string[]]$argv, [string]$link) {
   $rest = @($argv | Select-Object -Skip 1)
   if ($rest.Count) { $sp.ArgumentList = (Join-Args $rest) }
   if ($OnWindows) { $sp.WindowStyle = 'Hidden' }
-  Start-Process @sp
+  $p = Start-Process @sp
+  # PS 5.1: ExitCode reads blank later unless the handle is opened while the process runs.
+  if ($p) { $null = $p.Handle }
+  $p
 }
 
 # ------------------------------------------------------------------ keeper control
