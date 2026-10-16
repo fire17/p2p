@@ -12,6 +12,7 @@ So a user-level process can queue and approve, but cannot change what runs eleva
 #>
 param(
   [string]$Root,
+  [string]$ApproverKey,      # path to the approver's PUBLIC key (RSA XML); installs signed mode (no unsigned fallback)
   [switch]$Uninstall,
   [switch]$WhatIf
 )
@@ -61,6 +62,13 @@ Run "ACL queue/approved: admins+SYSTEM full, $user modify" {
 Run "copy runner.ps1 + common.ps1 into $($d.bin)" {
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'runner.ps1'), (Join-Path $PSScriptRoot 'common.ps1') -Destination $d.bin -Force
 }
+if ($ApproverKey) {
+  $keyXml = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ApproverKey).Path)
+  AA-CheckPublicKeyXml $keyXml      # refuses a private key or a non-RSA / short key, before anything is copied
+  Run "install approver public key -> $($d.bin)\approver.pub.xml (SIGNED mode: every approval needs a valid signature)" {
+    [IO.File]::WriteAllText((Join-Path $d.bin 'approver.pub.xml'), $keyXml, (New-Object Text.UTF8Encoding($false)))
+  }
+} else { "note   no -ApproverKey: UNSIGNED mode (see README, the risk section)" }
 $runner = Join-Path $d.bin 'runner.ps1'
 $arg = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -Root `"$Root`""
 Run "register $TaskPath$TaskName (user $user, RunLevel Highest, no trigger): conhost.exe $arg" {

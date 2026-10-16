@@ -9,6 +9,10 @@ For each approved\<id>.json it refuses unless ALL hold:
   the request queue\<id>.json exists; the approval's sha8 equals the first 8 hex of sha256(command as loaded now);
   the approval is <= 10 min old and the request <= 60 min old; the command is <= 2000 chars;
   the id was never handled before (no done\<id>.request.json).
+SIGNED MODE (approver.pub.xml next to this runner, i.e. in bin\; test mode: <TestRoot>\bin\): every approval must
+also carry the full sha256 (== sha256 of the command as loaded now) and an RSA PKCS#1 v1.5 / SHA-256 signature over
+the UTF-8 bytes of "agent-admin-v1|<id>|<sha256>|<by>|<at>", where at is exactly "yyyy-MM-ddTHH:mm:ssZ".
+There is no unsigned fallback in that mode.
 Then it runs the command in a child powershell (10 min timeout), writes results\<id>.json, appends one audit
 line and moves request + approval to done\. A refused approval is also moved to done\ (marked refused) and
 audited, so nothing is retried or run twice.
@@ -27,6 +31,10 @@ if (-not $NoElevate) {
 }
 $d = AA-Dirs $Root
 foreach ($k in 'queue', 'approved', 'done', 'results') { if (-not (Test-Path -LiteralPath $d[$k])) { throw "missing folder $($d[$k])" } }
+# Signed mode: the approver's public key next to this runner (bin\, admin-write only). In test mode: <TestRoot>\bin\.
+$pubPath = if ($TestRoot) { Join-Path $TestRoot 'bin\approver.pub.xml' } else { Join-Path $PSScriptRoot 'approver.pub.xml' }
+$pubXml = if (Test-Path -LiteralPath $pubPath) { [IO.File]::ReadAllText($pubPath) } else { $null }
+if ($pubXml) { AA-CheckPublicKeyXml $pubXml }   # a bad installed key stops the pass loudly
 
 function Audit([string]$id, [string]$sha8, [string]$by, [string]$outcome, [string]$cmd) {
   $c = if ($cmd) { ($cmd -replace '\s+', ' ') } else { '' }
@@ -71,12 +79,24 @@ try {
     if ($ap.id -ne $id -or $req.id -ne $id) { Refuse $id $sha8 $by 'id mismatch' $cmd $false; continue }
     if (-not $by.Trim()) { Refuse $id $sha8 $by 'approval has no -By reference' $cmd $false; continue }
     if (-not $cmd.Trim() -or $cmd.Length -gt $AA_MaxCommandChars) { Refuse $id $sha8 $by "command empty or over $AA_MaxCommandChars chars" $cmd $false; continue }
-    if ((AA-Sha256 $cmd).Substring(0, 8) -ne $sha8) { Refuse $id $sha8 $by 'sha8 does not match the command' $cmd $false; continue }
+    $cmdSha = AA-Sha256 $cmd
+    if ($pubXml) {
+      # signed mode: full sha256 + a valid signature over agent-admin-v1|id|sha256|by|at, no unsigned fallback
+      $apSha = [string]$ap.sha256; $sig = [string]$ap.sig; $atStr = [string]$ap.at
+      if ($apSha -notmatch '^[0-9a-f]{64}$') { Refuse $id $sha8 $by 'signed mode: approval has no full sha256' $cmd $false; continue }
+      if ($apSha -ne $cmdSha) { Refuse $id $sha8 $by 'sha256 does not match the command' $cmd $false; continue }
+      if ($sha8 -and $sha8 -ne $cmdSha.Substring(0, 8)) { Refuse $id $sha8 $by 'sha8 does not match the command' $cmd $false; continue }
+      $sha8 = $cmdSha.Substring(0, 8)
+      if (-not $sig) { Refuse $id $sha8 $by 'signed mode: approval has no signature' $cmd $false; continue }
+      if ($atStr -notmatch $AA_AtPattern) { Refuse $id $sha8 $by 'signed mode: at must be yyyy-MM-ddTHH:mm:ssZ' $cmd $false; continue }
+      if (-not (AA-VerifySig $pubXml (AA-SignedPayload $id $apSha $by $atStr) $sig)) { Refuse $id $sha8 $by 'signature invalid' $cmd $false; continue }
+    } elseif ($cmdSha.Substring(0, 8) -ne $sha8) { Refuse $id $sha8 $by 'sha8 does not match the command' $cmd $false; continue }
     try { $at = [DateTime]::Parse([string]$ap.at).ToUniversalTime(); $created = [DateTime]::Parse([string]$req.created).ToUniversalTime() }
     catch { Refuse $id $sha8 $by 'bad timestamps' $cmd $false; continue }
     if (($now - $at).TotalSeconds -gt $AA_ApprovalMaxAgeSec -or $at -gt $now.AddMinutes(1)) { Refuse $id $sha8 $by 'approval stale (>10 min) or in the future' $cmd $false; continue }
     if (($now - $created).TotalSeconds -gt $AA_RequestMaxAgeSec) { Refuse $id $sha8 $by 'request stale (>60 min)' $cmd $false; continue }
-    if ($at -lt $created) { Refuse $id $sha8 $by 'approval older than the request' $cmd $false; continue }
+    # a signed "at" has whole seconds, "created" has fractions: allow the same second
+    if ($at -lt $created.AddSeconds(-1)) { Refuse $id $sha8 $by 'approval older than the request' $cmd $false; continue }
 
     # run it: child powershell, the command passed encoded (no quoting issues), 10 min limit
     $out = Join-Path $d.results "$id.stdout.txt"; $err = Join-Path $d.results "$id.stderr.txt"

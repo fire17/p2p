@@ -45,3 +45,31 @@ function AA-ReadJson([string]$path) {
 function AA-CheckId([string]$id) {
   if ($id -notmatch $AA_IdPattern) { throw "bad id '$id' (expected yyyyMMdd-HHmmss-xxxxxx)" }
 }
+
+# ---- signed approvals (bin\approver.pub.xml present = signed mode, no unsigned fallback)
+$AA_SigPrefix = 'agent-admin-v1'
+$AA_AtPattern = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+
+function AA-SignedPayload([string]$id, [string]$sha256, [string]$by, [string]$at) {
+  # exactly what the approver signs (UTF-8 bytes); at = the approval's "at" string as written
+  "$AA_SigPrefix|$id|$sha256|$by|$at"
+}
+
+function AA-VerifySig([string]$pubXml, [string]$payload, [string]$sigB64) {
+  # RSA PKCS#1 v1.5 + SHA-256. A malformed SIGNATURE is an invalid signature ($false); a malformed installed KEY
+  # is a setup error and throws (the runner then refuses with that reason).
+  try { $sig = [Convert]::FromBase64String($sigB64) } catch [FormatException] { return $false }
+  $r = New-Object Security.Cryptography.RSACryptoServiceProvider
+  try {
+    $r.FromXmlString($pubXml)
+    try { return $r.VerifyData([Text.Encoding]::UTF8.GetBytes($payload), 'SHA256', $sig) }
+    catch [Security.Cryptography.CryptographicException] { return $false }   # e.g. wrong signature length
+  } finally { $r.Dispose() }
+}
+
+function AA-CheckPublicKeyXml([string]$xml) {
+  # refuse a private key (it must never be on the PC) and anything that is not an RSA public key
+  if ($xml -match '<(D|P|Q|DP|DQ|InverseQ)>') { throw 'this XML holds a PRIVATE key; only the public key may be installed' }
+  $r = New-Object Security.Cryptography.RSACryptoServiceProvider
+  try { $r.FromXmlString($xml); if ($r.KeySize -lt 2048) { throw "RSA key is $($r.KeySize) bits; at least 2048 required" } } finally { $r.Dispose() }
+}

@@ -45,6 +45,7 @@ windows/admin-runner/install.ps1
 windows/admin-runner/request.ps1
 windows/admin-runner/runner.ps1
 windows/admin-runner/status.ps1
+windows/admin-runner/test-vector.json
 windows/admin-runner/tests.ps1
 windows/mesh-setup.ps1
 windows/shai-ear.ps1
