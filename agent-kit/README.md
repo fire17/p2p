@@ -51,7 +51,7 @@ Keep **one** reader per PC: either the ear or a `recv` loop, not both.
 
 **Sending:** `windows\shai-send.ps1 "<TAG> text"` (or `-File msg.txt`). It always sends through a UTF-8 file, because `p2p.cmd` re-parses plain arguments through cmd.exe. It checks the tag and refuses token-like strings unless you add `-Redact`.
 
-**Inside WSL:** `wsl/shai-ear.sh` and `wsl/shai-send.sh` run the same two scripts through `powershell.exe`. **Several agents on one PC:** see `PRESENCE.md` (local hub; run its uplink *instead of* the ear, never both). **Your own machines as one network** (laptop + desktop + WSL, nobody else involved): `docs/MESH.md`, set up by `windows/mesh-setup.ps1`; its risks and fixes are in `docs/MESH-THREATS.md`.
+**Inside WSL:** `wsl/shai-ear.sh` and `wsl/shai-send.sh` run the same two scripts through `powershell.exe`. `wsl/pane-assist.py` (optional, no AI) lets Shai read a herdr pane and answer a blocked dialog with a few whitelisted keys over the same tunnel; its header says exactly what it may do. **Several agents on one PC:** see `PRESENCE.md` (local hub; run its uplink *instead of* the ear, never both). **Your own machines as one network** (laptop + desktop + WSL, nobody else involved): `docs/MESH.md`, set up by `windows/mesh-setup.ps1`; its risks and fixes are in `docs/MESH-THREATS.md`.
 
 ## 4. Message tags
 
