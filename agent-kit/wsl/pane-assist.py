@@ -94,7 +94,7 @@ def health():
     r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", win],
                        capture_output=True, text=True, timeout=120, cwd="/mnt/c")
     lines = [l.rstrip() for l in (r.stdout or "").splitlines() if l.strip()]
-    keep = [l for l in lines if l.startswith("VERDICT") or " WARN" in l or " FAIL" in l or l.startswith(("WARN", "FAIL"))]
+    keep = [l for l in lines if l.startswith(("VERDICT", "WARN", "FAIL"))]   # status is the first column
     return "\n".join(keep) or f"health.ps1 gave no VERDICT (exit {r.returncode}): {(r.stderr or '').strip()[:200]}"
 
 
