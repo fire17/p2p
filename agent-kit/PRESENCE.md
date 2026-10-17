@@ -53,7 +53,7 @@ Put this kit folder at `%USERPROFILE%\shai-kit`. WSL sees the same folder as `/m
 - On Windows, check with `py -3 --version`. Plain `python` can be the Store stub that only opens a store page.
 - If Windows has no Python, Windows agents use `hub.ps1`, the PowerShell twin. It works on the same folder and has the same verbs, except `uplink`. The uplink then runs from WSL (step 1, WSL variant).
 
-**Names.** Pick one name per agent: `<where>-<harness>`, for example `win-claude`, `win-codex`, `wsl-claude`, `wsl-codex`.
+**Names.** Pick one name per agent: `<where>-<harness>`, for example `win-claude`, `win-codex`, `wsl-claude`, `wsl-codex`. Names ending in `-unrouted` are reserved (a link's spill folder): `hub.py` and `hub.ps1` both refuse them.
 
 ### Step 1: start the uplink, once per PC
 
@@ -142,7 +142,7 @@ By hand: same hub, one `link` per extra machine. Example: your main PC (`main`) 
 6. Each link pins the tunnel key and hub id it meets first (`uplinks/<link>.pin.json`). If another machine shows up on that tunnel, the link holds until you run `hub unpin <link>`.
 
 **Caveats:**
-- **Restarts.** A listener on Windows does not restart after a reboot. Rerun step 1's `listen` line on `main` and each laptop's join line, then the uplinks.
+- **Restarts.** A listener on Windows does not restart after a reboot. Rerun step 1's `listen` line on `main` and each laptop's join line, then the uplinks. To restart one link set up by `mesh-setup.ps1`, use `mesh-setup.ps1 -Restart -Link <name>` (stop request, wait, start through its task), never `Stop-ScheduledTask` alone: it can leave the old keeper running. Every hub link start (keeper start or its own restart of an exited link) keeps the last 5 hub log runs (`<link>.hub.prev.log`, `.prev.2.log` .. `.prev.5.log`, same for `hub.err`), so 5 quick crashes roll the window.
 - **Fresh identity.** If a laptop is reinstalled, its identity changes. Restart that listener first (`tunnel stop --name laptop`, then `listen` again) so it can accept the new identity (`bin/p2p-tunnel.js:196-198`), then `hub unpin laptop` on `main` so its link accepts the new key and hub id.
 - **Names.** A machine name must differ from every agent name: a link refuses to start with a local agent's name, and an agent cannot take a link's name.
 - **Unverified.** p2p `tunnel listen` on Windows is untested by this kit (see §7).
@@ -172,7 +172,10 @@ The WSL mailbox is then `join-<KEY>` under `~/.p2p` inside WSL.
   agents/<name>.json             {"name","machine","os","harness","note","pid","started","beat","remote"}
                                  beat = Unix seconds; up = younger than 45 s; hidden after 24 h of silence
   inbox/<name>/<ns>-<id>.json    {"v":1,"id","from","to","t","ts","text","via"}
-  inbox/<name>/read/             claimed messages (gc after 7 days: hub.py gc)
+  inbox/<name>/claims/<fn>.claim claim markers (exclusive create; only the creator moves the message)
+  inbox/<name>/read/             claimed messages (gc after 7 days: hub.py gc, also run hourly by links and ears)
+  inbox/<name>/inflight/         a link's claimed messages until the send worked; requeued when the link starts
+  inbox/<as>-unrouted/           far-end lines a link or uplink could route to nobody (at most 200 files / 20 MiB)
   inbox/<name>/failed/           messages a link could never send (the sender got UNDELIVERABLE)
   inbox/<name>/throttled/        messages over 30 a minute from one sender (a reply loop?)
   uplinks/<as>.offset.json       the uplink's byte offset into the tunnel inbox + recent row ids (per generation)
@@ -183,9 +186,13 @@ The WSL mailbox is then `join-<KEY>` under `~/.p2p` inside WSL.
 ```
 On macOS/Linux/WSL-native paths the hub folder is `0700` and its files `0600`.
 
-**Writing.** Every file is written as `.tmp-*` and then renamed, so a reader never sees half a message.
+**Writing.** Every file is written as `.tmp-*` and then renamed, so a reader never sees half a message. On Windows, `hub.ps1` and `mesh-setup.ps1` retry a busy replace (sharing violations, and 1176/1177: the target moved away, the tmp kept and then moved into place).
 
-**Reading.** A reader **claims** a message by renaming it into `read/`. It prints the message only if that rename succeeded, so a message is printed exactly once even with two readers.
+**Reading.** A reader **claims** a message by exclusively creating its marker in `claims/`, then moves it into `read/` and prints it. Only the marker's creator does that, so a message is printed exactly once even with two readers (on Windows two renames of one file can both "succeed").
+
+**Link sends (at least once).** A link claims into `inflight/` and moves a message to `read/` only after the send worked. A killed run's `inflight/` messages go back to the queue when the link next starts. The envelope id is stable per hub message, so the far hub drops a resend instead of delivering it twice.
+
+**gc** (`hub.py gc --days 7`, and hourly from every link and ear) picks folders by depth, not by name: it sweeps `inbox/<name>/{read,claims,sent,failed,throttled}/` and `inbox/*-unrouted/`, never a live inbox (even one named `read`), plus `.tmp-*` files older than 1 h.
 
 **Clock skew.** WSL2's clock can lag Windows after sleep. Ages in `who` then look wrong. Inside WSL, `sudo hwclock -s` (or `wsl --shutdown` from Windows) resyncs it.
 
@@ -226,13 +233,14 @@ The hub is the bus. Delivery into each harness is native first, typing last. Ful
 | Harness | How a message arrives |
 |---|---|
 | Claude Code | Native cross-session message through `codex-bridge/peerbridge/ccpeer.py`. It lands as a real turn, with no typing. |
-| Codex | Run `pb expose --thread <id>` once; the route's peer is that thread id. After a pane restart, expose again. |
-| Anything else, or no live peer | herdr typing, **only** if the pane is not blocked. A startup dialog (folder trust, hook review) can look idle, and an Enter there can exit the agent. If unsure, the message waits in the inbox. |
+| Codex | Run `pb expose --thread <id>` once; the route's peer is that thread id. After a pane restart, expose again (`hub/agent-bridge-start.sh --watch` does it, once per thread, so `pb hide` sticks). Its routes carry `+trusted`: only `trusted.json` senders reach it (except `--gate all`: everyone). If the peer record is `codex` (harness/entrypoint) and peerbridge's `events.jsonl` exists, delivered only once peerbridge reports the inject; otherwise the send counts as delivered, as before. |
+| Anything else, or no live peer | herdr typing, **only** if the pane is not blocked and its composer holds no draft. A startup dialog (folder trust, hook review) can look idle, and an Enter there can exit the agent. If unsure, the message waits in the inbox. |
 
 - **Replies** always go through `hub.py send <sender> "<text>" --from <me>`. Answer `MATRIX PING <id>` with `MATRIX PONG <id>` and nothing else.
 - **Run the adapter:** `python3 hub/agent-bridge.py --config bridge.json` (try `--once --dry-run` first). Config format: docs/AGENT-BRIDGE.md section 4.
 - **Trust:** `trusted.json` in the hub root lists trusted senders by name pattern and via class (`local`, `link:*`, `tunnel` + `join-<KEY>`). Missing or broken file = nobody trusted. Only the machine's owner edits it; tunnel entries only with the owner's explicit approval, logged in the file. Details: docs/AGENT-BRIDGE.md section 5.
 - **Bypass:** Claude Code holds a message that claims bypass into a non-bypass session, so the bridge claims bypass only into routes marked `+bypass`, only for trusted senders, and only with `--gate trusted` (default `none`). The herdr fallback types into a `+bypass` pane only for those same senders.
-- **Failures** come back to the sender as `NOT DELIVERED <name> (id=<id>): <reason>`; nothing is dropped.
+- **`+trusted`** route flag (any adapter): only `trusted.json` senders reach that route, whatever the gate (except `--gate all`: everyone).
+- **Failures** come back to the sender as `NOT DELIVERED <name> (id=<id>): <reason>` (held and retried, or refused). A send that may have landed (herdr ran but failed, or no Codex inject report within 10 s) is `UNSURE` and comes back as `NOT CONFIRMED`; it is never resent. Nothing is dropped.
 - **Check every path at once:** run `python3 hub/hub.py matrix --names a,b,c --pairs` (agents on this hub). Start with `selftest` and `who`. Across machines, each side sees only its own inboxes: check both machines' delivery files.
 - **Status:** a real two-PC run (Windows 11 + Windows 10, WSL, herdr, 4 agents per PC) passed **56/56** all-pairs round trips with native adapters only (herdr fallback unused), checked against the hub's delivery files on each machine. The herdr fallback on a real dialog is **NOT yet verified**.

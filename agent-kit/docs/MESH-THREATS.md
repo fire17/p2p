@@ -93,12 +93,12 @@ numbers, are cited because the file moved.
 | 10 | `Uplink.answer_who`: one `WHO?` answer per 20 s; extra asks are folded into one later answer | "guard #10" |
 | 11 | never-seen names go to `<as>-unrouted`; no inbox folder is created | "guard #11" |
 | 12 | hub folder created/tightened to 0700, every file written 0600 (`open_private`) on POSIX | "guard #12" |
-| 13 | row ids remembered per generation (last 512); the offset is committed per row AFTER routing | "guard #13" |
+| 13 | row ids remembered per generation (last 512); the offset is committed per row AFTER routing. Outbound, a link claims into `inbox/<as>/inflight/` and moves to `read/` only after the send worked; a killed run's `inflight/` is requeued at start, and the envelope id is stable per hub message (uuid5), so the far hub's `mesh/seen` drops the resend (at least once out, at most once in) | "guard #13"; "link: a message claimed by a killed run is requeued and sent once" |
 | 14 | `Uplink.give`: at most 30 a minute per link and target through a bridge; the rest to `throttled/` with one notice; AGENT-PROMPT.md "No reply loops" rule | "guard #14" |
 | 18a | plain `uplink` sends this PC's roster only, unless `--share-mesh` | "guard 18a", e2e "helper WHO? (default)" |
 | 18c | `Link.accept_hub`: the first far hub id is pinned per link; a different id holds the link; an id or origin pinned by another link is refused; an existing route is never taken over until it is forgotten; `who` flags two machines with one name | "guard 18c" (x2) |
 | 22 | `Uplink.step`: each row is handled in its own `try/except Exception`; a failing row is dropped, counted (`bad_rows`) and the offset is committed past it (a stop, `KeyboardInterrupt`, is not caught, so #13 still holds). `wire_json`: nesting deeper than 32 is refused by a text pre-check before `json.loads`, and `NaN`/`Infinity` are refused (`parse_constant`). `_age`: wire ages are clamped to 0..1e6 s, NaN refused | "guard (a)"; "guard #13" now simulates a stop |
-| 23 | `Hub.prune`: `inbox/<as>-unrouted/` and every `throttled/` keep at most 200 files / 20 MiB (`SPILL_FILES`, `SPILL_BYTES`), oldest dropped first and logged; `gc` also sweeps `inbox/*-unrouted/` | "guard (b): <as>-unrouted keeps...", "guard (b): the rate key is the link..." |
+| 23 | `Hub.prune`: `inbox/<as>-unrouted/` and every `throttled/` keep at most 200 files / 20 MiB (`SPILL_FILES`, `SPILL_BYTES`), oldest dropped first and logged; `gc` also sweeps `inbox/*-unrouted/`. `gc` picks folders by depth, never by name (a live inbox named `read` is kept), and runs hourly from every link and ear; names ending in `-unrouted` are reserved, refused by both `hub.py` (`Hub.check_local_name`) and `hub/hub.ps1` (`Check-Name`), so no live inbox is ever swept as a spill folder | "guard (b): <as>-unrouted keeps...", "guard (b): the rate key is the link...", "gc: by depth (a live inbox named read/ is kept)..." (the reserved suffix has no own check in either) |
 | 24 | `Link.on_msg`: the rate key is `(this link, target)`; the far end's `from@srcl` is shown to the reader but never keys the limit | "guard (b): the rate key is the link..." |
 | 25 | `Link`: plain text without `@name` goes to nobody (kept in `inbox/<as>-unrouted`); `hub.py link --plain-to-all` opts back in. `uplink --default-to` is unchanged | "guard (c)" |
 | 26 | `_CTRL` (hub.py), `$Ctrl` (hub.ps1) and `Clean` (windows/shai-ear.ps1) also strip U+FE00-FE0F and U+E0100-E01EF (in .NET: the pair `\uDB40[\uDD00-\uDDEF]`) | "guard (d)" (hub.py only; the PowerShell twins have no automated check) |
@@ -120,7 +120,11 @@ Open, with mitigation:
   killed, its `hub.py link` child keeps running and `run\<link>.child`, the only record of it, is deleted
   (`Stop-OrphanLink` runs only when a NEXT keeper starts). Mitigation: after `-Uninstall`, look for a
   `python ... hub.py link --as <link>` process and stop it. Fix: call `Stop-OrphanLink` in `Remove-Links`
-  before deleting the run files.
+  before deleting the run files. For a plain restart use `mesh-setup.ps1 -Restart -Link <name>`: stop request,
+  wait for the pid file to go, refuse a second keeper, start through its task. `Stop-ScheduledTask` alone can
+  leave the old keeper running. Every hub link start (keeper start, or the keeper restarting an exited link) rotates the hub logs and keeps
+  the last 5 runs (`<link>.hub.prev.log`, `.prev.2.log` .. `.prev.5.log`, same for `hub.err`): 5 quick crashes
+  roll that window, so copy the logs early when diagnosing a crash loop.
 
 Corrections and limits found while fixing:
 - p2p v0.3.8 `tunnel send` exit codes: **2** = usage or size (permanent: "message exceeds 1 MiB"), **3** = peer
@@ -128,6 +132,11 @@ Corrections and limits found while fixing:
   reason, or a local oversize check, parks a message in `failed/`; everything else is retried (section 6 said rc 3).
 - A lone UTF-16 surrogate in a tunnel row (valid JSON) crashed every writer before; rows are now repaired.
 - Rate limit and `WHO?` throttle live in the bridge process: they reset when a link restarts.
+- Windows: a `p2p.cmd` call that times out kills its whole process tree (`taskkill /T /F`) and returns 124, so a
+  pipe held by an orphaned node never blocks the link.
+- A flush step stops starting new sends after 20 s (all OSes, `FLUSH_BUDGET_S`); the rest waits for the next step.
+- Windows: `hub.ps1` and `mesh-setup.ps1` `Write-Atomic` also retry 1176/1177 (the replace moved the target away
+  but kept the tmp; the next try moves the tmp into place).
 - Still open (Low, or by design): #15 a far `PRESENCE` note can still claim names; #16 an uplink's `PRESENCE`
   carries this PC's host names; #17 local `from=` is a claim; 18e a linked hub may broadcast (`to: "*"`) to every
   local agent; `mesh/seen/` grows until `gc`; hub.ps1 does not read `mesh/` (its `who` lists links but not the

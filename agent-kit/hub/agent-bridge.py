@@ -572,7 +572,8 @@ class Bridge:
 
     # ---- one message ----
     def route(self, t, m, path):
-        """("ok", via, detail) | ("hold", reason, retry) | ("refuse", reason, False) -- hold = retry later, refuse = never."""
+        """("ok", via, detail) | ("hold", reason, retry) | ("refuse", reason, False) | ("unsure", reason, False) --
+        hold = retry later, refuse = never, unsure = it may have landed: never resent, one NOT CONFIRMED notice."""
         why = []
         t.sending = False
         if self.refuses_only(t, m):
@@ -747,7 +748,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="agent-bridge.py", description="deliver hub messages natively (see file header)")
     p.add_argument("--config", help="JSON config (see the file header)")
     p.add_argument("--map", action="append", default=[], metavar="NAME=ROUTE",
-                   help="NAME=peer:<peer>[+bypass] | NAME=herdr:<session>:<pane>; repeatable; adds to --config")
+                   help="NAME=peer:<peer>[+bypass][+trusted] | NAME=herdr:<session>:<pane>[+trusted]; "
+                        "repeatable; adds to --config")
     p.add_argument("--gate", choices=GATES, help="who may claim from-mode=bypass into +bypass routes "
                    "(default: the config's \"gate\", else none)")
     p.add_argument("--root", help="hub folder (overrides hub_root in the config)")

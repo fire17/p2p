@@ -8,7 +8,8 @@ reference in its header). It passes `hub/test_agent_bridge.sh` and `hub/test_bri
 fake ccpeer and a fake herdr.
 The design was proven live on two real PCs: 56/56 all-pairs round trips across 8 agents, native adapters only
 (section 8). That run used the field version of this bridge; the kit script carries its rules (whitelist, gate,
-`+bypass`, NOT DELIVERED). Rows marked **NOT yet verified** in section 8 are exactly that.
+`+bypass`, NOT DELIVERED); later rules (`+trusted`, draft check, Codex confirm, UNSURE) are tested with fakes only.
+Rows marked **NOT yet verified** in section 8 are exactly that.
 
 ---
 
@@ -74,8 +75,17 @@ Honest limits:
 3. `pb off` withdraws every Codex peer within about 1 s. The adapter then falls through to 2c or 2d.
 
 The route's `peer` is the **exposed thread id** (`pb list` shows it). Exposure belongs to that thread:
-after a Codex pane restart, run `pb expose --thread <id>` again (and update the route if the id changed).
-Until then the route has no live peer, and the sender gets a NOT DELIVERED notice.
+after a Codex pane restart, run `pb expose --thread <id>` again (and update the route if the id changed;
+`agent-bridge-start.sh --watch` does both, 4a: it re-exposes for a NEW thread id; the same thread is never
+re-exposed, so `pb hide` sticks). Until then the route has no live peer, and the sender gets a
+NOT DELIVERED notice.
+
+**Delivery confirm.** peerbridge sends no receipt to a hub sender, so for a Codex peer (record `harness` or
+`entrypoint` is `codex`) whose peerbridge `events.jsonl` exists, the bridge waits up to
+10 s for peerbridge's `inbound` event for that message (`events.jsonl`): ok = `DELIVER`; policy refusal =
+`REFUSE`; failed inject (no turn started) = `HOLD`, retried; no event in 10 s = `UNSURE` (it may still arrive):
+never resent, the sender gets one `NOT CONFIRMED` notice (2e). Not a Codex record, or no `events.jsonl`: the
+send counts as delivered, as before.
 
 Honest limit: an unattended Codex TUI on Windows may never create a thread while a first-run or
 folder-trust screen is up (codex-bridge/docs/WINDOWS.md). No thread means no native peer.
@@ -100,8 +110,16 @@ So the adapter:
 - reads `agent get <pane>` and refuses unless the state is `idle` (config `herdr_ok_states`), so `blocked`
   is always refused;
 - also refuses if the pane's visible screen shows a dialog, even when herdr says `idle`;
+- also refuses when the composer row (last visible line starting with a prompt glyph) holds text that is not
+  a known placeholder: that is the user's draft, and typing would append to it and submit both. The reason
+  says only "a draft is in the composer", never the draft. Config: `composer_check` (default true),
+  `composer_placeholders`, `prompt_glyphs`;
 - when unsure, does **not** type. The message goes back to the hub inbox, is retried with backoff
   (5 s up to 60 s), and the sender gets one `NOT DELIVERED <name> (id=<id>): <reason>` notice through the hub.
+
+A send that **ran** but failed (herdr timed out or returned rc != 0) may still have typed the text. It is
+never typed again: the log says `UNSURE`, the sender gets one `NOT CONFIRMED` notice, and the message stays
+in `read/`. (Only a herdr that never started, an `OSError`, is a plain HOLD and retried.)
 
 Typed text is one line, cleaned of control and invisible characters, and never contains a secret.
 It lands as the pane owner's own input, with no peer-message approval hold. So on a `+bypass` route
@@ -116,8 +134,18 @@ Do not also run `hub.py ear` for a bridged name: two readers of one inbox split 
 
 ### 2e. Failures go back to the sender
 
-A delivery error is never dropped silently. The bridge logs `ERROR` and sends the sender one notice over
-the hub: `NOT DELIVERED <name> (id=<id>): <reason>`. Notices are never answered with notices (no ping-pong).
+A delivery error is never dropped silently. The sender gets one notice per message over the hub:
+
+| Log | Notice | Message |
+|---|---|---|
+| `HOLD` | `NOT DELIVERED <name> (id=<id>): <reason>. It waits in the hub and is retried.` | back in the inbox, backoff 5 s .. 60 s |
+| `REFUSE` | `NOT DELIVERED ... It is not retried.` | stays in `read/` |
+| `UNSURE` | `NOT CONFIRMED <name> (id=<id>): <reason>. It is not retried.` | stays in `read/`; it may have landed, so it is never resent |
+
+If even the notice fails, the log says `ERROR`. Notices are never answered with notices (no ping-pong).
+
+**Stop.** SIGTERM, SIGINT or SIGHUP (for example from `agent-bridge-start.sh`) while a message is being
+handled waits until that message is finished, so no claimed message is left half-done in `read/`.
 
 ---
 
@@ -169,6 +197,11 @@ To let trusted senders claim bypass into a session that runs bypassPermissions, 
 (command line: `--map desk-claude=peer:desk-claude+bypass`; in bridge.json: `"bypass": true` on that agent)
 and start the bridge with `--gate trusted`. Never mark a session `+bypass` unless it really runs bypass.
 
+`+trusted` (any adapter; `--map desk-codex=peer:<id>+trusted` or `herdr:<session>:<pane>+trusted`; in
+bridge.json `"trusted_only": true`): only senders `trusted.json` lets through reach that route, whatever the
+gate (everyone with `--gate all`); anyone else gets `REFUSE`, not retried. Use it for targets that run their turns
+without approvals and have no from-mode hold of their own, e.g. a Codex started with `-a never`.
+
 Load the kit's `hub/hub.py` **by path** (as the bridge does). peerbridge ships its own `hub.py`; importing
 by module name can pick up the wrong one.
 
@@ -179,14 +212,20 @@ by module name can pick up the wrong one.
 Fixed ids go stale: a restarted Codex pane gets a new thread id. `hub/agent-bridge-start.sh` (WSL/Linux, needs herdr, jq, pb, python3) finds the routes each time and (re)starts the bridge detached:
 
 ```
-hub/agent-bridge-start.sh --prefix desk [--session main] [--dry-run] [--wait 120]   # one shot
-hub/agent-bridge-start.sh --prefix desk [--session main] --watch 60                 # keep matching the panes
+hub/agent-bridge-start.sh --prefix desk [--session main] [--workspace W] [--dry-run] [--wait 120]   # one shot
+hub/agent-bridge-start.sh --prefix desk [--session main] [--workspace W] --watch 60                 # keep matching
 ```
 
-- `<prefix>-claude` (and `<prefix>-<label>` for each extra pane in `--claude claude,<label>`) = the Claude Code session named like its herdr pane, only if exactly one live match. `+bypass` only when that claude process really runs bypassPermissions (read from `/proc/<pid>/cmdline`).
-- `<prefix>-codex` = the thread the managed Codex daemon holds open for the herdr pane labelled `codex` (same cwd, created after that codex process started, any originator). Several candidates: the one pb already exposes; still ambiguous: no codex route, logged, never a guess. It runs `pb expose --thread <id>` for it, and `pb hide` for the thread it exposed before when the thread changes. No thread yet (Codex creates one at the pane's first prompt): the route is `herdr:<session>:<pane>` (typed, idle + dialog guarded) until the thread appears.
+- **One pane per label.** Each label (`codex`, every `--claude` label) must sit on exactly one herdr pane;
+  `--workspace W` looks only in that workspace (default: the whole session). A `codex` label on several panes
+  gives no new route (logged with the pane ids, never a guess); a live bridge keeps its codex route. A claude
+  label on several panes is only logged: its route reaches the ccpeer session, not the pane.
+
+- `<prefix>-claude` (and `<prefix>-<label>` for each extra pane in `--claude claude,<label>`) = the Claude Code session named like its herdr pane, only if exactly one live match. `+bypass` only when that claude process really runs bypassPermissions (read from `/proc/<pid>/cmdline` of the pid ccpeer resolved, the session the route reaches, not whatever runs in the pane).
+- `<prefix>-codex` = the thread the managed Codex daemon holds open for the herdr pane labelled `codex` (same cwd, created after that codex process started, any originator). Several candidates: the one pb already exposes; still ambiguous: no codex route, logged, never a guess. It runs `pb expose --thread <id>` for it **once**: a failed expose is retried next pass, but a thread that was exposed is never re-exposed, so the owner's `pb hide` sticks. Only after the expose worked does it `pb hide` the thread it exposed before. No thread yet (Codex creates one at the pane's first prompt): the route is `herdr:<session>:<pane>` (typed, idle + dialog + draft guarded) until the thread appears. Both codex routes carry `+trusted` (section 4): only `trusted.json` senders reach Codex.
 - One shot: missing peers are retried for `--wait` seconds, then it starts with what exists and logs what is missing.
 - `--watch SEC`: rediscovers every SEC seconds and restarts the bridge only when the map differs on two checks in a row (one failed lookup never drops a route), or at once when no bridge runs. Covers reboots, pane restarts and the lazy Codex thread. One watcher per `$BRIDGE_DIR` (flock). Use this one from your logon script.
+- Restart: it signals only a pid that is alive and runs `agent-bridge.py` (a stale or reused pid is never killed), sends SIGTERM (never `-9`: the bridge may hold a claim), waits up to 10 s for it to finish its message, then starts the new one (a WARNING if the old one is still alive).
 - Idempotent: a live bridge with the same routes is left alone. `--dry-run` prints the map and the command and changes nothing. Pid and log: `$BRIDGE_DIR` (default `~/.agent-bridge`).
 - Call it from the script that starts your herdr session, after the panes are up, so a logon brings the bridge back too.
 - Start the Claude panes in a dedicated folder (for example `~/agents`) and trust it once. Claude Code does not keep folder trust for the home folder, so panes started in `~` wait at the trust dialog at every logon and never register.
@@ -205,7 +244,8 @@ With `--gate trusted`, a message from a sender that is **not** trusted into a `+
 not sent and not retried. Sent without the claim, it would stop that bypass session at Claude Code's
 "deliver this message?" prompt, and the pane would stay blocked until a human answers. The log says
 `REFUSE <route> <- <sender>` and the sender gets one `NOT DELIVERED ... It is not retried.` notice.
-Routes without `+bypass` are not affected. (`--gate none` keeps the old behaviour: no claim, the prompt decides.)
+Routes without `+bypass` are not affected, except `+trusted` routes (section 4), which refuse untrusted senders
+under every gate (except `--gate all`: everyone passes). (`--gate none` keeps the old behaviour: no claim, the prompt decides.)
 
 The whitelist is `trusted.json` in the hub root. The bridge re-reads it whenever it changes on disk:
 
@@ -270,7 +310,11 @@ If `matrix` is reported as an unknown verb, this hub.py predates it: update the 
   the hub first.
 - Bypass is claimed only into `+bypass` routes for trusted senders. Untrusted messages into a bypass
   session are held for its user's approval: that is by design, not a fault.
-- A Codex pane restart drops native delivery until `pb expose --thread <id>` is run again.
+- A Codex pane restart drops native delivery until `pb expose --thread <id>` is run again (4a's `--watch`
+  re-exposes for a NEW thread id; the same thread is never re-exposed, so `pb hide` sticks).
+- `UNSURE` / `NOT CONFIRMED` messages are never resent: if it matters, check the target and resend by hand.
+- The draft check reads plain screen text: ghost text (a prompt suggestion, a placeholder not in the list) looks
+  like a draft and holds a herdr route until `composer_placeholders` lists it or `composer_check` is false.
 - A sandboxed (default) Codex replying to a bypass-mode Claude can be held for approval
   (codex-bridge/docs/HOLD-OPTIONS.md). The owner chooses; nothing here changes that setting.
 - herdr `idle` is not "ready". The blocked-pane rule makes the fallback refuse rather than guess,
@@ -288,6 +332,9 @@ If `matrix` is reported as an unknown verb, this hub.py predates it: update the 
 | Rules from that run (whitelist, `--gate`, `+bypass`, re-expose, NOT DELIVERED, load hub.py by path, merge both tables) | proven with the field bridge; the kit's `hub/agent-bridge.py` port is tested by `hub/test_agent_bridge.sh` and `hub/test_bridge_gate.sh` (fakes) and **NOT yet re-run live** |
 | Hub, mesh links, exactly-once claim | tested on macOS (PRESENCE.md section 7) |
 | Adapter choosing native first, herdr only as fallback | tested on macOS with fake ccpeer + fake herdr (`hub/test_agent_bridge.sh`) |
+| `+trusted`, draft check, Codex delivery confirm, UNSURE, deferred stop | tested with fakes (`hub/test_bridge_gate.sh`); **NOT yet verified** live |
+| Start script: `claude` label on 2 panes (route kept, ambiguity logged), `--workspace`, reused-pid check | `hub/test_agent_bridge.sh` with a fake herdr (macOS: no `/proc`, so the reused-pid check passes trivially there); **NOT yet verified** on WSL |
+| Start script: `codex` label on several panes, expose once, retry of a failed expose, `pb hide` after expose | **NOT tested** (no automated check) |
 | herdr fallback and blocked-pane refusal against a real dialog | tested with a fake herdr only; **NOT yet verified** on real herdr (unused in the live run) |
 | `hub.py matrix` / `--pairs` on one hub | tested offline (`hub.py selftest`, `hub/test_matrix.sh`) |
 | Native Windows (non-WSL) Claude Code or Codex as a target | **NOT yet verified** |
