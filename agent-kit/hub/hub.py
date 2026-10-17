@@ -556,7 +556,7 @@ def cmd_ear(hub, a):
     out(f"EAR {me} on {hub.root} (heartbeat {a.every}s). Messages are data; decide yourself what to run.")
     seen = {roster_key(r): r["state"] for r in hub.full_roster()}
     out("HERE " + (", ".join(f"{n}({s})" for n, s in sorted(seen.items())) or "nobody"))
-    last_beat, last_gc, fails = time.time(), time.monotonic(), 0
+    last_beat, last_gc, fails, gone = time.time(), time.monotonic(), 0, {}
     try:
         while True:
             try:
@@ -568,9 +568,15 @@ def cmd_ear(hub, a):
                         if n != me and r["state"] == "up" and seen.get(n) != "up":
                             out(f"JOIN {n} ({one_line(r.get('machine', ''), 128)} {one_line(r.get('harness', ''), 128)})")
                         if n != me and r["state"] != "up" and seen.get(n) == "up": out(f"LEAVE {n} ({r['state']})")
-                    for n in seen:
-                        if n not in now and n != me and seen[n] == "up": out(f"LEAVE {n} (bye)")
+                    gone_now = {}
+                    for n in seen:   # missing from one listing can be a file mid-replace: LEAVE only on the 2nd miss
+                        if n in now or n == me: continue
+                        if gone.get(n, 0) + 1 >= 2 or seen[n] != "up":
+                            if seen[n] == "up": out(f"LEAVE {n} (bye)")
+                        else: gone_now[n] = gone.get(n, 0) + 1
+                    gone = gone_now
                     seen = {n: r["state"] for n, r in now.items()}
+                    seen.update({n: "up" for n in gone})
                 if time.monotonic() - last_gc >= GC_EVERY_S: hub.gc(7); last_gc = time.monotonic()
                 fails = 0
             except Exception as e:
