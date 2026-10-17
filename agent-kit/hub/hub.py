@@ -225,7 +225,11 @@ class Hub:
         now, rows = time.time(), []
         for fn in sorted(os.listdir(self.agents)):
             if not fn.endswith(".json") or fn.startswith("."): continue
-            r = read_json(os.path.join(self.agents, fn))
+            path = os.path.join(self.agents, fn)
+            r = read_json(path)
+            for _ in range(5):   # a presence file mid-replace (drvfs / Windows) reads as missing or partial for a moment
+                if isinstance(r, dict) or not os.path.exists(path): break
+                time.sleep(0.02); r = read_json(path)
             if not isinstance(r, dict) or not NAME_RE.match(str(r.get("name", ""))): continue
             try: age = now - float(r.get("beat") or 0)
             except (TypeError, ValueError): continue
