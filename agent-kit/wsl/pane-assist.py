@@ -13,6 +13,7 @@ Verbs : ASSIST <id> LIST
         anything else -> error reply.
 Safety: session "gony" only (never "default"); the only commands it runs are herdr pane/agent list|read|send-keys
         and shai-send. KEYS goes only to a pane whose agent herdr reports "blocked" (waiting on a dialog) or to a
+        pane whose last screen lines are a choice dialog (herdr says "done" on some), or to a
         pane labelled assist-test*: keys into an idle shell/agent prompt (e.g. Up Enter) would re-run a command.
 Reply : shai-send "LOG ASSIST-REPLY <id> <ok|error> <payload>" (shai-send only accepts its fixed tags, so LOG
         carries it), control chars stripped, capped at 6000 chars, --redact.
@@ -43,6 +44,8 @@ KEYMAP = {"Up": "Up", "Down": "Down", "Left": "Left", "Right": "Right", "Enter":
           **{str(d): str(d) for d in range(10)}}
 MAX_TOKENS, MAX_LINES, DEF_LINES, CAP = 20, 120, 40, 6000
 ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+CHOICE_RE = re.compile(r"^\s*❯ \d+\. ")
+DIALOG_HINTS = ("Enter to select", "Esc to cancel", "Ready to submit your answers?")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]|\x1b\[[0-9;?]*[A-Za-z]")
 
 
@@ -67,6 +70,13 @@ def panes():
         out.append({"pane": p["pane_id"], "label": p.get("label") or "", "name": names.get(p["pane_id"], ""),
                     "agent": p.get("agent") or "", "status": p.get("agent_status") or ""})
     return out
+
+
+def shows_dialog(pane):
+    """True when the pane's last screen lines are a choice dialog: herdr reports some (e.g. a multi-question
+    Submit screen) as "done", so the status alone would leave them stuck."""
+    tail = herdr("pane", "read", pane).rstrip("\n").split("\n")[-16:]
+    return any(CHOICE_RE.match(l) for l in tail) and any(h in l for l in tail for h in DIALOG_HINTS)
 
 
 def find(target):
@@ -110,9 +120,11 @@ def handle(text):
             if bad:
                 raise ValueError(f"tokens not allowed: {' '.join(bad)} (allowed: {' '.join(KEYMAP)})")
             p = find(rest[0])
-            if not (p["status"] == "blocked" or p["label"].startswith("assist-test")):
+            if not (p["status"] == "blocked" or p["label"].startswith("assist-test")
+                    or (p["agent"] and shows_dialog(p["pane"]))):
                 raise ValueError(f"{p['pane']} {p['label']} is '{p['status'] or 'no agent'}', not blocked on a "
-                                 "dialog: KEYS refused (only blocked agent panes or assist-test* panes)")
+                                 "dialog: KEYS refused (only blocked agent panes, panes showing a choice dialog, "
+                                 "or assist-test* panes)")
             log(f"{rid} KEYS {p['pane']} ({rest[0]}, {p['status']}) {' '.join(toks)}")
             for t in toks:   # one key per call: an unsupported key name stops before any later key is sent
                 herdr("pane", "send-keys", p["pane"], KEYMAP[t])
