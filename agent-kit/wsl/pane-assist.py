@@ -6,7 +6,8 @@ Input : the Shai tunnel mailbox <P2P_HOME>/tunnel/<name>/<current.json id>/inbox
         Get-MailDir), tailed READ-ONLY from its current end: it never touches cursor.json/offset.json, opens the file
         only for each poll (a WSL handle held on /mnt/c can block the Windows writer), and acts only on chat rows
         from the tunnel's pinned peer whose text starts with "ASSIST ". shai-ear keeps printing every row as before.
-Verbs : ASSIST <id> LIST
+Verbs : ASSIST <id> HEALTH                             kit windows/health.ps1: VERDICT + WARN/FAIL lines
+        ASSIST <id> LIST
         ASSIST <id> READ <label|agent-name> [n]           n = visible lines, default 40, max 120
         ASSIST <id> KEYS <label|agent-name> <tok> [tok...] tokens only: Up Down Left Right Enter Esc Tab Space BSpace
                                                           0-9 y n; max 20; never free text
@@ -86,14 +87,28 @@ def find(target):
     return hits[0]
 
 
+def health():
+    """windows/health.ps1 of this kit: the VERDICT line plus every WARN/FAIL line (one screen, read-only check)."""
+    script = os.path.join(KIT, "windows", "health.ps1")
+    win = subprocess.run(["wslpath", "-w", script], capture_output=True, text=True, timeout=10).stdout.strip()
+    r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", win],
+                       capture_output=True, text=True, timeout=120, cwd="/mnt/c")
+    lines = [l.rstrip() for l in (r.stdout or "").splitlines() if l.strip()]
+    keep = [l for l in lines if l.startswith("VERDICT") or " WARN" in l or " FAIL" in l or l.startswith(("WARN", "FAIL"))]
+    return "\n".join(keep) or f"health.ps1 gave no VERDICT (exit {r.returncode}): {(r.stderr or '').strip()[:200]}"
+
+
 def handle(text):
     """Returns (id, ok, payload). Raises nothing: every failure becomes an error reply."""
     parts = text.split()
     rid = parts[1] if len(parts) > 1 and ID_RE.match(parts[1]) else "?"
     try:
         if len(parts) < 3 or rid == "?":
-            raise ValueError("grammar: ASSIST <id> LIST | READ <target> [n] | KEYS <target> <tok>...")
+            raise ValueError("grammar: ASSIST <id> LIST | HEALTH | READ <target> [n] | KEYS <target> <tok>...")
         verb, rest = parts[2], parts[3:]
+        if verb == "HEALTH" and not rest:
+            log(f"{rid} HEALTH")
+            return rid, True, health()
         if verb == "LIST" and not rest:
             log(f"{rid} LIST")
             return rid, True, "\n".join(f"{p['pane']} label={p['label'] or '-'} name={p['name'] or '-'} "
@@ -132,7 +147,7 @@ def handle(text):
             time.sleep(1.0)
             after = herdr("pane", "read", p["pane"]).rstrip("\n").split("\n")[-12:]
             return rid, True, f"sent {' '.join(toks)} to {p['pane']} {p['label']}; screen after:\n" + "\n".join(after)
-        raise ValueError("grammar: ASSIST <id> LIST | READ <target> [n] | KEYS <target> <tok>...")
+        raise ValueError("grammar: ASSIST <id> LIST | HEALTH | READ <target> [n] | KEYS <target> <tok>...")
     except Exception as e:   # reply with the error; the log keeps it too
         log(f"{rid} ERROR {type(e).__name__}: {e}")
         return rid, False, f"{type(e).__name__}: {e}"
