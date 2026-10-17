@@ -125,6 +125,15 @@ function Format-Arg([string]$a) {
 function Join-Args([string[]]$argv) { (@($argv) | ForEach-Object { Format-Arg $_ }) -join ' ' }
 function Show-Argv([string[]]$argv) { Join-Args $argv }
 
+# Kill a process and its children (p2p.cmd -> node); Kill() alone stops only cmd.exe and leaves node holding the pipes.
+function Stop-Tree($p) {
+  $ErrorActionPreference = 'Continue'   # PS 5.1: native stderr under 'Stop' would end taskkill's output early
+  $tk = Join-Path ([string]$env:SystemRoot) 'System32\taskkill.exe'
+  if ($OnWindows) { try { & $tk /PID $p.Id /T /F 2>&1 | Out-Null } catch {} }
+  try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+  try { [void]$p.WaitForExit(5000) } catch {}
+}
+
 # Run one fixed argv, capture output, never through a shell string we build from data.
 function Invoke-Fixed([string[]]$argv, [int]$TimeoutSec = 60) {
   $psi = New-Object Diagnostics.ProcessStartInfo
@@ -137,7 +146,7 @@ function Invoke-Fixed([string[]]$argv, [int]$TimeoutSec = 60) {
   try { [void]$p.Start() } catch { return [pscustomobject]@{ rc = 127; out = ''; err = $_.Exception.Message } }
   $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
   if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-    try { $p.Kill() } catch {}
+    Stop-Tree $p
     return [pscustomobject]@{ rc = 124; out = ''; err = 'timeout' }
   }
   $p.WaitForExit()
@@ -146,12 +155,27 @@ function Invoke-Fixed([string[]]$argv, [int]$TimeoutSec = 60) {
   [pscustomobject]@{ rc = $p.ExitCode; out = $out; err = $err }
 }
 
+$ReplaceTries = 20   # = hub.py REPLACE_TRIES
 function Write-Atomic([string]$path, [string]$text) {
   $dir = Split-Path $path -Parent; [void][IO.Directory]::CreateDirectory($dir)
   $tmp = Join-Path $dir ('.tmp-' + [Guid]::NewGuid().ToString('N'))
   [IO.File]::WriteAllText($tmp, $text, $Utf8)
-  Move-Item -LiteralPath $tmp -Destination $path -Force
+  # Not Move-Item -Force: on PS 5.1 that deletes the target, then renames (readers see it missing), and the delete
+  # fails while a reader (keeper, status, hub.py) has the file open. Replace it in place and retry those sharing
+  # violations for ~1 s, then clean up, as hub/hub.ps1 Write-Atomic does. ([NullString]: PS turns $null into ''.)
+  for ($i = 1; ; $i++) {
+    try {
+      if ([IO.File]::Exists($path)) { [IO.File]::Replace($tmp, $path, [NullString]::Value) } else { [IO.File]::Move($tmp, $path) }
+      return
+    } catch {
+      $e = $_; $c = Win32-Code $e   # 5/32: open elsewhere; 2: target just removed; 80/183: target just created;
+      # 1176/1177: Replace moved the target away but kept the tmp, so the next try Moves the tmp into place
+      if ($i -ge $ReplaceTries -or @(2, 5, 32, 80, 183, 1175, 1176, 1177) -notcontains $c) { try { [IO.File]::Delete($tmp) } catch {}; throw $e }
+      Start-Sleep -Milliseconds 50
+    }
+  }
 }
+function Win32-Code($err) { $e = $err.Exception; while ($e.InnerException) { $e = $e.InnerException }; $e.HResult -band 0xFFFF }
 
 # PS 5.1 has no ConvertFrom-Json -AsHashtable.
 function ConvertTo-Hash($o) {
@@ -542,7 +566,7 @@ function Remove-Links {
       $r = Stop-Tunnel $cfg $l.session; Say "  tunnel $($l.session): stop rc=$($r.rc)"
       $r = Invoke-Fixed (@($cfg.python) + @($cfg.hubPy, 'unpin', $l.as)) 60; Say "  hub pin for $($l.as): $(([string]$r.out).Trim())"
     }
-    $files = @($stop, $pidFile, (Join-Path $RunDir ($name + '.lock')), (Join-Path $RunDir ($name + '.child'))) + @('keeper.log', 'keeper.log.1', 'hub.log', 'hub.err.log' | ForEach-Object { Join-Path $LogDir ($name + '.' + $_) })
+    $files = @($stop, $pidFile, (Join-Path $RunDir ($name + '.lock')), (Join-Path $RunDir ($name + '.child'))) + @(@('keeper.log', 'keeper.prev.log', 'keeper.log.1', 'hub.log', 'hub.err.log') + @('hub', 'hub.err' | ForEach-Object { "$_.prev.log"; foreach ($g in 2..5) { "$_.prev.$g.log" } }) | ForEach-Object { Join-Path $LogDir ($name + '.' + $_) })
     if ($DryRun) { Plan "delete this link's files: $($files -join ', ')"; Plan "drop '$name' from $ConfigPath" }
     else {
       foreach ($f in $files) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }

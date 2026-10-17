@@ -34,6 +34,7 @@ function Clean([string]$s) { $s -replace $Ctrl, '' }
 function One([string]$s, [int]$n) { $t = Clean (($s -split '\s+' | Where-Object { $_ }) -join ' '); if ($t.Length -gt $n) { $t.Substring(0, $n) } else { $t } }
 function Check-Name([string]$n) {
   if ($n -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw "bad name '$n': letters, digits, . _ - (e.g. win-claude)" }
+  if ($n -like '*-unrouted') { throw "bad name '$n': names ending in -unrouted are reserved (hub.py gc sweeps them)" }
   $n
 }
 function Write-Atomic([string]$path, $obj) {
@@ -48,8 +49,9 @@ function Write-Atomic([string]$path, $obj) {
       if ([IO.File]::Exists($path)) { [IO.File]::Replace($tmp, $path, [NullString]::Value) } else { [IO.File]::Move($tmp, $path) }
       return
     } catch {
-      $e = $_; $c = Win32-Code $e   # 5/32: open elsewhere; 2: target just removed; 80/183: target just created
-      if ($i -ge $ReplaceTries -or @(2, 5, 32, 80, 183, 1175) -notcontains $c) { try { [IO.File]::Delete($tmp) } catch {}; throw $e }
+      $e = $_; $c = Win32-Code $e   # 5/32: open elsewhere; 2: target just removed; 80/183: target just created;
+      # 1176/1177: Replace moved the target away but kept the tmp, so the next try Moves the tmp into place
+      if ($i -ge $ReplaceTries -or @(2, 5, 32, 80, 183, 1175, 1176, 1177) -notcontains $c) { try { [IO.File]::Delete($tmp) } catch {}; throw $e }
       Start-Sleep -Milliseconds 50
     }
   }

@@ -103,7 +103,9 @@ function Clean([string]$s) {
 # p2p.cmd is cmd.exe -> node: Process.Kill() ends only cmd.exe, and an orphaned node "tunnel recv" could later move
 # the cursor past a message nobody prints. Kill the whole tree (taskkill /T works on PS 5.1).
 function Stop-Tree($p) {
-  if ($env:OS -eq 'Windows_NT') { try { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } catch { } }
+  $ErrorActionPreference = 'Continue'   # PS 5.1: native stderr under 'Stop' would end taskkill's output early
+  $tk = Join-Path ([string]$env:SystemRoot) 'System32\taskkill.exe'
+  if ($env:OS -eq 'Windows_NT') { try { & $tk /PID $p.Id /T /F 2>&1 | Out-Null } catch { } }
   try { if (-not $p.HasExited) { $p.Kill() } } catch { }
   try { [void]$p.WaitForExit(5000) } catch { }
 }
