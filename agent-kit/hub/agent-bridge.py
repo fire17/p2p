@@ -24,7 +24,7 @@ Adapters, per name:
           A Codex thread made reachable with `pb expose --thread <id>` is a ccpeer peer too: use the thread id
           as "peer". Restarting that Codex pane drops the exposure: run `pb expose --thread <id>` again.
   herdr   fallback only: type one cleaned line into a herdr pane. Before typing, `herdr agent get` must say
-          the pane is in an allowed state (default: idle) AND the pane's visible screen must show no dialog
+          the pane is in an allowed state (default: idle or done) AND the pane's visible screen must show no dialog
           (herdr can report a pane idle while a trust/permission/picker dialog is up) AND no draft in the
           composer (an idle pane may hold the user's half-typed text: typing would append to it and submit both).
           Otherwise nothing is typed: the message goes back to the inbox and is retried later (backoff 5 s .. 60 s).
@@ -77,7 +77,8 @@ Optional top-level keys: hub_root (else --root, $AGENT_HUB, the hub's default), 
 (folder holding ccpeer.py; default ../codex-bridge/peerbridge next to this file; a ccpeer on PYTHONPATH wins over
 the default), herdr (binary, default "herdr"), herdr_send (argv template after `herdr --session S`, default
 ["agent", "prompt", "{pane}", "{text}"]; e.g. ["pane", "run", "{pane}", "{text}"] for herdr 0.7),
-herdr_ok_states (default ["idle"]), dialog_markers (extra lower-case screen phrases that mean "dialog up"),
+herdr_ok_states (default ["idle", "done"]; herdr's "done" = idle with a completion nobody has looked at yet),
+dialog_markers (extra lower-case screen phrases that mean "dialog up"),
 prompt_glyphs (extra composer prompt glyphs), composer_placeholders (extra lower-case prefixes an EMPTY composer
 shows), composer_check (default true; false = skip the draft check),
 herdr_max_chars (default 4000), poll (s, default 1), heartbeat (s, default 10), reply_cmd (default
@@ -214,7 +215,7 @@ class Target:
         self.send_tpl = list(spec.get("herdr_send") or top.get("herdr_send") or DEFAULT_SEND)
         if not all(isinstance(x, str) for x in self.send_tpl) or "{text}" not in self.send_tpl:
             raise ValueError(f"{name}: herdr_send must be a list of strings with a \"{{text}}\" element")
-        self.ok_states = [str(s) for s in (spec.get("herdr_ok_states") or top.get("herdr_ok_states") or ["idle"])]
+        self.ok_states = [str(s) for s in (spec.get("herdr_ok_states") or top.get("herdr_ok_states") or ["idle", "done"])]
         cc = spec.get("composer_check", top.get("composer_check", True))
         if not isinstance(cc, bool):
             raise ValueError(f"{name}: \"composer_check\" must be true or false")

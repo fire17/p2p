@@ -238,6 +238,7 @@ The hub is the bus. Delivery into each harness is native first, typing last. Ful
 
 - **Replies** always go through `hub.py send <sender> "<text>" --from <me>`. Answer `MATRIX PING <id>` with `MATRIX PONG <id>` and nothing else.
 - **Run the adapter:** `python3 hub/agent-bridge.py --config bridge.json` (try `--once --dry-run` first). Config format: docs/AGENT-BRIDGE.md section 4.
+- **More than the main pair of panes:** `hub/agent-bridge-start.sh --prefix <p> --names <file>` adds one route per `[<label>]=<name>` pair whose label ends in `-claude` or `-codex` (each Codex pane gets its own thread file). One bridge carries all routes. Details: docs/AGENT-BRIDGE.md and the script header.
 - **Trust:** `trusted.json` in the hub root lists trusted senders by name pattern and via class (`local`, `link:*`, `tunnel` + `join-<KEY>`). Missing or broken file = nobody trusted. Only the machine's owner edits it; tunnel entries only with the owner's explicit approval, logged in the file. Details: docs/AGENT-BRIDGE.md section 5.
 - **Bypass:** Claude Code holds a message that claims bypass into a non-bypass session, so the bridge claims bypass only into routes marked `+bypass`, only for trusted senders, and only with `--gate trusted` (default `none`). The herdr fallback types into a `+bypass` pane only for those same senders.
 - **`+trusted`** route flag (any adapter): only `trusted.json` senders reach that route, whatever the gate (except `--gate all`: everyone).
