@@ -7,19 +7,24 @@
 #
 # Routes (hub name -> route), discovered every time, never fixed ids. For the herdr pane labelled codex and each pane
 # named in --claude (comma list, default "claude"; e.g. --claude claude,review for a second Claude pane), each label
-# on exactly ONE pane (codex: several = no new route, logged, never a guess, a live bridge keeps its route; claude:
-# only logged, since its route reaches the ccpeer session, not the pane):
-#   <prefix>-<label>  peer:<label>, the Claude Code session named like the pane (`claude -n <label>`); it
-#        must resolve to exactly one live session (ccpeer.resolve). +bypass only when that claude process really runs
-#        bypassPermissions (its /proc/<pid>/cmdline has --dangerously-skip-permissions or --permission-mode
-#        bypassPermissions); herdr reports no argv for claude, so /proc is read directly, for the pid of the session
-#        ccpeer resolved (the one the route reaches), not for whatever runs in the pane.
+# on exactly ONE pane (several = no new route, logged, never a guess, a live bridge keeps its route):
+#   <prefix>-<label>  peer:<session id>, the session the pane's own claude process runs as: its registry record
+#        (by pid, never by display name: two PCs or two panes may both run `claude -n X`). That record must be on
+#        this machine (its pidDomain = ccpeer.pid_domain(); the bridge checks it again at every delivery) and its
+#        session id must resolve to exactly that one process. A restarted or /clear-ed session gets a new id:
+#        --watch follows it. +bypass only when that claude process really runs bypassPermissions (its
+#        /proc/<pid>/cmdline has --dangerously-skip-permissions or --permission-mode bypassPermissions); herdr
+#        reports no argv for claude, so /proc is read directly.
 #   <prefix>-codex  peer:<thread id>, the codex pane's CURRENT thread: a rollout the managed Codex daemon holds open
-#        (any originator), cwd = the pane's cwd, created no earlier than 120 s before the pane's codex process
-#        started (the thread can be created 30 s before it, or hours after it at the first prompt). No such thread,
-#        but the one chosen before (agent-bridge.codex-thread) is still open with that cwd: keep it (start = now -
-#        etimes moves when WSL steps its clock). A new thread always wins. Several: the one pb
-#        already exposes wins; still ambiguous: no codex route (logged, never a guess). The thread is `pb expose`d
+#        (any originator) with cwd = the pane's cwd. Exactly ONE such rollout and no other codex process in that cwd:
+#        that one, whatever its time. Otherwise the ones created no earlier than 120 s + 10% of the process age
+#        before the pane's codex process started (the thread can be created 30 s before it, or hours after it at the
+#        first prompt; the 10% absorbs a WSL monotonic clock that runs fast or slow against the wall clock the
+#        rollout time is written in; /proc starttime + btime is the same clock as now - etimes, so it cannot). No such
+#        thread, but the one chosen before (agent-bridge.codex-thread) is still open with that cwd: keep it. A new
+#        thread always wins. Several: the one pb already exposes wins; still ambiguous: no codex route (logged, never
+#        a guess). The daemon keeps a thread open after its TUI exits, so right after a pane restart in the same cwd
+#        the old thread can stay the route until the new process's first prompt makes a new one. The thread is `pb expose`d
 #        (re-tried on the next pass if that failed; never again once it worked, so the owner's `pb hide` sticks);
 #        once that worked, the thread this script exposed before is `pb hide`n.
 #        No thread yet (Codex makes one only at the pane's first prompt): herdr:<session>:<pane>, i.e. the bridge
@@ -27,10 +32,8 @@
 #        switches to the native peer.
 #        Both codex routes carry +trusted: only senders in trusted.json reach Codex (it runs its turns unattended).
 # --names FILE (either mode): more routes, one per `[<pane label>]=<name>` pair in FILE (e.g. a names map like
-#   `[web-claude]=web-claude`) whose label ends in -claude or -codex; other pairs are skipped.
-#   <prefix>-<name>  for a -claude label: peer:<session>, the session the pane's claude process really runs as
-#        (its own registry record, whatever `-n` it got); it must resolve to exactly one live session, and that
-#        session must be the pane's process. +bypass as above.
+#   `[web-claude]=web-claude`) whose label ends in -claude or -codex; other pairs, and anything after a #, are skipped.
+#   <prefix>-<name>  for a -claude label: exactly as <prefix>-<label> above (whatever `-n` the session got).
 #                    for a -codex label: exactly as <prefix>-codex above, with its own previous-thread file
 #        (agent-bridge.codex-thread.<prefix>-<name>), so one route's new thread never hides another's.
 #   Several panes with the label: no new route, a live bridge keeps its route. Codex panes that share a cwd
@@ -77,25 +80,19 @@ proc_of() {  # pid and cwd ("pid<TAB>cwd") of the process named $2 in the foregr
   h pane process-info --pane "$1" 2>/dev/null \
     | jq -r --arg n "$2" '[.result.process_info.foreground_processes[]|select(.name==$n)][0] | "\(.pid // "")\t\(.cwd // "")"'; }
 
-peer_ok() {  # exactly one live Claude session named $1? its pid on stdout (the process the route reaches)
-python3 - "$KIT/codex-bridge/peerbridge" "$1" <<'PY'
-import sys; sys.path.insert(0, sys.argv[1]); import ccpeer
-r = ccpeer.resolve(sys.argv[2])
-if len(r) != 1: sys.exit(1)
-print(r[0].get("pid") or "")
-PY
-}
-
-session_of() {  # name of the live Claude session that IS process $1; it must resolve to exactly that one session
+session_of() {  # session id of the live Claude session that IS process $1, on this machine, resolving to it alone
 python3 - "$KIT/codex-bridge/peerbridge" "$1" <<'PY'
 import re, sys; sys.path.insert(0, sys.argv[1]); import ccpeer
 mine = [r for r in ccpeer.records() if str(r.get("pid")) == sys.argv[2]]
 if len(mine) != 1: sys.exit(1)
-n = str(mine[0].get("name") or "")
-if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", n): sys.exit(1)  # a route peer holds no space, '+' or ':'
-r = ccpeer.resolve(n)
+sid = str(mine[0].get("sessionId") or "")
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", sid): sys.exit(1)  # a route peer holds no space, '+' or ':'
+here, theirs = getattr(ccpeer, "pid_domain", lambda: "")(), mine[0].get("pidDomain")
+tail = lambda d: d.split(":", 1)[1] if d.split(":", 1)[0] in ("linux", "wsl") and ":" in d else d
+if here and isinstance(theirs, str) and tail(theirs) != tail(here): sys.exit(1)  # a record from another machine
+r = ccpeer.resolve(sid)
 if len(r) != 1 or str(r[0].get("pid")) != sys.argv[2]: sys.exit(1)
-print(n)
+print(sid)
 PY
 }
 
@@ -106,14 +103,22 @@ is_bypass() {  # the claude process really runs bypassPermissions?
 }
 
 codex_thread() {  # thread id on stdout; "" = the pane has no thread yet; exit 1 = cannot tell (reason on stderr)
-  local pid="$1" cwd="$2" tidf="$3" start daemons   # tidf: this route's previous-thread file
-  start=$(( $(date +%s) - $(ps -o etimes= -p "$pid" | tr -d ' ') ))
+  local pid="$1" cwd="$2" tidf="$3" age daemons   # tidf: this route's previous-thread file
+  age="$(ps -o etimes= -p "$pid" | tr -d ' ')"
   daemons="$(pgrep -f 'app-server.*--managed-daemon' | tr '\n' ' ')"
   [ -n "$daemons" ] || { echo "no managed Codex daemon running" >&2; return 1; }
-  python3 - "$start" "$cwd" "$tidf" $daemons <<'PY'
-import glob, json, os, sys
+  python3 - "$age" "$cwd" "$tidf" "$pid" $daemons <<'PY'
+import glob, json, os, sys, time
 from datetime import datetime
-start, cwd, tidf, daemons = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4:]
+age, cwd, tidf, pid, daemons = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+start, slack = time.time() - age, 120 + age // 10
+def other_codex():  # another codex process (not a daemon) runs in this cwd
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            if os.path.basename(d) in (pid, *daemons) or open(d + "/comm").read().strip() != "codex": continue
+            if os.readlink(d + "/cwd") == cwd and b"app-server" not in open(d + "/cmdline", "rb").read(): return True
+        except OSError: continue
+    return False
 try: prev = open(tidf).read().strip()
 except OSError: prev = ""
 open_files = set()
@@ -122,16 +127,19 @@ for d in daemons:
         try: t = os.readlink(fd)
         except OSError: continue
         if "/sessions/" in t and os.path.basename(t).startswith("rollout-") and t.endswith(".jsonl"): open_files.add(t)
-cands, prev_open = [], False
+cands, matches, prev_open = [], [], False
 for f in open_files:
     try: meta = json.loads(open(f, encoding="utf-8").readline()).get("payload", {})
     except (OSError, ValueError): continue
-    if meta.get("cwd") != cwd: continue
+    if meta.get("cwd") != cwd or not meta.get("id"): continue
+    matches.append((0, meta["id"]))
     if prev and meta.get("id") == prev: prev_open = True
     try: created = datetime.fromisoformat(meta["timestamp"].replace("Z", "+00:00")).timestamp()
     except (KeyError, ValueError): continue
-    if created >= start - 120: cands.append((created, meta["id"]))
-if not cands and prev_open:
+    if created >= start - slack: cands.append((created, meta["id"]))
+if len(matches) == 1 and not other_codex():
+    cands = matches   # the only thread with this cwd, and no other codex there: no clock needed
+elif not cands and prev_open:
     # No thread created since the pane started, but the one chosen before is still open with this cwd: keep it.
     # (start = now - etimes moves when WSL steps its wall clock, which can push that thread out of the window.)
     cands = [(0, prev)]
@@ -148,13 +156,13 @@ PY
 
 named() {  # "label=name" lines from --names: [<label>]=<name> pairs whose label ends in -claude / -codex
   [ -n "$NAMES" ] || return 0
-  grep -oE '\[[A-Za-z0-9_.-]+-(claude|codex)\]=[A-Za-z0-9][A-Za-z0-9_.-]*' "$NAMES" | sed 's/^\[//; s/\]=/=/'
+  sed 's/#.*//' "$NAMES" | grep -oE '\[[A-Za-z0-9_.-]+-(claude|codex)\]=[A-Za-z0-9][A-Za-z0-9_.-]*' | sed 's/^\[//; s/\]=/=/'
 }
 
 tidf() {  # route $1's previous-thread file (the plain codex route keeps the old file name)
   if [ "$1" = "$PREFIX-codex" ]; then echo "$TIDF"; else echo "$TIDF.$1"; fi; }
 
-named_claude() {  # route $2 for the claude in the pane labelled $1: peer = the session that pane's process runs as
+named_claude() {  # route $2 for the claude in the pane labelled $1: peer = the session id that pane's process runs as
   local pane pid sn
   pane="$(pane_of "$1" 2>>"$LOG")" || { MISSING+=("$1(several panes, see log)"); keep "$2"; return; }
   [ -n "$pane" ] || { MISSING+=("$1(no pane)"); return; }
@@ -189,15 +197,8 @@ codex_routes() {  # "label=route" args: the codex pane per label -> its thread (
 
 discover() {  # sets MAPS (array), TH/TT (codex route -> its thread), MISSING (array)
   MAPS=(); MISSING=(); TH=(); TT=()
-  local label pane pid kv; local -a cx=("codex=$PREFIX-codex")
-  for label in ${CLAUDES//,/ }; do
-    # the claude route reaches the ccpeer session, not a pane: several panes with the label are only logged
-    pane="$(pane_of "$label" 2>>"$LOG")" || pane="several"
-    [ -n "$pane" ] || { MISSING+=("$label(no pane)"); continue; }
-    pid="$(peer_ok "$label")" || { MISSING+=("$label(no unique live session)"); continue; }
-    if [ -n "$pid" ] && is_bypass "$pid"; then MAPS+=(--map "$PREFIX-$label=peer:$label+bypass")
-    else MAPS+=(--map "$PREFIX-$label=peer:$label"); fi
-  done
+  local label kv; local -a cx=("codex=$PREFIX-codex")
+  for label in ${CLAUDES//,/ }; do named_claude "$label" "$PREFIX-$label"; done
   local seen=" $PREFIX-codex "; for label in ${CLAUDES//,/ }; do seen+="$PREFIX-$label "; done   # one route per name
   for kv in $(named); do
     case "$seen" in *" $PREFIX-${kv#*=} "*) MISSING+=("${kv%%=*}(route name $PREFIX-${kv#*=} taken)"); continue ;; esac

@@ -21,6 +21,8 @@ claims its inbox (hub.claim, exactly once across readers), then delivers each me
 Adapters, per name:
   ccpeer  Claude Code's own cross-session protocol (codex-bridge/peerbridge/ccpeer.py): resolve(peer) must find
           exactly one live session; the text goes in as a <cross-session-message> user frame on its socket.
+          Checked at every delivery: a record whose pidDomain (machine id + pid namespace) is not this machine's
+          is never sent to (held; e.g. a synced or shared sessions folder). A record without pidDomain is sent to.
           A Codex thread made reachable with `pb expose --thread <id>` is a ccpeer peer too: use the thread id
           as "peer". Restarting that Codex pane drops the exposure: run `pb expose --thread <id>` again.
   herdr   fallback only: type one cleaned line into a herdr pane. Before typing, `herdr agent get` must say
@@ -102,6 +104,11 @@ UNTRUSTED = ("sender not in trusted.json: this route runs bypassPermissions, and
              "it at an approval prompt")
 UNTRUSTED_ONLY = "sender not in trusted.json: this route takes messages from trusted senders only (+trusted)"
 DEFAULT_SEND = ["agent", "prompt", "{pane}", "{text}"]
+def same_domain(d):
+    """A pid domain without its kernel tag: Claude Code writes linux:<machine-id>:<pid-ns>, ccpeer says wsl:... on WSL."""
+    return d.split(":", 1)[1] if d.split(":", 1)[0] in ("linux", "wsl") and ":" in d else d
+
+
 # Phrases on a pane's visible screen that mean a dialog/menu owns the keyboard (lower case).
 DIALOG_MARKERS = [
     "enter to select", "esc to cancel", "enter to confirm", "do you want to proceed", "do you want to make this edit",
@@ -412,7 +419,17 @@ class Bridge:
         if len(recs) != 1:
             hint = " (pb list; a restarted Codex pane needs `pb expose --thread <id>` again)" if not recs else ""
             return None, f"peer {hub.one_line(t.peer, 64)!r}: {len(recs)} live matches{hint}"
+        here, theirs = self.pid_domain(), recs[0].get("pidDomain")
+        if here and isinstance(theirs, str) and same_domain(theirs) != same_domain(here):
+            return None, f"peer {hub.one_line(t.peer, 64)!r}: its record is from another machine (pidDomain), not sent"
         return recs[0], ""
+
+    def pid_domain(self):
+        """This machine's pid domain as ccpeer computes it ("" = unknown: no check)."""
+        try:
+            return str(self.ccpeer.pid_domain() or "")
+        except Exception:
+            return ""
 
     def from_mode(self, t, m):
         """"bypass" only into a +bypass route and only when the gate lets this sender through, else None (no claim):

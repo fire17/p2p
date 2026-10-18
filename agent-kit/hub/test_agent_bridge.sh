@@ -3,7 +3,7 @@
 # Proves: ccpeer is used first, herdr is the fallback, a blocked (or dialog-showing "idle") pane is never typed
 # into, --dry-run sends nothing, presence is kept, typed text is control-free. Also agent-bridge-start.sh --dry-run:
 # a label on several panes is never guessed, --workspace scopes it, a stale (reused) pid is not taken for the bridge;
-# --names: one route per -claude/-codex pane, peer = its own process's session / its own cwd's thread, per-route thread file.
+# --names: one route per -claude/-codex pane, peer = its own process's session id (on this machine) / its own cwd's thread.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/agent-bridge-test.XXXXXX"); trap 'rm -rf "$T"' EXIT
@@ -14,10 +14,18 @@ ok() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "PASS $2"; else fail=$((fail
 # ---- fake ccpeer: peers listed in $FAKE_PEERS (comma list); send_to appends frames to $T/ccpeer.log
 cat > "$T/fakepy/ccpeer.py" <<'EOF'
 import json, os
-def records():  # FAKE_PEERS entries: name or name:pid (pid defaults to 1)
-    return [{"name": n, "ref": "abcdef123456", "sessionId": "sid-" + n, "address": "uds:/x/" + n,
+def records():  # FAKE_PEERS entries: name[:pid[:pidDomain]] (pid defaults to 1; session id sid-<name>[-<pid>])
+    out = []
+    for e in os.environ.get("FAKE_PEERS", "").split(","):
+        if not e: continue
+        n, p, d = (e.split(":", 2) + ["", ""])[:3]
+        r = {"name": n, "ref": "abcdef123456", "sessionId": "sid-" + n + ("-" + p if p else ""), "address": "uds:/x/" + n,
              "messagingSocketPath": "/x/" + n, "pid": int(p or 1)}
-            for n, _, p in (e.partition(":") for e in os.environ.get("FAKE_PEERS", "").split(",") if e)]
+        if d: r["pidDomain"] = d
+        out.append(r)
+    return out
+def pid_domain():
+    return os.environ.get("FAKE_PID_DOMAIN", "")
 def resolve(to, recs=None):
     return [r for r in (records() if recs is None else recs) if r["name"] == to or r["sessionId"] == to]
 def envelope(text, frm, from_name, from_mode):
@@ -127,6 +135,15 @@ $HUB send a-cc "native only" --from tester >/dev/null
 OUT=$(PYTHONPATH="$T/fakepy" FAKE_PEERS= BR --config "$T/cconly.json" --once); RC=$?
 [ $RC = 1 ] && echo "$OUT" | grep -q "^HOLD a-cc" && [ -z "$(typed)" ] && [ "$(waiting a-cc)" = 1 ]; ok $? "ccpeer-only: no peer -> held in inbox, never typed"
 
+# ---- 2d. every delivery re-checks the record is on THIS machine (pidDomain), so a foreign record is never sent to
+$HUB here a-far >/dev/null; reset_logs
+$HUB send a-far "tok-far" --from tester >/dev/null
+OUT=$(PYTHONPATH="$T/fakepy" FAKE_PID_DOMAIN="linux:m-here:pid:[1]" FAKE_PEERS="far:7:linux:m-other:pid:[1]" BR --map a-far=peer:far --once); RC=$?
+echo "$OUT" | sed 's/^/    /'
+[ $RC = 1 ] && [ -z "$(ccsent)" ] && echo "$OUT" | grep -q "^HOLD a-far .*another machine" && [ "$(waiting a-far)" = 1 ]; ok $? "machine: a record from another machine is held, never sent"
+OUT=$(PYTHONPATH="$T/fakepy" FAKE_PID_DOMAIN="wsl:m-here:pid:[1]" FAKE_PEERS="far:7:linux:m-here:pid:[1]" BR --map a-far=peer:far --once)
+ccsent | grep -qF 'tok-far' && [ "$(waiting a-far)" = 0 ]; ok $? "machine: same machine id + pid ns (linux: vs wsl: tag) -> delivered"
+
 # ---- 3. blocked pane is NOT typed into; message stays; sender told once; later delivered
 cat > "$T/blk.json" <<EOF
 {"herdr_session": "main", "peerbridge": "$T/empty", "agents": [{"name": "a-blocked", "adapter": "herdr", "pane": "p2"},
@@ -182,18 +199,20 @@ echo "$OUT" | grep -q "^DRY a-dry .*via=ccpeer .*not sent" && echo "$OUT" | grep
 mkdir -p "$T/kit/codex-bridge/peerbridge" "$T/home"
 cp "$T/fakepy/ccpeer.py" "$T/kit/codex-bridge/peerbridge/ccpeer.py"
 for c in pb flock; do printf '#!/bin/sh\nexit 0\n' > "$T/bin/$c"; chmod +x "$T/bin/$c"; done
-ABS() { HOME="$T/home" AGENT_KIT="$T/kit" BRIDGE_DIR="$T/abr" FAKE_PEERS=claude bash "$HERE/agent-bridge-start.sh" --prefix t --wait 0 --dry-run "$@" 2>&1; }
+ABS() { HOME="$T/home" AGENT_KIT="$T/kit" BRIDGE_DIR="$T/abr" FAKE_PEERS=claude:4242,claude:4243 bash "$HERE/agent-bridge-start.sh" --prefix t --wait 0 --dry-run "$@" 2>&1; }
+echo '[{"pid": 4242, "name": "claude", "cwd": "/w", "argv": null}]' > "$T/herdr/p1.procs"
+echo '[{"pid": 4243, "name": "claude", "cwd": "/w", "argv": null}]' > "$T/herdr/p5.procs"
 echo '[{"pane_id": "p1", "label": "claude", "workspace_id": "w1"}, {"pane_id": "p9", "label": "shell", "workspace_id": "w2"}]' > "$T/herdr/panes.json"
 OUT=$(ABS); RC=$?
 echo "$OUT" | sed 's/^/    /'
-[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:claude$"; ok $? "start: one claude pane -> peer route"
+[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:sid-claude-4242$"; ok $? "start: one claude pane -> peer = its own process's session id (two live sessions share the name)"
 echo '[{"pane_id": "p5", "label": "claude", "workspace_id": "w2"}, {"pane_id": "p1", "label": "claude", "workspace_id": "w1"}]' > "$T/herdr/panes.json"
 OUT=$(ABS); RC=$?
 echo "$OUT" | sed 's/^/    /'
-[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:claude$"; ok $? "start: claude label on 2 panes -> route kept (it reaches the ccpeer session, not a pane)"
+! echo "$OUT" | grep -q "t-claude="; ok $? "start: claude label on 2 panes -> no new route (never a guess)"
 grep -q "pane label claude: 2 panes p5 p1" "$T/abr/agent-bridge.log"; ok $? "start: ambiguity logged with the pane ids"
 OUT=$(ABS --workspace w1); RC=$?
-[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:claude$" && grep -q '"--workspace", "w1"' "$T/herdr/calls.log"; ok $? "start: --workspace scopes the pane lookup"
+[ $RC = 0 ] && echo "$OUT" | grep -q "^routes: --map t-claude=peer:sid-claude-4242$" && grep -q '"--workspace", "w1"' "$T/herdr/calls.log"; ok $? "start: --workspace scopes the pane lookup"
 echo $$ > "$T/abr/agent-bridge.pid"   # a live process that is not the bridge (a reused pid)
 OUT=$(ABS --workspace w1)
 echo "$OUT" | grep -q "^live bridge: none$"; ok $? "start: a reused pid is not taken for the live bridge"
@@ -206,9 +225,11 @@ python3 -c 'import time; time.sleep(600)' & PLAIN=$!
 mkdir -p "$T/sessions"
 now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
 roll() { echo "{\"payload\": {\"id\": \"$1\", \"cwd\": \"$2\", \"timestamp\": \"$3\"}}" > "$T/sessions/rollout-$1.jsonl"; }
-roll thr-home /w/home "$now"; roll thr-proj /w/proj "$now"; roll thr-old /w/new 2020-01-01T00:00:00.000Z
-python3 -c 'import sys, time; fs = [open(f) for f in sys.argv[1:]]; time.sleep(600)' "$T"/sessions/rollout-*.jsonl & DAEMON=$!
-trap 'kill $BYP $PLAIN $DAEMON 2>/dev/null; rm -rf "$T"' EXIT
+roll thr-home /w/home "$now"; roll thr-proj /w/proj "$now"
+roll thr-old /w/new 2020-01-01T00:00:00.000Z; roll thr-old2 /w/new 2020-01-01T00:00:01.000Z   # 2 old ones: no unique-cwd pick
+python3 -c 'import sys, time; fs = [open(f) for f in sys.argv[2:]]; open(sys.argv[1], "w").close(); time.sleep(600)' "$T/d1.ready" "$T"/sessions/rollout-*.jsonl & DAEMON=$!
+while [ ! -e "$T/d1.ready" ]; do sleep 0.1; done
+trap 'kill $BYP $PLAIN $DAEMON ${DAEMON2:-} ${OTHER:-} 2>/dev/null; rm -rf "$T"' EXIT
 printf '#!/bin/sh\necho "$FAKE_DAEMON_PID"\n' > "$T/bin/pgrep"; chmod +x "$T/bin/pgrep"
 cat > "$T/names.sh" <<'EOF'
 declare -A NAME=(
@@ -216,40 +237,71 @@ declare -A NAME=(
   [Proj-claude]=proj-claude [Proj-codex]=proj-codex
   [New-codex]=new-codex [Gone-claude]=gone-claude
   [Dup-codex]=proj-claude [Old-claude]=claude
+
+#  [Proj-claude]=cmt-claude
+  [Gone-codex]=gone-codex   # [New-codex]=cmt2-codex
 )
 EOF
 procs() { echo "[{\"pid\": $2, \"name\": \"$3\", \"cwd\": \"$4\", \"argv\": null}]" > "$T/herdr/$1.procs"; }
 panes() { python3 -c 'import json, sys; print(json.dumps([{"pane_id": p, "label": l, "workspace_id": "w1"} for p, l in zip(sys.argv[1::2], sys.argv[2::2])]))' "$@" > "$T/herdr/panes.json"; }
-ABN() { HOME="$T/home" AGENT_KIT="$T/kit" BRIDGE_DIR="$T/abn" FAKE_DAEMON_PID=$DAEMON bash "$HERE/agent-bridge-start.sh" --prefix t --wait 0 --dry-run --names "$T/names.sh" "$@" 2>&1; }
+ABN() { HOME="$T/home" AGENT_KIT="$T/kit" BRIDGE_DIR="$T/abn" FAKE_DAEMON_PID=${DPID:-$DAEMON} bash "$HERE/agent-bridge-start.sh" --prefix t --wait 0 --dry-run --names "$T/names.sh" "$@" 2>&1; }
 has() { echo "$OUT" | grep -q "^routes: .*--map $1\( \|$\)"; }
 panes p1 claude p2 codex p3 Proj-claude p4 Proj-codex p6 New-codex p7 shai
 procs p2 $PLAIN codex /w/home; procs p3 $BYP claude /w/proj; procs p4 $PLAIN codex /w/proj; procs p6 $PLAIN codex /w/new
-OUT=$(FAKE_PEERS="claude,Proj:$BYP" ABN); RC=$?
+OUT=$(FAKE_PEERS="claude:4242,Proj:$BYP" ABN); RC=$?
 echo "$OUT" | sed 's/^/    /'
-[ $RC = 0 ] && has t-claude=peer:claude && has t-proj-claude=peer:Proj+bypass; ok $? "names: claude pane -> peer = the session its process runs as (-n Proj), +bypass from /proc"
+[ $RC = 0 ] && has t-claude=peer:sid-claude-4242 && has "t-proj-claude=peer:sid-Proj-$BYP+bypass"; ok $? "names: claude pane -> peer = the session id its process runs as (-n Proj), +bypass from /proc"
 has t-codex=peer:thr-home+trusted && has t-proj-codex=peer:thr-proj+trusted; ok $? "names: each codex pane -> the thread of its own cwd"
 has t-new-codex=herdr:main:p6+trusted; ok $? "names: codex pane without a thread -> herdr until its first prompt"
+! echo "$OUT" | grep -q 't-cmt'; ok $? "names: a commented pair (# line, or after # on a line) is ignored"
 ! echo "$OUT" | grep -q 't-shai-claude\|t-general-\|t-gone-claude' && grep -q 'no route for: Gone-claude(no pane)' "$T/abn/agent-bridge.log"; ok $? "names: labels without -claude/-codex skipped, a missing pane logged"
 [ "$(echo "$OUT" | grep '^routes: ' | grep -o -- '--map t-claude=' | wc -l)" = 1 ] && [ "$(echo "$OUT" | grep '^routes: ' | grep -o -- '--map t-proj-claude=' | wc -l)" = 1 ] \
   && grep -q 'Dup-codex(route name t-proj-claude taken) Old-claude(route name t-claude taken)' "$T/abn/agent-bridge.log"; ok $? "names: a route name already taken is never mapped twice"
 echo "$OUT" | grep -q "^would run: pb expose --thread thr-proj (t-proj-codex)$" && echo "$OUT" | grep -q "^would run: pb expose --thread thr-home (t-codex)$"; ok $? "names: every new thread is exposed"
 echo thr-proj > "$T/abn/agent-bridge.codex-thread.t-proj-codex"; echo thr-old > "$T/abn/agent-bridge.codex-thread.t-new-codex"
-OUT=$(FAKE_PEERS="claude,Proj:$BYP" ABN)
+OUT=$(FAKE_PEERS="claude:4242,Proj:$BYP" ABN)
 ! echo "$OUT" | grep -q "pb expose --thread thr-proj" && echo "$OUT" | grep -q "pb expose --thread thr-home (t-codex)$"; ok $? "names: the previous-thread file is per route (thr-proj exposed already, thr-home not)"
 has t-new-codex=peer:thr-old+trusted; ok $? "names: a route keeps its own previous thread while it is still open"
-OUT=$(FAKE_PEERS="claude,Proj:$PLAIN" ABN)
-! echo "$OUT" | grep -q 't-proj-claude='; ok $? "names: the session named Proj is not the pane's process -> no route"
-OUT=$(FAKE_PEERS="claude,Proj:$BYP,Proj:$PLAIN" ABN)
-! echo "$OUT" | grep -q 't-proj-claude='; ok $? "names: two live sessions named Proj -> no route"
+OUT=$(FAKE_PEERS="claude:4242,Proj:$PLAIN" ABN)
+! echo "$OUT" | grep -q 't-proj-claude='; ok $? "names: no session record for the pane's own process -> no route (a same-name session elsewhere is not taken)"
+OUT=$(FAKE_PEERS="claude:4242,Proj:$PLAIN,Proj:$BYP" ABN)
+has "t-proj-claude=peer:sid-Proj-$BYP+bypass"; ok $? "names: two live sessions named Proj (two panes, or two PCs) -> the pane's own session, never the name"
+OUT=$(FAKE_PID_DOMAIN="linux:m-here:pid:[1]" FAKE_PEERS="claude:4242,Proj:$BYP:linux:m-other:pid:[1]" ABN)
+! echo "$OUT" | grep -q 't-proj-claude=' && echo "$OUT" | grep -q 't-claude=peer:sid-claude-4242'; ok $? "names: the pane's session record is from another machine -> no route"
+OUT=$(FAKE_PID_DOMAIN="wsl:m-here:pid:[1]" FAKE_PEERS="claude:4242,Proj:$BYP:linux:m-here:pid:[1]" ABN)
+has "t-proj-claude=peer:sid-Proj-$BYP+bypass"; ok $? "names: same machine (linux: vs wsl: tag) -> route"
 procs p3 $PLAIN claude /w/proj
-OUT=$(FAKE_PEERS="claude,Proj:$PLAIN" ABN)
-has t-proj-claude=peer:Proj; ok $? "names: no bypass in /proc -> no +bypass"
+OUT=$(FAKE_PEERS="claude:4242,Proj:$PLAIN" ABN)
+has "t-proj-claude=peer:sid-Proj-$PLAIN"; ok $? "names: no bypass in /proc -> no +bypass"
 procs p4 $PLAIN codex /w/home
-OUT=$(FAKE_PEERS="claude,Proj:$PLAIN" ABN)
+OUT=$(FAKE_PEERS="claude:4242,Proj:$PLAIN" ABN)
 ! echo "$OUT" | grep -q 't-codex=\|t-proj-codex=' && grep -q 'cwd /w/home shared' "$T/abn/agent-bridge.log"; ok $? "names: two codex panes in one cwd -> neither gets a route (logged)"
 panes p1 claude p2 codex p3 Proj-claude p8 Proj-claude
-OUT=$(FAKE_PEERS="claude,Proj:$PLAIN" ABN)
+OUT=$(FAKE_PEERS="claude:4242,Proj:$PLAIN" ABN)
 ! echo "$OUT" | grep -q 't-proj-claude=' && grep -q 'pane label Proj-claude: 2 panes p3 p8' "$T/abn/agent-bridge.log"; ok $? "names: label on 2 panes -> no route (never a guess)"
+
+# ---- 4d. which codex thread, clock-independent: unique cwd, a monotonic clock that runs fast or slow, ties
+# The pane's codex is 2000 s old in wall time; a fake ps reports its etimes off by 7.5% either way (WSL skew).
+printf '#!/bin/sh\n[ -n "${FAKE_ETIMES:-}" ] && { echo "$FAKE_ETIMES"; exit 0; }\nfor p in /bin/ps /usr/bin/ps; do [ -x $p ] && exec $p "$@"; done\n' > "$T/bin/ps"; chmod +x "$T/bin/ps"
+ago() { python3 -c 'import sys, time; print(time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - int(sys.argv[1]))))' "$1"; }
+mkdir -p "$T/s2/sessions" "$T/w/solo2" "$T/cx"
+roll2() { echo "{\"payload\": {\"id\": \"$1\", \"cwd\": \"$2\", \"timestamp\": \"$3\"}}" > "$T/s2/sessions/rollout-$1.jsonl"; }
+roll2 thr-stale /w/skew "$(ago 7000)"; roll2 thr-new /w/skew "$(ago 2030)"     # stale one, and the one made 30 s before start
+roll2 thr-solo /w/solo 2020-01-01T00:00:00.000Z; roll2 thr-solo2 "$T/w/solo2" 2020-01-01T00:00:00.000Z
+roll2 thr-tie1 /w/tie "$(ago 10)"; roll2 thr-tie2 /w/tie "$(ago 5)"
+python3 -c 'import sys, time; fs = [open(f) for f in sys.argv[2:]]; open(sys.argv[1], "w").close(); time.sleep(600)' "$T/d2.ready" "$T"/s2/sessions/rollout-*.jsonl & DAEMON2=$!
+while [ ! -e "$T/d2.ready" ]; do sleep 0.1; done   # the fake daemon holds the rollouts open
+cp /bin/sleep "$T/cx/codex"; (cd "$T/w/solo2" && exec "$T/cx/codex" 600) & OTHER=$!   # another codex process in solo2
+panes p2 codex
+codex_in() { procs p2 $PLAIN codex "$1"; OUT=$(DPID=$DAEMON2 FAKE_ETIMES=$2 FAKE_PEERS= ABN); }
+codex_in /w/skew 1850; has t-codex=peer:thr-new+trusted; ok $? "codex: monotonic 7.5% SLOW (etimes too small) -> still the thread made at start, not the stale one"
+codex_in /w/skew 2150; has t-codex=peer:thr-new+trusted; ok $? "codex: monotonic 7.5% FAST (etimes too large) -> the thread made at start, not the stale one"
+codex_in /w/solo 100; has t-codex=peer:thr-solo+trusted; ok $? "codex: the only daemon-open thread with this cwd -> taken, whatever its time"
+codex_in "$T/w/solo2" 100; has "t-codex=herdr:main:p2+trusted"; ok $? "codex: only thread with this cwd, but another codex process runs there -> time window rules (none: herdr)"
+mkdir -p "$T/home/.peerbridge"; echo '{"threads": ["thr-tie2"]}' > "$T/home/.peerbridge/policy.json"
+codex_in /w/tie 100; has t-codex=peer:thr-tie2+trusted; ok $? "codex: two threads with this cwd -> the one pb exposes wins"
+rm -f "$T/home/.peerbridge/policy.json"
+codex_in /w/tie 100; ! echo "$OUT" | grep -q 't-codex=' && grep -q 'codex thread in /w/tie: 2 candidates' "$T/abn/agent-bridge.log"; ok $? "codex: two threads with this cwd, none exposed -> no route (never a guess)"
 
 # ---- 5. source hygiene
 python3 -c "import sys; sys.exit(0 if all(b < 128 for b in open(sys.argv[1],'rb').read()) else 1)" "$HERE/agent-bridge.py"; ok $? "source: ASCII only"
