@@ -56,7 +56,10 @@ param(
   # Test/diagnostic hook: stop after N loop iterations (0 = run forever).
   [int]$MaxIterations = 0,
   # Backoff ceiling in seconds after errors.
-  [ValidateRange(1, 600)][int]$MaxBackoff = 60
+  [ValidateRange(1, 600)][int]$MaxBackoff = 60,
+  # Old session dirs (a re-join makes a new one) whose inbox changed within this many hours are drained on arm,
+  # on every session-dir change and every 10 loops: rows past their cursor print once (late=<dir>), cursor moves.
+  [ValidateRange(0, 168)][int]$ReplayHours = 48
 )
 
 Set-StrictMode -Version 2
@@ -226,7 +229,7 @@ function Still-Owner {
   } catch { return $true }   # lock unreadable: keep running rather than go deaf
 }
 
-function Print-Message($row) {
+function Print-Message($row, [string]$late = '') {
   $id = [string](Get-Field $row 'id')
   $text = Get-Field $row 'text'
   if ($null -eq $text) { return }
@@ -248,6 +251,7 @@ function Print-Message($row) {
     $line = $flat.Substring(0, $MaxLine) + ' ...(+' + ($flat.Length - $MaxLine) + ' chars)'
   }
   $suffix = '  {id=' + $id
+  if ($late) { $suffix += ' late=' + $late }
   $re = Get-Field $row 'reply_to'                      # set by send --reply-to (bin/p2p-tunnel.js:398)
   if ($re) { $suffix += ' re=' + (Short ([string]$re) 16) }
   if ($saved -and ($flat.Length -gt $MaxLine -or $clean.TrimEnd("`n").Contains("`n"))) { $suffix += ' full=' + $saved }
@@ -298,6 +302,55 @@ function Catch-Up([string]$dir, [long]$from) {
   } catch { }
 }
 
+# ---------- old session dirs ----------
+# A re-join points current.json at a new dir; recv then reads only that dir (from 0: no cursor yet). Rows that reached
+# the OLD dir after the ear's last recv there were never printed. Drain them: print each row past that dir's cursor
+# (seen.txt dedups), then move its cursor.json to the last whole row, as recv would. The current dir is never touched.
+function Drain-OldDirs([string]$n) {
+  if (-not $n -or $ReplayHours -le 0) { return }
+  $root = Join-Path $TunnelRoot $n
+  $curMail = Get-MailDir $n
+  $cut = (Get-Date).AddHours(-$ReplayHours)
+  $dirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^[a-f0-9]{32}$' -and $_.FullName -ne $curMail } | ForEach-Object {
+      $ib = Join-Path $_.FullName 'inbox.jsonl'
+      if (Test-Path -LiteralPath $ib) { $fi = Get-Item -LiteralPath $ib; if ($fi.LastWriteTime -ge $cut) { $fi } } } |
+    Sort-Object LastWriteTime)
+  foreach ($ib in $dirs) {
+    $dir = $ib.DirectoryName
+    $from = Get-Cursor $dir
+    if ($from -lt 0 -or $from -ge $ib.Length) { continue }
+    try {
+      $fs = New-Object IO.FileStream($ib.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+      try {
+        [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
+        $buf = New-Object byte[] ([int][Math]::Min(8MB, $fs.Length - $from))
+        $got = 0
+        while ($got -lt $buf.Length) { $k = $fs.Read($buf, $got, $buf.Length - $got); if ($k -le 0) { break }; $got += $k }
+      } finally { $fs.Dispose() }
+      $end = [Array]::LastIndexOf($buf, [byte]10, [Math]::Max(0, $got - 1))
+      if ($got -le 0 -or $end -lt 0) { continue }
+      $tag = (Split-Path -Leaf $dir).Substring(0, 8)
+      $np = 0
+      foreach ($line in ((New-Object System.Text.UTF8Encoding($false)).GetString($buf, 0, $end) -split "`r?`n")) {
+        if (-not $line.Trim()) { continue }
+        $row = $null
+        try { $row = $line | ConvertFrom-Json } catch { $row = $null }
+        if ($null -ne $row) {
+          $rid = [string](Get-Field $row 'id')
+          if (-not ($rid -and $Seen.Contains($rid)) -and (Get-Field $row 'text') -ne $null -and -not ((Get-Field $row 'channel') -and (Get-Field $row 'channel') -ne 'chat')) { $np++ }
+          Print-Message $row $tag
+        }
+      }
+      $next = $from + $end + 1
+      $tmp = Join-Path $dir ('cursor.json.ear-' + $PID)
+      [IO.File]::WriteAllText($tmp, ('{"offset":' + $next + '}'), (New-Object System.Text.UTF8Encoding($false)))
+      Move-Item -LiteralPath $tmp -Destination (Join-Path $dir 'cursor.json') -Force
+      Ear ('REPLAY old session dir ' + $tag + ': ' + $np + ' row(s) printed late, cursor ' + $from + ' -> ' + $next)
+    } catch { Ear ('WARN replay of old session dir ' + (Split-Path -Leaf $dir) + ' failed: ' + (Short ([string]$_) 160)) }
+  }
+}
+
 # ---------- arm ----------
 if (-not (Test-Path -LiteralPath $P2P)) {
   Ear ('WARN p2p launcher not found at ' + $P2P + ' - the owner must run the join line first. Retrying.')
@@ -315,6 +368,7 @@ if ($lastState -ne 'UP') { Ear ('STATUS ' + $lastState + ' ' + $link.Detail + ' 
 # ---------- loop ----------
 $backoff = 0
 $lastWarn = ''
+$lastMail = ''
 $iter = 0
 while ($true) {
   $iter++
@@ -331,6 +385,7 @@ while ($true) {
   }
 
   $mail = Get-MailDir $Session
+  if ($mail -and ($mail -ne $lastMail -or $iter % 10 -eq 1)) { Drain-OldDirs $Session; $lastMail = $mail }
   $cur0 = Get-Cursor $mail
   $r = Invoke-P2P @('tunnel', 'recv', '--name', $Session, '--wait', [string]$Wait) ($Wait + 45)
   if ($r.Killed) { Catch-Up $mail $cur0 }

@@ -54,6 +54,7 @@ windows/health.ps1
 windows/mesh-setup.ps1
 windows/shai-ear.ps1
 windows/shai-send.ps1
+windows/test-shai-ear-replay.ps1
 wsl/pane-assist.py
 wsl/shai-ear.sh
 wsl/shai-send.sh
