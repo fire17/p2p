@@ -3,7 +3,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync, readdirSync } from 'node:fs'
 import { generateIdentity, decodeKey, verifyCommitment, encodeKey, TypoError } from '../src/key.js'
 import { generateInviteSecret, formatShare, parseShare, INVITE_FLAG } from '../src/invite.js'
 
@@ -69,6 +69,64 @@ export function drainBounded(p, ms = 300) {
     Promise.resolve(p).catch(() => {}),
     new Promise((r) => { t = setTimeout(r, ms) }),
   ]).then(() => { clearTimeout(t) }, () => { clearTimeout(t) })
+}
+
+// ── socket guard: a long-lived daemon must never hoard sockets ─────────────────
+// A Windows joiner (bun 1.4.2) once held 15,948 TCP sockets (13,371 Bound + 2,596 CloseWait) until
+// the OS refused more (WSAENOBUFS) — the relay redial in src/transport-wss.js multiplied itself on
+// every drop. That is fixed at the source; this is the belt over it: the daemon counts what it holds
+// and, past a sane cap, stops with ONE clear error line instead of starving the whole machine.
+/** Every measure this runtime can give cheaply. Absent fields mean "not measurable here". */
+export function socketCounts(relay) {
+  const out = {}
+  try { const r = relay?.(); if (r) { out.relayOpen = r.open; out.relayMade = r.made } } catch { /* */ }
+  try { out.fds = readdirSync('/dev/fd').length } catch { /* win32: no /dev/fd */ }
+  try {
+    const a = process.getActiveResourcesInfo?.()                // node lists sockets; bun returns []
+    if (a?.length) out.handles = a.filter((n) => /TCP|UDP|Pipe/i.test(n)).length
+  } catch { /* */ }
+  return out
+}
+
+const envInt = (k, d) => { const n = Number.parseInt(process.env[k], 10); return n > 0 ? n : d }
+/** Caps, env-tunable. Normal is ~2 relay sockets, a few dozen fds, and a handful of dials a minute. */
+export const socketCaps = () => ({
+  relayOpen: envInt('P2P_SOCKET_CAP', 64),      // relay WebSockets not yet closed (2 is normal)
+  handles: envInt('P2P_SOCKET_CAP', 64) * 4,    // node: TCP/UDP/pipe handles
+  fds: envInt('P2P_FD_CAP', 1024),              // posix: open descriptors of any kind
+  dialsPerMin: envInt('P2P_DIAL_CAP', 120),     // relay sockets constructed in the last 60s
+})
+
+/**
+ * Sample socket counts every `intervalMs`; the first time any exceeds its cap, call onTrip(message)
+ * once and stop. The message is the ONE line an operator (or lane 'join' over p2p) needs.
+ * @param {{sample?:()=>object, caps?:object, intervalMs?:number, onTrip:(msg:string, counts:object)=>void, now?:()=>number}} o
+ * @returns {{check:()=>string|null, stop:()=>void}}
+ */
+export function createSocketGuard({ sample = () => socketCounts(), caps = socketCaps(), intervalMs = 5000,
+  onTrip, now = () => Date.now() }) {
+  const made = []                                             // [t, relayMade] over the last minute
+  let timer = null, tripped = false
+  const check = () => {
+    if (tripped) return null
+    const c = sample(), t = now()
+    if (c.relayMade !== undefined) {
+      made.push([t, c.relayMade])
+      while (made.length > 1 && t - made[0][0] > 60000) made.shift()
+      c.dialsPerMin = c.relayMade - made[0][1]
+    }
+    const over = Object.keys(caps).find((k) => c[k] !== undefined && c[k] > caps[k])
+    if (!over) return null
+    tripped = true; stop()
+    const msg = `socket guard tripped: ${over}=${c[over]} > cap ${caps[over]} (` +
+      Object.entries(c).map(([k, v]) => k + '=' + v).join(' ') + ') — transport torn down, daemon exiting'
+    try { onTrip(msg, c) } catch { /* the guard must never throw from a timer */ }
+    return msg
+  }
+  const stop = () => { clearInterval(timer); timer = null }
+  timer = setInterval(check, intervalMs)
+  timer.unref?.()
+  return { check, stop }
 }
 
 // ── TUI input helpers (pure — the TUI itself needs a real TTY, these do not) ──
