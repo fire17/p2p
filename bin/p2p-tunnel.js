@@ -7,7 +7,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mkdirSync, openSync, closeSync, readSync, fstatSync, readFileSync, writeFileSync,
   unlinkSync, appendFileSync, existsSync, statSync, chmodSync } from 'node:fs'
-import { loadOrCreateIdentity, mintInvite, parseShare, decodeKey, peerKey, isOwnKey } from './lib.js'
+import { loadOrCreateIdentity, mintInvite, parseShare, decodeKey, peerKey, isOwnKey,
+  createSocketGuard, socketCounts } from './lib.js'
 import { newId, chunk, decodeMsg, createAssembler, tunnelDir } from '../src/tunnel.js'
 import { createInvite } from '../src/invite.js'
 import { atomicJson as atomic } from '../src/atomic-json.js'
@@ -150,10 +151,10 @@ async function serve(s) {
   const state = { id: s.session.id, pid: process.pid, name: s.name, role: s.session.role,
     self: null, peerKey: null, connected: false, ready: false, sent: 0, recv: 0, beat: Date.now() }
   const save = () => { state.beat = Date.now(); atomic(s.f.state, state) }
-  let node, deps, timer, pumpBusy = false, stopped = false
+  let node, deps, timer, guard, pumpBusy = false, stopped = false
   const shutdown = () => {
     if (stopped) return
-    stopped = true; clearInterval(timer)
+    stopped = true; clearInterval(timer); guard?.stop()
     try { node?.close() } catch {}; try { deps?.close?.() } catch {}
     state.stopped = Date.now(); state.connected = false; save(); release(s)
     try { unlinkSync(pidFile) } catch {}
@@ -181,6 +182,12 @@ async function serve(s) {
         deps.resolve = scoped.resolve; deps.publishAll = scoped.publishAll
       }
     }
+    // SOCKET GUARD: count what this daemon holds; past a cap, tear the transport down and exit with
+    // one clear line (state.error → the launcher prints `p2p tunnel: socket guard tripped: …`).
+    const { relayStats } = await import('../src/transport-wss.js')
+    guard = createSocketGuard({ sample: () => socketCounts(relayStats), intervalMs: Number(process.env.P2P_GUARD_MS) || 5000,
+      onTrip: (msg) => { console.error('p2p tunnel: ' + msg); state.error = msg; save(); shutdown(); process.exit(3) } })
+    guard.check()
     const { listen } = await import('../src/node.js')
     // A joiner needs no public presence: still build invite-scoped resolvers when dialing,
     // but never publish its ordinary identity to tracker/DHT/mDNS just to send one invitation.
