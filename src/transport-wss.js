@@ -90,6 +90,36 @@ function parse(buf) {
   return out
 }
 
+// ── relay redial policy + process-wide socket accounting ─────────────────────────────────────
+// THE WINDOWS JOINER LEAK (2026-10-28, bun 1.4.2 win32: one joiner held 15,948 TCP sockets — 13,371
+// Bound + 2,596 CloseWait — and exhausted the PC's ephemeral ports, WSAENOBUFS). Root cause was HERE:
+// `down` was wired to BOTH ws.onerror and ws.onclose, and every failed or reset connection fires BOTH.
+// So each failure armed TWO reconnect timers, each of which replaced `ws` with a fresh socket while the
+// one it overwrote was never closed (its handlers still armed it to redial). Every network hiccup
+// therefore DOUBLED the relay sockets — 1, 3, 7, 15, 31, 63 … every 2s while a relay was unreachable,
+// on node AND bun — and every orphan the broker later hung up on sat in CloseWait because nothing
+// ever closed it. A flaky network fed the loop, the loop broke the network: a positive feedback.
+//
+// The fix: ONE socket per relay at a time, owned by a generation check (a stale socket's events are
+// ignored except for accounting), the old socket is always closed with its handlers detached before
+// a redial, ONE retry timer (cleared before re-arming), exponential backoff with jitter and a 60s
+// ceiling (reset only after a link stayed up), a connect deadline (a socket stuck CONNECTING is torn
+// down, not abandoned), and a dead-link check on the keepalive (a broker that vanished without a FIN
+// is noticed instead of held forever).
+const BACKOFF_MIN_MS = 2000
+const BACKOFF_MAX_MS = 60000
+const STABLE_MS = 30000           // a link that lived this long resets the backoff
+const CONNECT_TIMEOUT_MS = 15000  // CONNECT → CONNACK deadline
+const PING_MS = 30000             // MQTT PINGREQ cadence (keepalive 60s in CONNECT)
+const DEAD_MS = 95000             // nothing heard for ~3 pings → the link is dead; redial
+
+// Process-wide: every relay WebSocket this module constructs, and how many have not yet reported
+// close. The joiner's socket guard (bin/lib.js createSocketGuard) reads this — it is the in-process
+// truth on runtimes where process.getActiveResourcesInfo() is empty (bun).
+const stats = { made: 0, open: 0 }
+/** @returns {{made:number, open:number}} relay sockets ever constructed / not yet closed */
+export const relayStats = () => ({ made: stats.made, open: stats.open })
+
 /**
  * One relay connection: auto-reconnects, replays its subscriptions, never throws outward.
  * sub() returns a promise that settles on the broker's SUBACK — the dialer MUST await that before
@@ -97,40 +127,86 @@ function parse(buf) {
  * nobody is subscribed to yet, and the dial hangs until a retry happens to line up. Observed live:
  * without this, first-contact took ~13s; with it, ~1s.
  */
-function relayConn(url, WS, onPublish) {
+function relayConn(url, WS, onPublish, {
+  backoffMinMs = BACKOFF_MIN_MS, backoffMaxMs = BACKOFF_MAX_MS, connectTimeoutMs = CONNECT_TIMEOUT_MS,
+} = {}) {
   const subs = new Set()
   const queue = []
   const subWaiters = []                                       // FIFO — one SUBACK per SUBSCRIBE
   let ws = null, ready = false, ping = null, closed = false
+  let retry = null, connTimer = null, backoff = backoffMinMs, upAt = 0, lastRx = 0
 
-  const raw = (u8) => { try { ws.send(u8) } catch { /* relay hiccup */ } }
+  const raw = (u8) => { try { ws?.send(u8) } catch { /* relay hiccup */ } }
   const doSub = (t) => raw(packet(8, 2, [0, 1, ...mstr(t), 0]))
 
-  const open = () => {
+  /** Drop the CURRENT socket completely: timers, handlers (bar close accounting), the OS handle. */
+  const teardown = () => {
+    clearInterval(ping); ping = null
+    clearTimeout(connTimer); connTimer = null
+    ready = false; upAt = 0
+    const old = ws
+    ws = null
+    if (!old) return
+    old.onopen = null; old.onmessage = null; old.onerror = null   // onclose stays: it only accounts
+    try { old.close() } catch { /* already closing */ }
+  }
+  /** Exactly one redial, after backoff. Idempotent: a second call while one is armed re-arms it. */
+  const down = () => {
+    const lived = upAt ? Date.now() - upAt : 0
+    teardown()
     if (closed) return
-    try { ws = new WS(url, 'mqtt') } catch { return }
-    ws.binaryType = 'arraybuffer'
-    ws.onopen = () => raw(packet(1, 0, [...mstr('MQTT'), 4, 2, 0, 60, ...mstr('p2p' + hex(rnd(6)))]))
-    ws.onmessage = (ev) => {
-      for (const p of parse(new Uint8Array(ev.data))) {
+    if (lived >= STABLE_MS) backoff = backoffMinMs
+    const delay = Math.round(backoff * (0.75 + Math.random() * 0.5))   // jitter: relays must not see a herd
+    backoff = Math.min(backoffMaxMs, backoff * 2)
+    clearTimeout(retry)
+    retry = setTimeout(open, delay)
+    retry.unref?.()
+  }
+
+  function open() {
+    retry = null
+    if (closed || ws) return
+    let me
+    try { me = new WS(url, 'mqtt') } catch { down(); return }
+    stats.made++; stats.open++
+    let counted = true
+    ws = me
+    me.binaryType = 'arraybuffer'
+    me.onopen = () => {
+      if (me !== ws) return
+      raw(packet(1, 0, [...mstr('MQTT'), 4, 2, 0, 60, ...mstr('p2p' + hex(rnd(6)))]))
+    }
+    me.onmessage = (ev) => {
+      if (me !== ws) return
+      lastRx = Date.now()
+      let pkts
+      try { pkts = parse(new Uint8Array(ev.data)) } catch { return }
+      for (const p of pkts) {
         if (p.type === 2) {                                   // CONNACK
-          ready = true
+          if (ready) continue
+          ready = true; upAt = Date.now()
+          clearTimeout(connTimer); connTimer = null
           for (const t of subs) doSub(t)
           while (queue.length) { const [t, b] = queue.shift(); raw(packet(3, 0, [...mstr(t), ...b])) }
-          ping = setInterval(() => raw(packet(12, 0, [])), 30000)
+          clearInterval(ping)
+          ping = setInterval(() => {
+            if (me !== ws) return
+            if (Date.now() - lastRx > DEAD_MS) { down(); return }   // half-open: the broker is gone
+            raw(packet(12, 0, []))
+          }, PING_MS)
           ping.unref?.()
         } else if (p.type === 9) {                            // SUBACK
           subWaiters.shift()?.()
         } else if (p.type === 3) onPublish(p.topic, p.payload)
       }
     }
-    const down = () => {
-      ready = false
-      clearInterval(ping)
-      if (!closed) setTimeout(open, 2000).unref?.()            // best-effort relays: reconnect, keep subs
+    me.onerror = () => { if (me === ws) down() }
+    me.onclose = () => {
+      if (counted) { counted = false; stats.open-- }
+      if (me === ws) down()                                   // a stale socket's close only accounts
     }
-    ws.onclose = down
-    ws.onerror = down
+    connTimer = setTimeout(() => { if (me === ws && !ready) down() }, connectTimeoutMs)
+    connTimer.unref?.()
   }
   open()
 
@@ -140,17 +216,24 @@ function relayConn(url, WS, onPublish) {
     sub(t) {
       subs.add(t)
       return new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(false), 6000)
+        const waiter = () => { clearTimeout(timer); resolve(true) }
+        const timer = setTimeout(() => {
+          const i = subWaiters.indexOf(waiter)
+          if (i >= 0) subWaiters.splice(i, 1)                  // a timed-out waiter must not pile up
+          resolve(false)
+        }, 6000)
         timer.unref?.()
-        subWaiters.push(() => { clearTimeout(timer); resolve(true) })
+        subWaiters.push(waiter)
         if (ready) doSub(t)                                    // else: replayed on CONNACK
       })
     },
+    /** Stop replaying `t` on reconnect (no UNSUBSCRIBE packet — see the EPOCH ROLL note). */
+    forget(t) { subs.delete(t) },
     pub(t, bytes) {
       if (!ready) { if (queue.length < 64) queue.push([t, bytes]); return }
       raw(packet(3, 0, [...mstr(t), ...bytes]))
     },
-    close() { closed = true; clearInterval(ping); try { ws?.close() } catch { /* ignore */ } },
+    close() { closed = true; clearTimeout(retry); retry = null; teardown() },
   }
 }
 
@@ -176,6 +259,7 @@ export function createEndpoint({
   S = null, relays = RELAYS, WebSocket: WS = globalThis.WebSocket, now = () => Date.now(),
   maxAccepted = MAX_ACCEPTED, acceptIdleMs = ACCEPT_IDLE_MS, acceptRate = ACCEPT_RATE,
   acceptBurst = ACCEPT_BURST, idleSweepMs = IDLE_SWEEP_MS, epochRollMs = EPOCH_ROLL_MS,
+  backoffMinMs, backoffMaxMs, connectTimeoutMs,
 } = {}) {
   if (!WS) throw new Error('transport-wss: no WebSocket (need Node >= 22 or a browser)')
 
@@ -244,7 +328,7 @@ export function createEndpoint({
     sock._emit(frame, sock.rinfo)
   }
 
-  const conns = relays.map((u) => relayConn(u, WS, inbound))
+  const conns = relays.map((u) => relayConn(u, WS, inbound, { backoffMinMs, backoffMaxMs, connectTimeoutMs }))
   const subAll = (t) => conns.forEach((c) => c.sub(t))
   const pubAll = (t, b) => conns.forEach((c) => c.pub(t, b))
 
@@ -305,7 +389,7 @@ export function createEndpoint({
 
   return {
     topics,
-    _debug: { acceptedCount: () => accepted.size, dialsCount: () => dials.size, rollActive: () => roll !== null }, // DOS-1-WSS leak-monitor hook + epoch-roll probe
+    _debug: { acceptedCount: () => accepted.size, dialsCount: () => dials.size, rollActive: () => roll !== null, relayStats }, // DOS-1-WSS leak-monitor hook + epoch-roll probe
     candidates() { return S ? [{ proto: 'wss', topic: topicFor(S, epochStr(now())), relays }] : [] },
     async stun() { return { ip: 'wss', port: 0 } },             // the relay IS the reflexive address
     onConnection(cb) { onConnCb = cb },
@@ -322,7 +406,10 @@ export function createEndpoint({
       if (!c) throw new Error('transport-wss: no wss candidate ({proto:"wss", topic} required)')
       const dialId = rnd(16)                                   // this dial's private reply address
       const myDialTopic = NS + hex(dialId)
-      const sock = socketLike(dialId, c.topic, hex(dialId), () => dials.delete(myDialTopic)) // no dial-map leak
+      const sock = socketLike(dialId, c.topic, hex(dialId), () => {         // no dial-map leak
+        dials.delete(myDialTopic)
+        for (const cn of conns) cn.forget(myDialTopic)                     // nor a replayed dead topic
+      })
       dials.set(myDialTopic, sock)
       // Await the FIRST broker's SUBACK before making any noise: the listener answers a knock with
       // a HELLO that node.js retransmits for only ~2s, so our reply topic must already be live.
@@ -378,4 +465,4 @@ export function createWssRendezvous({ relays = RELAYS, now = () => Date.now() } 
   }
 }
 
-export default { createEndpoint, createWssRendezvous, RELAYS, topicFor, epochStr }
+export default { createEndpoint, createWssRendezvous, RELAYS, topicFor, epochStr, relayStats }
