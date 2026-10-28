@@ -7,6 +7,7 @@ import { mkdtempSync, mkdirSync, cpSync, readFileSync, writeFileSync, existsSync
 import { tmpdir } from 'node:os'
 import { join, dirname, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { runInNewContext } from 'node:vm'
 import { generateIdentity } from '../src/key.js'
 import { renderJoin, INSTALLERS } from '../tools/render-join.mjs'
 
@@ -238,6 +239,78 @@ for (const shell of shells) test(`join bootstrap ${shell.label}: HTTP integrity 
       }
       assert.equal(readdirSync(temp).some(name => name.startsWith('p2p-join.')), false)
       assert.equal(readdirSync(temp).some(name => name.startsWith('p2p-join-')), false)
+    } finally { await new Promise(resolve => server.close(resolve)) }
+  })
+})
+
+// ── The GENERIC join.ps1 (key typed by the user, never a site file) ─────────────────────────────
+// The page's copy lines come from app.js commands(); the test executes THAT exact text with only the
+// host swapped for a local server, so a copy-line edit cannot drift from what is proven to join.
+const genericPs1 = readFileSync(join(root, 'join.ps1'), 'utf8').replace(/\r\n/g, '\n')
+const site = (() => { const ctx = { module: { exports: {} } }; runInNewContext(readFileSync(join(root, 'app.js'), 'utf8'), ctx); return ctx.module.exports })()
+const python = ['python3', 'python'].find(exe => spawnSync(exe, ['-c', 'import sys; sys.exit(sys.version_info[0] != 3)'], { timeout: 15000 }).status === 0)
+
+test('generic join.ps1 is the committed render of tools/render-generic.py', { skip: !python && 'python3 unavailable' }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'p2p generic render ')), out = join(dir, 'join.ps1')
+  try {
+    const rendered = spawnSync(python, [join(root, 'tools', 'render-generic.py'), out], { encoding: 'utf8', timeout: 30000 })
+    assert.equal(rendered.status, 0, rendered.stdout + rendered.stderr)
+    assert.equal(readFileSync(out, 'utf8'), genericPs1, 'join.ps1 is stale: run python3 tools/render-generic.py and commit it')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('join copy lines: env-var iex on Windows, no `--` on Unix, and join.ps1 assigns nothing in the caller scope', () => {
+  const key = generateIdentity().S, lines = site.commands(key, 'join')
+  assert.equal(lines.win, "$env:P2P_KEY='" + key + "'; irm https://p2p.akeyo.io/join.ps1 | iex")
+  assert.equal(lines.unix, 'curl -fsSL https://p2p.akeyo.io/join.sh | sh -s ' + key)
+  assert.ok(genericPs1.includes("#   $env:P2P_KEY='<LISTENER_KEY>'; irm https://p2p.akeyo.io/join.ps1 | iex\n"), 'header advertises the handed-out line')
+  // `| iex` runs in the caller's scope: a top-level param() would reset the caller's $Key/$KEY.
+  assert.doesNotMatch(genericPs1, /^param\(/m)
+  assert.ok(genericPs1.trimEnd().endsWith('\n} @args'), 'the old scriptblock line reaches the inner param through @args')
+})
+
+for (const shell of shells.filter(candidate => candidate.platform === 'ps1')) test(`generic join.ps1 ${shell.label}: the page's iex line and the older scriptblock line both join; caller scope untouched`, { skip: !bun, timeout: 120000 }, async () => {
+  await fixture(async ({ temp, home, key, env }) => {
+    const marker = join(temp, 'installer-executed')
+    const installer = "$ErrorActionPreference='Stop'\n[IO.File]::WriteAllText($env:P2P_JOIN_FIXTURE_MARKER,'yes')\nif($env:P2P_KEY) { throw 'the key env var reached the installer' }\n[IO.File]::WriteAllText((Join-Path $env:P2P_HOME 'runtime.kind'),'bun')\n[IO.File]::WriteAllText((Join-Path $env:P2P_HOME 'runtime.path'),$env:P2P_TEST_BUN,(New-Object Text.UTF8Encoding($false)))\n"
+    let servedScript = ''
+    const server = createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'application/octet-stream' }); res.end(req.url === '/join.ps1' ? servedScript : installer) })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const origin = 'http://127.0.0.1:' + server.address().port
+    // The committed join.ps1 byte for byte, except its pinned installer URL + hash point at the fixture.
+    assert.ok(genericPs1.includes(INSTALLERS.ps1.url) && genericPs1.includes(INSTALLERS.ps1.sha256))
+    servedScript = genericPs1.replace(INSTALLERS.ps1.url, origin + '/init.ps1').replace(INSTALLERS.ps1.sha256, createHash('sha256').update(installer).digest('hex'))
+    const local = line => line.split('https://p2p.akeyo.io').join(origin)
+    const fixtureEnv = { ...env, P2P_TEST_BUN: bun, P2P_JOIN_FIXTURE_MARKER: marker, P2P_REF: 'fixture-original', TMPDIR: temp, TEMP: temp, TMP: temp }
+    let invocation = 0
+    // A caller that holds $KEY (agent-kit/START.md does exactly this - PowerShell names are case-insensitive),
+    // runs under StrictMode Latest, and invokes from inside a function (an "optimized" local scope).
+    const invoke = line => {
+      const psCommand = "Set-StrictMode -Version Latest; function Invoke-JoinFixture { $KEY = 'caller-value'; " + line + "; Write-Output 'JOIN_FIXTURE_RETURNED'; " +
+        "if ($KEY -cne 'caller-value') { throw 'caller $KEY was changed' }; if ($env:P2P_KEY) { throw 'P2P_KEY was left set' }; " +
+        "if ($ErrorActionPreference -ne 'Continue') { throw 'ErrorActionPreference leaked' } }; " +
+        "try { Invoke-JoinFixture } finally { if ($env:P2P_REF -ne 'fixture-original') { throw 'Caller environment was not restored' } }"
+      const capture = ['stdout', 'stderr'].map(stream => join(temp, 'generic-' + invocation + '-' + stream + '.txt'))
+      invocation++
+      return run(shell.exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psCommand], fixtureEnv, '', 55000, capture)
+    }
+    try {
+      let result = await invoke(local(site.commands(key, 'join').win))
+      assert.equal(result.code, 0, result.out + result.err)
+      assert.match(result.out, /JOIN_FIXTURE_RETURNED/)
+      assert.ok(existsSync(marker))
+      const first = await status(home, 'join-' + key)
+      result = await invoke(local('& ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) ' + key))
+      assert.equal(result.code, 0, result.out + result.err)
+      assert.equal((await status(home, 'join-' + key)).pid, first.pid, 'the older line reuses the same daemon')
+      rmSync(marker)
+      result = await invoke(local('irm https://p2p.akeyo.io/join.ps1 | iex'))
+      assert.notEqual(result.code, 0, result.out + result.err)
+      assert.match(result.err + result.out, /usage: \$env:P2P_KEY=/)
+      result = await invoke(local("$env:P2P_KEY='not-a-key'; irm https://p2p.akeyo.io/join.ps1 | iex"))
+      assert.notEqual(result.code, 0, result.out + result.err)
+      assert.match(result.err + result.out, /Invalid listener key/)
+      assert.equal(existsSync(marker), false, 'no installer runs without a valid key')
     } finally { await new Promise(resolve => server.close(resolve)) }
   })
 })

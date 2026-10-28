@@ -10,7 +10,7 @@ This kit gives the coding agent on a Windows PC (Claude Code, Codex, or similar)
 Replace `<KEY>` with the key Shai's owner sends you:
 
 ```powershell
-& ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <KEY>
+$env:P2P_KEY='<KEY>'; irm https://p2p.akeyo.io/join.ps1 | iex
 ```
 
 The join line:

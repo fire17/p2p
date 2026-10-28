@@ -7,7 +7,7 @@ $KEY = "<KEY>"; $N = "join-$KEY"; $P = "$env:USERPROFILE\.local\bin\p2p.cmd"; $K
 
 STEP 2 - check the tunnel: & $P tunnel status --name $N
 If it is not installed or not connected=true, ask the person to run this in PowerShell (it installs Bun + Agent Tunnel, chat only, no remote terminal), then check again:
-& ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) $KEY
+$env:P2P_KEY=$KEY; irm https://p2p.akeyo.io/join.ps1 | iex
 
 STEP 3 - download (or update) the kit; re-run this line any time to get the latest version:
 $files = ((Invoke-WebRequest -UseBasicParsing "https://p2p.akeyo.io/agent-kit/MANIFEST.txt").Content -split "`n") | Where-Object { $_.Trim() }; foreach ($f in $files) { $f = $f.Trim(); $d = Join-Path $K $f; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Invoke-WebRequest -UseBasicParsing "https://p2p.akeyo.io/agent-kit/$f" -OutFile $d }

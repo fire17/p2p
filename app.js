@@ -27,10 +27,13 @@
   /** The install/connect command strings. key === null → plain install. */
   function commands(key, kind) {
     if (key && kind === 'join') {
-      // Agent Tunnel join: ONE static script, the key is a parameter — never a per-key file on this site.
+      // Agent Tunnel join: ONE static script, the key is typed by the user — never a per-key file on this site.
+      // Windows: the env var carries the key into `irm | iex` (which cannot pass args); join.ps1 reads it
+      // once and clears it. The older `& ([scriptblock]::Create((irm …/join.ps1))) KEY` line still works.
+      // Unix: the key starts with 0, so `sh -s KEY` cannot be read as an option and needs no `--`.
       return {
-        unix: 'curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- ' + key,
-        win: '& ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) ' + key,
+        unix: 'curl -fsSL https://p2p.akeyo.io/join.sh | sh -s ' + key,
+        win: "$env:P2P_KEY='" + key + "'; irm https://p2p.akeyo.io/join.ps1 | iex",
         already: 'p2p tunnel join ' + key + ' --profile join-' + key
       }
     }

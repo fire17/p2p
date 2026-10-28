@@ -1,14 +1,17 @@
-# p2p.akeyo.io/join.ps1 - ONE static script for every Windows machine; the listener key is a PARAMETER, never a file on this site:
-#   & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <LISTENER_KEY>
+# p2p.akeyo.io/join.ps1 - ONE static script for every Windows machine; the listener key is typed by the user, never a file on this site:
+#   $env:P2P_KEY='<LISTENER_KEY>'; irm https://p2p.akeyo.io/join.ps1 | iex
 # (share it as https://p2p.akeyo.io/#/join/<LISTENER_KEY> - the page renders this line client-side)
+# The older form still works: & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <LISTENER_KEY>
 # Installs verified Bun + p2p v0.3.8, joins the listener's chat, identifies the machine. Never enables terminal access.
 # Rendered from tools/join-bootstrap.ps1.in + tools/join-client.mjs by tools/render-generic.py. PowerShell 5.1 and 7.
-param([Parameter(Position = 0)][string]$Key = '')
 & {
+  param([string]$Key = '')
   $ErrorActionPreference = 'Stop'
   Set-StrictMode -Version 2.0
   $joinKey = $Key
-  if (-not $joinKey) { throw 'usage: & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <LISTENER_KEY>' }
+  if (-not $joinKey) { $joinKey = [Environment]::GetEnvironmentVariable('P2P_KEY', 'Process') }
+  [Environment]::SetEnvironmentVariable('P2P_KEY', $null, 'Process')
+  if (-not $joinKey) { throw 'usage: $env:P2P_KEY=''<LISTENER_KEY>''; irm https://p2p.akeyo.io/join.ps1 | iex' }
   if ($joinKey -cnotmatch '^0[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$') { throw 'Invalid listener key' }
   Write-Host "Agent Tunnel: install verified Bun + p2p v0.3.8; connect chat to $joinKey."
   Write-Host 'Your machine name, username, OS and architecture will be sent to this peer.'
@@ -211,4 +214,4 @@ try { await main() } catch (error) { console.error('Agent Tunnel: ' + error.mess
     foreach ($joinName in $joinSaved.Keys) { [Environment]::SetEnvironmentVariable($joinName, $joinSaved[$joinName], 'Process') }
     if (Test-Path -LiteralPath $joinTemp) { Remove-Item -LiteralPath $joinTemp -Recurse -Force -ErrorAction SilentlyContinue }
   }
-}
+} @args

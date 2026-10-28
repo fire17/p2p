@@ -128,8 +128,8 @@ By hand: same hub, one `link` per extra machine. Example: your main PC (`main`) 
    ```
    It prints a key. The fixed `--profile` keeps the key the same when you restart it.
 2. Join from the laptop.
-   - Windows laptop: `& ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <KEY>`
-   - Linux or WSL laptop: `curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <KEY> --chat-only`
+   - Windows laptop: `$env:P2P_KEY='<KEY>'; irm https://p2p.akeyo.io/join.ps1 | iex`
+   - Linux or WSL laptop: `curl -fsSL https://p2p.akeyo.io/join.sh | sh -s <KEY> --chat-only`
 3. Run one hub link on each end (`--as` = the OTHER machine's name, `--label` = this machine's name):
    - on `main`: `hub.py link --session laptop --as laptop --label main`
    - on the laptop: `hub.py link --session join-<KEY> --as main --label laptop`
@@ -157,7 +157,7 @@ P2P_HOME=<shai's tunnel home for you> p2p tunnel listen --name <you>-wsl --profi
 ```
 Then WSL joins chat-only with the printed key:
 ```bash
-curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <KEY> --chat-only
+curl -fsSL https://p2p.akeyo.io/join.sh | sh -s <KEY> --chat-only
 ```
 The WSL mailbox is then `join-<KEY>` under `~/.p2p` inside WSL.
 

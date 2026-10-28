@@ -54,4 +54,4 @@ if [ "$PURGE_APT" -eq 1 ] && command -v apt-get >/dev/null 2>&1; then
 else say '- apt packages (unzip, tmux) left in place; add --purge-apt to remove them'; fi
 echo 'done — this machine is fresh. Rejoin with the key the listener owner gives you (the SAME key works once the owner'
 echo 'has relaunched the listener — a listener pins its first peer, and this machine now has a new identity):'
-echo '  curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <KEY>'
+echo '  curl -fsSL https://p2p.akeyo.io/join.sh | sh -s <KEY>'

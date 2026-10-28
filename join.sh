@@ -1,6 +1,6 @@
 #!/bin/sh
 # p2p.akeyo.io/join.sh — ONE static script for every machine. The listener key is a PARAMETER, never a file on this site:
-#   curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <LISTENER_KEY>
+#   curl -fsSL https://p2p.akeyo.io/join.sh | sh -s <LISTENER_KEY>
 # The key is the only argument (share it as https://p2p.akeyo.io/#/join/<LISTENER_KEY> — the page renders this line client-side).
 # On a Linux server (systemd present, run as root or with passwordless sudo) it also installs the keeper service (rejoin after
 # reboot) and enables the owner terminal grant for the listener — the owner running it IS the consent. Add --chat-only to skip that.
@@ -269,7 +269,7 @@ UNIT
 JOIN_MODE=''
 for a in "$@"; do case "$a" in --chat-only) JOIN_MODE=--chat-only;; --server) JOIN_MODE=--server;; -*) echo "unknown option: $a" >&2; exit 2;; *) [ -n "${P2P_JOIN_KEY:-}" ] || P2P_JOIN_KEY="$a";; esac; done
 if [ -z "${P2P_JOIN_KEY:-}" ]; then
-  echo 'usage: curl -fsSL https://p2p.akeyo.io/join.sh | sh -s -- <LISTENER_KEY> [--chat-only]' >&2; exit 2
+  echo 'usage: curl -fsSL https://p2p.akeyo.io/join.sh | sh -s <LISTENER_KEY> [--chat-only]' >&2; exit 2
 fi
 if [ -z "$JOIN_MODE" ]; then
   # default: full server setup wherever it can be done (Linux + systemd + root or passwordless sudo); chat-only elsewhere
