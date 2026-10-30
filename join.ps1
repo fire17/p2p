@@ -2,7 +2,7 @@
 #   $env:P2P_KEY='<LISTENER_KEY>'; irm https://p2p.akeyo.io/join.ps1 | iex
 # (share it as https://p2p.akeyo.io/#/join/<LISTENER_KEY> - the page renders this line client-side)
 # The older form still works: & ([scriptblock]::Create((irm https://p2p.akeyo.io/join.ps1))) <LISTENER_KEY>
-# Installs verified Bun + p2p v0.3.8, joins the listener's chat, identifies the machine. Never enables terminal access.
+# Installs verified Bun + p2p v0.3.9, joins the listener's chat, identifies the machine. Never enables terminal access.
 # Rendered from tools/join-bootstrap.ps1.in + tools/join-client.mjs by tools/render-generic.py. PowerShell 5.1 and 7.
 & {
   param([string]$Key = '')
@@ -13,15 +13,15 @@
   [Environment]::SetEnvironmentVariable('P2P_KEY', $null, 'Process')
   if (-not $joinKey) { throw 'usage: $env:P2P_KEY=''<LISTENER_KEY>''; irm https://p2p.akeyo.io/join.ps1 | iex' }
   if ($joinKey -cnotmatch '^0[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}$') { throw 'Invalid listener key' }
-  Write-Host "Agent Tunnel: install verified Bun + p2p v0.3.8; connect chat to $joinKey."
+  Write-Host "Agent Tunnel: install verified Bun + p2p v0.3.9; connect chat to $joinKey."
   Write-Host 'Your machine name, username, OS and architecture will be sent to this peer.'
   Write-Host 'The chat daemon continues after this command exits. This join line does not enable remote terminal access.'
   $joinTemp = Join-Path ([IO.Path]::GetTempPath()) ('p2p-join-' + [Guid]::NewGuid().ToString('N'))
   $joinSaved = @{}
   $joinEnv = @{
-    P2P_RUNTIME = 'bun'; P2P_REF = 'v0.3.8'
-    P2P_SRC = 'https://github.com/fire17/p2p/releases/download/v0.3.8/p2p-v0.3.8.zip'
-    P2P_SRC_SUMS = 'https://github.com/fire17/p2p/releases/download/v0.3.8/SHASUMS256.txt'
+    P2P_RUNTIME = 'bun'; P2P_REF = 'v0.3.9'
+    P2P_SRC = 'https://github.com/fire17/p2p/releases/download/v0.3.9/p2p-v0.3.9.zip'
+    P2P_SRC_SUMS = 'https://github.com/fire17/p2p/releases/download/v0.3.9/SHASUMS256.txt'
   }
   foreach ($joinName in $joinEnv.Keys) { $joinSaved[$joinName] = [Environment]::GetEnvironmentVariable($joinName, 'Process') }
   try {
