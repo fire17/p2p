@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may carry breaking changes).
 
+## [0.3.9] — 2026-10-30
+
+- Relay socket leak fixed (`src/transport-wss.js`). On 0.3.8 the relay connection wired one handler to both `onerror` and `onclose`; a dropped or refused relay fires both, so every drop armed two redials, each replacing the socket without closing the previous one. Sockets doubled every ~2 s with no backoff: a Windows joiner reached 15,948 TCP sockets (WSAENOBUFS), a Debian arm64 Pi pinned a core and grew ~2.7 MB/s until killed. Now each drop closes the old socket and arms exactly one redial, with jittered exponential backoff (2 s → 60 s ceiling, reset after a 30 s-stable link), a CONNACK deadline and a dead-link check on the keepalive. Timed-out SUBACK waiters and closed dial topics no longer accumulate.
+- `tunnel serve` socket guard: the daemon samples its relay sockets, redials per minute and open descriptors every 5 s; past a cap (`P2P_SOCKET_CAP` 64, `P2P_DIAL_CAP` 120/min, `P2P_FD_CAP` 1024) it records `state.error`, prints `p2p tunnel: socket guard tripped: …`, shuts down and exits 3.
+- `test/tunnel-socket-leak.test.js`: hold/drop/refuse cycles against a local WebSocket relay, joiner fds counted with lsof under node and bun — red on 0.3.8 (node TCP 2→7,888; bun 2→128), flat here.
+
 ## [0.3.8] — 2026-09-13
 
 - `tunnel serve` now exits on SIGTERM/SIGINT/SIGHUP. On 0.3.7 the handlers wrote `state.stopped`, released the owner lock and set the exit code, then the process lingered on the relay's open WebSocket (close handshake never completed) — `systemctl stop` of the server keeper ran into its 90 s TimeoutStopSec and a relaunch needed SIGKILL. Signals now exit explicitly, as the `stop` verb always did (test/tunnel-signal-exit.test.js: red on 0.3.7 for all three signals, green here).
