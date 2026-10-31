@@ -1,6 +1,6 @@
 # One-line Agent Tunnel join
 
-The generated Pages routes install Bun and p2p v0.3.8, connect an encrypted chat
+The generated Pages routes install Bun and p2p v0.3.9, connect an encrypted chat
 daemon, and send an acknowledged machine introduction. Terminal access remains
 off for a new connection. The installed release includes terminal commands, but
 joining does not authorize incoming instructions or enable a remote shell. Existing
@@ -63,7 +63,7 @@ commit's SHA and the installer's SHA256 (`git show <sha>:init.ps1 | shasum -a 25
 update `INSTALLERS` in `tools/render-join.mjs`, run `python3 tools/render-generic.py`
 (and edit `join.sh` by hand for `init`), then commit the rendered scripts. The installer then verifies the published source
 archive and Bun download against their existing checksum manifests. The
-bootstrap forces the v0.3.8 source URL and Bun runtime; it does not downgrade a
+bootstrap forces the v0.3.9 source URL and Bun runtime; it does not downgrade a
 newer installed p2p version. Existing installer mirror settings remain subject to
 the installer's checksum checks. The initial HTTPS join script and the publisher
 remain the trust boundary; a checksum does not authenticate a compromised site.
